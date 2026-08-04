@@ -1,5 +1,14 @@
 # Universal Agentic Workflow (UWF)
 
+> **⚠️ Project status (2026-08): cleanup in progress — not currently runnable.**
+> A partial skills extraction left 13 of 20 skills referenced but missing (details:
+> [docs/product/repo-audit-2026-08-03.md](docs/product/repo-audit-2026-08-03.md)).
+> Direction, scope, and milestones to v1 are defined in
+> [docs/product/product-definition.md](docs/product/product-definition.md) and
+> [docs/product/roadmap-v1.md](docs/product/roadmap-v1.md); decisions are recorded
+> as ADRs 0004–0006 in [docs/adr/](docs/adr/). The skill descriptions below
+> reflect the intended (restored) state, not the current tree.
+
 > **Before first use:** Enable **custom subagents** in VS Code Copilot settings (it is currently experimental). Without this, subagents will not execute and no artifacts will be produced.
 
 A composable, role-based agent workflow framework for AI-assisted project delivery. Copy the `.github/` directory into any repository, choose the workflow persona that matches your goal, and get a consistent, gate-enforced development lifecycle — fully autonomous or human-paced — out of the box.
