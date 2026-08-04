@@ -34,7 +34,7 @@ Net effect: three partially overlapping sources of truth, none complete.
 | :--- | :---: | :---: | :--- |
 | uwf-orchestration-engine | ✅ | ✅ stale | In-repo is canonical (has `intake.yaml`, post-#29 agent names). External predates #29. |
 | uwf-state-manager | ✅ | ✅ stale | In-repo is canonical. External references deleted agent name `uwf-core-discovery`. |
-| uwf-local-tracking | ❌ | ✅ | **Exists only externally.** Must be copied back (M0). |
+| uwf-local-tracking | ❌ | ✅ | **Missing in-repo.** External copy verified byte-identical to `2151b74^` (2026-08-04) — restore from git history with the rest. |
 | uwf-model-adaptation | ✅ | — | OK |
 | uwf-traits | ✅ | — | OK |
 | uwf-project_manager | ✅ | — | OK |
@@ -83,15 +83,16 @@ Additional inconsistencies:
 
 ## Remediation (tracked as M0 in the roadmap)
 
-1. Restore the 13 missing skills + `reset-all.mjs` from `2151b74^`
+1. Restore all 13 missing skills + `reset-all.mjs` from `2151b74^`
    (`git checkout 2151b74^ -- .github/skills/<name>` per skill; drop any `*.db*`
-   files; respect current `.gitignore`).
+   files; respect current `.gitignore`). Git history is the single authoritative
+   restore source, including for `uwf-local-tracking` — verified 2026-08-04:
+   `diff -rq` between the `2151b74^` copy and the external repo (excluding
+   `node_modules`, `*.db*`, `.git`) reports no differences.
 2. Keep the 7 in-repo skills as-is — they are the newest versions.
-3. Copy `uwf-local-tracking` from the external repo (strip `node_modules`,
-   `*.db*`).
-4. Archive `qwts/skills-uwf-{local-tracking,orchestration-engine,state-manager}`
+3. Archive `qwts/skills-uwf-{local-tracking,orchestration-engine,state-manager}`
    with a README note: *"Superseded 2026-08 — canonical source is the
    universal-agentic-workflow monorepo."* Decision:
    [ADR-0004](../adr/ADR-0004-skills-live-in-the-monorepo.md).
-5. Add the reference-integrity check to `scripts/uwf-smoke/` and wire the suite
+4. Add the reference-integrity check to `scripts/uwf-smoke/` and wire the suite
    into CI.

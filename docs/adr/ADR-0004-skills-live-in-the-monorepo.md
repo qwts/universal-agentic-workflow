@@ -7,8 +7,10 @@ Status: Accepted
 - Commit `2151b74` ("move skills to their own repo") deleted all 20 skills from
   `.github/skills/`, but only 3 were extracted to standalone repos
   (`qwts/skills-uwf-*`). PR #29 later re-added 7 skills in-repo with newer
-  content. Result: 13 skills referenced but existing nowhere locally, 2 skills
-  with diverged dual copies, 1 skill existing only externally. Full findings:
+  content. Result: 13 referenced skills missing from the repo (12 existing
+  nowhere else; 1, `uwf-local-tracking`, also in an external repo whose content
+  is byte-identical to the deleted historical copy) and 2 skills with diverged
+  dual copies. Full findings:
   [repo-audit-2026-08-03.md](../product/repo-audit-2026-08-03.md).
 - Skill interfaces are not yet stable and there is exactly one consumer (this
   repo). No install mechanism for external skills exists.

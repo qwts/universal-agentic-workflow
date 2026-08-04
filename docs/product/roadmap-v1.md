@@ -36,11 +36,12 @@ Tracked on GitHub: [milestone "M0 — Truth"](https://github.com/qwts/universal-
         human review.
   - [ ] Run `markdownlint` (playbook config) over `docs/` as a cheap local gate;
         enroll in docs-gov when governed.
-- [ ] Restore the 13 skills deleted by commit `2151b74` ("move skills to their own
-      repo") that were never re-added; adopt the in-repo copies as canonical for the
-      two that drifted ([ADR-0004](../adr/ADR-0004-skills-live-in-the-monorepo.md)).
-- [ ] Copy `uwf-local-tracking` back in from `qwts/skills-uwf-local-tracking`
-      (exists only externally today).
+- [ ] Restore all 13 missing skills from git history (`2151b74^`) — the single
+      authoritative source. This includes `uwf-local-tracking`: its external repo
+      copy was verified byte-identical to the `2151b74^` version (2026-08-04), so
+      no separate copy from `qwts/skills-uwf-local-tracking` is needed. Adopt the
+      in-repo copies as canonical for the two skills that drifted
+      ([ADR-0004](../adr/ADR-0004-skills-live-in-the-monorepo.md)).
 - [ ] Archive the three `skills-uwf-*` repos with a "superseded — see monorepo"
       note.
 - [ ] Add a reference-integrity smoke test: every `.github/skills/uwf-*` path
