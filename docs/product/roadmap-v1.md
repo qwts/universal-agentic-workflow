@@ -16,11 +16,15 @@ gated change with UWF, without opening the architecture doc.
 
 *The repo is internally consistent and provably stays that way.*
 
-- [ ] Migrate repository ownership to the `qwts` account so the main repo and all
+Tracked on GitHub: [milestone "M0 — Truth"](https://github.com/qwts/universal-agentic-workflow/milestone/1)
+(issues [#39](https://github.com/qwts/universal-agentic-workflow/issues/39)–[#44](https://github.com/qwts/universal-agentic-workflow/issues/44)).
+
+- [x] Migrate repository ownership to the `qwts` account so the main repo and all
       project repos conform to one namespace standard (external skill repos are
       already `qwts/skills-uwf-*`; history references `qwtm`/`qwtj`).
-- [ ] Set repository private for the cleanup period
-      ([ADR-0006](../adr/ADR-0006-repo-visibility.md)).
+      *(Done 2026-08-03.)*
+- [x] Set repository private for the cleanup period
+      ([ADR-0006](../adr/ADR-0006-repo-visibility.md)). *(Done 2026-08-03.)*
 - [ ] Conform to `qwts` org governance (`../playbook-engineering`):
   - [ ] Enroll in `governance/repos.json` (regenerate with
         `node tools/repos/repos.mjs --write`; `repos.mjs check` must pass).
