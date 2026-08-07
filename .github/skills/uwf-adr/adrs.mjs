@@ -40,6 +40,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DB_PATH = join(__dirname, "uwf-adrs.db");
 const SCHEMA_PATH = join(__dirname, "adr-schema.yaml");
 const TEMPLATE_PATH = join(__dirname, "templates", "adr.template.md");
+const VALID_IMPACTS = ["low", "medium", "high"];
+const VALID_STATUSES = ["proposed", "accepted", "deprecated", "superseded"];
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -206,8 +208,9 @@ function cmdCreate(db) {
   requireFlag("decision", "create");
 
   const impact = flags["impact"] ?? "medium";
-  const validImpacts = ["low", "medium", "high"];
-  if (!validImpacts.includes(impact)) fail(`--impact must be one of: ${validImpacts.join(", ")}`);
+  if (!VALID_IMPACTS.includes(impact)) {
+    fail(`--impact must be one of: ${VALID_IMPACTS.join(", ")}`);
+  }
 
   const outputDir = flags["output-path"] ?? "docs/adr";
   const number = nextNumber(db, outputDir);
@@ -256,6 +259,12 @@ function cmdUpdate(db) {
   }
 
   if (Object.keys(updates).length === 0) fail("No fields to update. Provide at least one flag.");
+  if ("status" in updates && !VALID_STATUSES.includes(updates.status)) {
+    fail(`--status must be one of: ${VALID_STATUSES.join(", ")}`);
+  }
+  if ("impact" in updates && !VALID_IMPACTS.includes(updates.impact)) {
+    fail(`--impact must be one of: ${VALID_IMPACTS.join(", ")}`);
+  }
 
   updates.updated_at = new Date().toISOString();
   const keys = Object.keys(updates);
