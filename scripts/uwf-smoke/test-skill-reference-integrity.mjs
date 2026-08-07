@@ -22,7 +22,6 @@ import { tmpdir } from "node:os";
 import {
   basename,
   dirname,
-  extname,
   join,
   relative,
   resolve,
@@ -193,6 +192,11 @@ function collectTraitFindings(repoRoot) {
   const contractFiles = listFiles(contractsRoot).filter(
     (path) => path.endsWith(".yaml") || path.endsWith(".yml"),
   );
+  const runtimeContractFiles = new Set(
+    readdirSync(contractsRoot)
+      .filter((name) => name.endsWith(".yaml"))
+      .map((name) => join(contractsRoot, name)),
+  );
   if (contractFiles.length === 0) {
     findings.push({
       code: "missing-stage-contracts",
@@ -229,10 +233,12 @@ function collectTraitFindings(repoRoot) {
     for (const traitId of parsed.value.supported_traits) {
       addTraitReference(findings, traitSources, traitId, source);
     }
-    stageContracts.set(basename(contractFile, extname(contractFile)), {
-      source,
-      supportedTraits: new Set(parsed.value.supported_traits),
-    });
+    if (runtimeContractFiles.has(contractFile)) {
+      stageContracts.set(basename(contractFile, ".yaml"), {
+        source,
+        supportedTraits: new Set(parsed.value.supported_traits),
+      });
+    }
   }
 
   const personaStageFiles = listFiles(join(repoRoot, ".github/skills")).filter(
@@ -431,6 +437,15 @@ function runNegativeFixture() {
       ].join("\n"),
     );
     writeFileSync(
+      join(contractsRoot, "fixture.yml"),
+      "supported_traits:\n  - unsupported_fixture\n",
+    );
+    mkdirSync(join(contractsRoot, "nested"), { recursive: true });
+    writeFileSync(
+      join(contractsRoot, "nested/fixture.yaml"),
+      "supported_traits:\n  - unsupported_fixture\n",
+    );
+    writeFileSync(
       join(personaRoot, "stages.yaml"),
       [
         "workflow: fixture",
@@ -551,7 +566,7 @@ assert(
   ),
 );
 assert(
-  "persona trait unsupported by its stage contract is rejected",
+  "persona trait unsupported by the direct runtime contract is rejected",
   fixtureFindings.some(
     (finding) =>
       finding.code === "unsupported-stage-trait" &&
@@ -571,7 +586,7 @@ assert(
   ),
 );
 assert(
-  "compatible persona trait-stage fixture is accepted",
+  "direct runtime contract wins over ignored yml and nested contracts",
   !fixtureFindings.some(
     (finding) =>
       ["unsupported-stage-trait", "missing-stage-trait-policy"].includes(
