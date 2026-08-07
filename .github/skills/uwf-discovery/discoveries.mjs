@@ -22,6 +22,9 @@
  *   gaps      [--role <r>]                       Shorthand: list category=gap, status=open
  *   close     --id <n>                           Mark a discovery as addressed
  *
+ * Global options:
+ *   --db-path <path>                              Override the SQLite path
+ *
  * Exit codes:
  *   0  success
  *   1  operational error (not found, conflict …)
@@ -33,11 +36,11 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { readFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "uwf-discoveries.db");
+const DEFAULT_DB_PATH = join(__dirname, "uwf-discoveries.db");
 const SCHEMA_PATH = join(__dirname, "discovery-schema.yaml");
 
 const VALID_CATEGORIES = [
@@ -72,6 +75,9 @@ for (let i = 1; i < args.length; i++) {
     }
   }
 }
+const DB_PATH = flags["db-path"]
+  ? resolve(String(flags["db-path"]))
+  : DEFAULT_DB_PATH;
 
 // ---------------------------------------------------------------------------
 // Output helpers
@@ -233,7 +239,12 @@ function cmdGaps(db) {
     "SELECT * FROM discoveries WHERE category = 'gap' AND status = 'open'";
   const params = [];
   if (flags["role"]) { query += " AND role = ?"; params.push(flags["role"]); }
-  query += " ORDER BY impact DESC, id ASC";
+  query += ` ORDER BY CASE impact
+    WHEN 'high' THEN 3
+    WHEN 'medium' THEN 2
+    WHEN 'low' THEN 1
+    ELSE 0
+  END DESC, id ASC`;
   const rows = db.prepare(query).all(...params);
   succeed({ procedure: "gaps", count: rows.length, discoveries: rows });
 }

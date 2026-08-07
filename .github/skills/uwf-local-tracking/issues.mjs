@@ -10,7 +10,7 @@
  *
  * Commands:
  *   create --id <id> --title <text>        Create a new issue
- *          [--status <s>] [--phase <p>]
+ *          [--status open|active|closed|skipped] [--phase <p>]
  *          [--milestone <m>] [--sprint <s>]
  *          [--description <text>]
  *          [--assigned-agent <id>]
@@ -25,6 +25,9 @@
  *   skip     --id <id> [--reason <text>]       Set issue status to "skipped"
  *   next     [--milestone <m>] [--sprint <s>]  Find next eligible open issue(s)
  *
+ * Global options:
+ *   --db-path <path>                            Override the SQLite path
+ *
  * Exit codes:
  *   0  success
  *   1  operational error (not found, conflict …)
@@ -36,12 +39,13 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { readFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "uwf-issues.db");
+const DEFAULT_DB_PATH = join(__dirname, "uwf-issues.db");
 const SCHEMA_PATH = join(__dirname, "issues-schema.yaml");
+const VALID_STATUSES = ["open", "active", "closed", "skipped"];
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -64,6 +68,9 @@ for (let i = 1; i < args.length; i++) {
     }
   }
 }
+const DB_PATH = flags["db-path"]
+  ? resolve(String(flags["db-path"]))
+  : DEFAULT_DB_PATH;
 
 // ---------------------------------------------------------------------------
 // Output helpers
@@ -130,6 +137,10 @@ function cmdCreate(db) {
   if (db.prepare("SELECT id FROM issues WHERE id = ?").get(id)) {
     fail(`Issue "${id}" already exists.`);
   }
+  const status = flags["status"] ?? "open";
+  if (!VALID_STATUSES.includes(status)) {
+    usageError(`--status must be one of: ${VALID_STATUSES.join(", ")}`);
+  }
 
   const now = new Date().toISOString();
   db.prepare(
@@ -140,7 +151,7 @@ function cmdCreate(db) {
   ).run(
     id,
     flags["title"],
-    flags["status"] ?? "open",
+    status,
     flags["phase"] ?? null,
     flags["milestone"] ?? null,
     flags["sprint"] ?? null,
@@ -179,6 +190,9 @@ function cmdUpdate(db) {
   }
 
   if (Object.keys(updates).length === 0) fail("No fields to update. Provide at least one flag.");
+  if ("status" in updates && !VALID_STATUSES.includes(updates.status)) {
+    usageError(`--status must be one of: ${VALID_STATUSES.join(", ")}`);
+  }
 
   updates.updated_at = new Date().toISOString();
   const keys = Object.keys(updates);
