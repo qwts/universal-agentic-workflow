@@ -113,6 +113,20 @@ function parseYaml(path) {
   }
 }
 
+function addTraitReference(findings, traitSources, traitId, source) {
+  if (typeof traitId !== "string" || !TRAIT_ID_PATTERN.test(traitId)) {
+    findings.push({
+      code: "invalid-trait-reference",
+      subject: String(traitId),
+      detail: `declared by ${source}`,
+    });
+    return;
+  }
+
+  if (!traitSources.has(traitId)) traitSources.set(traitId, new Set());
+  traitSources.get(traitId).add(source);
+}
+
 function collectSkillFindings(repoRoot) {
   const references = new Map();
 
@@ -201,17 +215,63 @@ function collectTraitFindings(repoRoot) {
     }
 
     for (const traitId of parsed.value.supported_traits) {
-      if (typeof traitId !== "string" || !TRAIT_ID_PATTERN.test(traitId)) {
+      addTraitReference(findings, traitSources, traitId, source);
+    }
+  }
+
+  const personaStageFiles = listFiles(join(repoRoot, ".github/skills")).filter(
+    (path) =>
+      /^\.github\/skills\/uwf-[^/]+\/stages\.ya?ml$/.test(
+        repoPath(repoRoot, path),
+      ),
+  );
+  for (const personaStageFile of personaStageFiles) {
+    const source = repoPath(repoRoot, personaStageFile);
+    const parsed = parseYaml(personaStageFile);
+    if (parsed.error) {
+      findings.push({
+        code: "invalid-persona-stages",
+        subject: source,
+        detail: parsed.error,
+      });
+      continue;
+    }
+
+    if (
+      parsed.value == null ||
+      typeof parsed.value !== "object" ||
+      !Array.isArray(parsed.value.stages)
+    ) {
+      findings.push({
+        code: "invalid-persona-stages",
+        subject: source,
+        detail: "stages must be an array",
+      });
+      continue;
+    }
+
+    for (const [index, stage] of parsed.value.stages.entries()) {
+      if (stage == null || typeof stage !== "object" || stage.traits === undefined) {
+        continue;
+      }
+
+      const stageName =
+        typeof stage.name === "string" && stage.name.length > 0
+          ? stage.name
+          : `index ${index}`;
+      const stageSource = `${source} stage ${stageName}`;
+      if (!Array.isArray(stage.traits)) {
         findings.push({
-          code: "invalid-trait-reference",
-          subject: String(traitId),
-          detail: `declared by ${source}`,
+          code: "invalid-stage-traits",
+          subject: stageSource,
+          detail: "traits must be an array",
         });
         continue;
       }
 
-      if (!traitSources.has(traitId)) traitSources.set(traitId, new Set());
-      traitSources.get(traitId).add(source);
+      for (const traitId of stage.traits) {
+        addTraitReference(findings, traitSources, traitId, stageSource);
+      }
     }
   }
 
@@ -281,9 +341,11 @@ function runNegativeFixture() {
       fixtureRoot,
       ".github/skills/uwf-orchestration-engine/stage-contracts",
     );
+    const personaRoot = join(fixtureRoot, ".github/skills/uwf-fixture");
     const traitsRoot = join(fixtureRoot, ".github/skills/uwf-traits/traits");
     mkdirSync(agentsRoot, { recursive: true });
     mkdirSync(contractsRoot, { recursive: true });
+    mkdirSync(personaRoot, { recursive: true });
     mkdirSync(traitsRoot, { recursive: true });
 
     writeFileSync(
@@ -298,6 +360,18 @@ function runNegativeFixture() {
         "  - missing_fixture",
         "  - mismatched_fixture",
         "  - invalid_fixture",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(personaRoot, "stages.yaml"),
+      [
+        "workflow: fixture",
+        "stages:",
+        "  - name: fixture",
+        "    stage_type: fixture",
+        "    traits:",
+        "      - persona_missing_fixture",
         "",
       ].join("\n"),
     );
@@ -349,6 +423,15 @@ assert(
   fixtureFindings.some(
     (finding) =>
       finding.code === "missing-trait" && finding.subject === "missing_fixture",
+  ),
+);
+assert(
+  "persona stages missing trait fixture is rejected",
+  fixtureFindings.some(
+    (finding) =>
+      finding.code === "missing-trait" &&
+      finding.subject === "persona_missing_fixture" &&
+      finding.detail.includes("stages.yaml"),
   ),
 );
 assert(
