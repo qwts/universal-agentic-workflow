@@ -29,7 +29,7 @@
 
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
-import { readFileSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -115,11 +115,21 @@ function toSlug(title) {
     .replace(/^-|-$/g, "");
 }
 
-/** Return the next zero-padded ADR number string (e.g. "0004"). */
-function nextNumber(db) {
-  const row = db.prepare("SELECT number FROM adrs ORDER BY id DESC LIMIT 1").get();
-  if (!row) return "0001";
-  return String(Number(row.number) + 1).padStart(4, "0");
+/** Return the next zero-padded ADR number across the DB and committed files. */
+function nextNumber(db, outputDir) {
+  const row = db
+    .prepare("SELECT MAX(CAST(number AS INTEGER)) AS max_number FROM adrs")
+    .get();
+  let maxNumber = Number(row?.max_number ?? 0);
+
+  if (existsSync(outputDir)) {
+    for (const name of readdirSync(outputDir)) {
+      const match = name.match(/^ADR-(\d+)(?:-|\.md$)/i);
+      if (match) maxNumber = Math.max(maxNumber, Number(match[1]));
+    }
+  }
+
+  return String(maxNumber + 1).padStart(4, "0");
 }
 
 /** Scaffold the markdown file from the template. */
@@ -193,12 +203,12 @@ function cmdCreate(db) {
   const validImpacts = ["low", "medium", "high"];
   if (!validImpacts.includes(impact)) fail(`--impact must be one of: ${validImpacts.join(", ")}`);
 
-  const number = nextNumber(db);
+  const outputDir = flags["output-path"] ?? "docs/adr";
+  const number = nextNumber(db, outputDir);
   const slug = toSlug(flags["title"]);
   const today = new Date().toISOString().slice(0, 10);
   const now = new Date().toISOString();
 
-  const outputDir = flags["output-path"] ?? "docs/adr";
   const { filePath } = scaffoldFile(outputDir, number, flags["title"], flags["decision"], today);
 
   const info = db.prepare(

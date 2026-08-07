@@ -562,12 +562,14 @@ function evaluateCheck(check) {
       // Runs a shell command; gate passes if exit code is 0.
       // check.cmd   — the command string to execute
       // check.label — human-readable description for failure messages
+      const cmd = resolveTemplates(check.cmd);
+      if (!cmd) return `${check.label ?? "run_script"} is missing cmd`;
       try {
-        execSync(check.cmd, { stdio: "pipe" });
+        execSync(cmd, { stdio: "pipe" });
         return null;
       } catch (err) {
         const detail = err.stdout?.toString().trim() || err.stderr?.toString().trim() || "";
-        return `${check.label ?? check.cmd} failed (exit ${err.status})${detail ? ": " + detail : ""}`;
+        return `${check.label ?? cmd} failed (exit ${err.status})${detail ? ": " + detail : ""}`;
       }
     }
     default:

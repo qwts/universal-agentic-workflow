@@ -133,7 +133,7 @@ stages:
           text: "Gap Entries"
           label: "forensic-gap-report.md contains Gap Entries section"
         - type: run_script
-          command: >
+          cmd: >
             node -e "const fs=require('fs'); const p=process.argv[1];
             const d=JSON.parse(fs.readFileSync(p,'utf8'));
             if(d.gap_report_reviewed!==true){

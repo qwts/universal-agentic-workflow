@@ -218,6 +218,10 @@ function cmdUpdate(db) {
   if (updates.status && !VALID_STATUSES.includes(updates.status))
     fail(`--status must be one of: ${VALID_STATUSES.join(", ")}`);
 
+  if (updates.type && updates.type !== row.type) {
+    updates.number = nextNumber(db, updates.type, row.role);
+  }
+
   updates.updated_at = new Date().toISOString();
   const keys = Object.keys(updates);
   const setClauses = keys.map((k) => `"${k}" = ?`).join(", ");
