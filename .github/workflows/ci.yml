@@ -49,6 +49,8 @@ jobs:
             .github/skills/uwf-adr \
             .github/skills/uwf-discovery \
             .github/skills/uwf-local-tracking \
+            .github/skills/uwf-question-protocol \
+            .github/skills/uwf-review \
             .github/skills/uwf-requirements
           do
             npm ci --no-audit --no-fund --prefix "$package_dir"
