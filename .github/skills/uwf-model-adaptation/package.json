@@ -4,6 +4,6 @@
   "type": "module",
   "description": "UWF Model Adaptation — profile resolution and steering policy generation",
   "dependencies": {
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^4.3.1"
   }
 }
