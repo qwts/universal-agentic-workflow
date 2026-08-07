@@ -1,7 +1,9 @@
 # GitHub Copilot adapter
 
-Start with [`../AGENTS.md`](../AGENTS.md); it is the canonical repository
-context.
+When contributing to this UWF source repository, start with the root
+`AGENTS.md`; it is the canonical repository context. Installed copies of the
+`.github/` bundle remain self-contained and use the downstream repository's
+own root context.
 
 When UWF delegates a stage in GitHub Copilot:
 
