@@ -19,6 +19,9 @@
  *   supersede --id <n> --by <n>               Mark an ADR as superseded by another
  *   deprecate --id <n>                        Mark an ADR as deprecated
  *
+ * Global options:
+ *   --db-path <path>                           Override the SQLite path
+ *
  * Exit codes:
  *   0  success
  *   1  operational error (not found, conflict …)
@@ -30,11 +33,11 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "uwf-adrs.db");
+const DEFAULT_DB_PATH = join(__dirname, "uwf-adrs.db");
 const SCHEMA_PATH = join(__dirname, "adr-schema.yaml");
 const TEMPLATE_PATH = join(__dirname, "templates", "adr.template.md");
 
@@ -59,6 +62,9 @@ for (let i = 1; i < args.length; i++) {
     }
   }
 }
+const DB_PATH = flags["db-path"]
+  ? resolve(String(flags["db-path"]))
+  : DEFAULT_DB_PATH;
 
 // ---------------------------------------------------------------------------
 // Output helpers

@@ -23,6 +23,9 @@
  *   defer     --id <n>                            Mark requirement as deferred
  *   reject    --id <n>                            Mark requirement as rejected
  *
+ * Global options:
+ *   --db-path <path>                              Override the SQLite path
+ *
  * Exit codes:
  *   0  success
  *   1  operational error (not found, conflict …)
@@ -34,11 +37,11 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { readFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "uwf-requirements.db");
+const DEFAULT_DB_PATH = join(__dirname, "uwf-requirements.db");
 const SCHEMA_PATH = join(__dirname, "requirements-schema.yaml");
 
 const VALID_TYPES = ["functional", "non_functional", "data", "acceptance_criteria", "risk"];
@@ -75,6 +78,9 @@ for (let i = 1; i < args.length; i++) {
     }
   }
 }
+const DB_PATH = flags["db-path"]
+  ? resolve(String(flags["db-path"]))
+  : DEFAULT_DB_PATH;
 
 // ---------------------------------------------------------------------------
 // Output helpers
@@ -126,17 +132,17 @@ function initTable(db) {
 /** Return the next number for a given type+role, e.g. "FR-003". */
 function nextNumber(db, type, role) {
   const prefix = TYPE_PREFIX[type] ?? "REQ";
-  const row = db
+  const rows = db
     .prepare(
       `SELECT number FROM requirements
-       WHERE role = ? AND type = ?
-       ORDER BY id DESC LIMIT 1`
+       WHERE role = ? AND type = ?`
     )
-    .get(role, type);
-
-  if (!row) return `${prefix}-001`;
-  const current = Number(row.number.split("-")[1] ?? 0);
-  return `${prefix}-${String(current + 1).padStart(3, "0")}`;
+    .all(role, type);
+  const maximum = rows.reduce((max, row) => {
+    const match = String(row.number).match(/-(\d+)$/);
+    return Math.max(max, Number(match?.[1] ?? 0));
+  }, 0);
+  return `${prefix}-${String(maximum + 1).padStart(3, "0")}`;
 }
 
 // ---------------------------------------------------------------------------

@@ -133,11 +133,15 @@ stages:
           text: "Gap Entries"
           label: "forensic-gap-report.md contains Gap Entries section"
         - type: run_script
-          cmd: >
-            node -e "const fs=require('fs'); const p=process.argv[1];
-            const d=JSON.parse(fs.readFileSync(p,'utf8'));
-            if(d.gap_report_reviewed!==true){
-              console.error('forensic-br.json: gap_report_reviewed must be true');
-              process.exit(1);
-            }" "{{output_path}}/forensic-br.json"
+          cmd: node
+          args:
+            - -e
+            - >-
+              const fs=require('fs'); const p=process.argv[1];
+              const d=JSON.parse(fs.readFileSync(p,'utf8'));
+              if(d.gap_report_reviewed!==true){
+                console.error('forensic-br.json: gap_report_reviewed must be true');
+                process.exit(1);
+              }
+            - "{{output_path}}/forensic-br.json"
           label: "forensic-br.json gap_report_reviewed is true"

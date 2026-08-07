@@ -7,13 +7,13 @@
  *   node .github/skills/reset-all.mjs --artifacts   # also delete tmp/workflow-artifacts/
  *
  * What gets deleted:
- *   - All *.db files under .github/skills/
+ *   - All *.db, *.db-shm, and *.db-wal files under .github/skills/
  *   - tmp/workflow-artifacts/ (only with --artifacts flag)
  *
  * Each skill will recreate its DB on next invocation (CREATE TABLE IF NOT EXISTS).
  */
 
-import { unlinkSync, rmSync, existsSync, readdirSync, statSync } from "node:fs";
+import { unlinkSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,7 +27,7 @@ function findDbs(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
     if (entry.isDirectory() && entry.name !== "node_modules") results.push(...findDbs(full));
-    else if (entry.isFile() && entry.name.endsWith(".db")) results.push(full);
+    else if (entry.isFile() && /\.db(?:-shm|-wal)?$/.test(entry.name)) results.push(full);
   }
   return results;
 }

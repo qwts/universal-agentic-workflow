@@ -22,6 +22,7 @@
  *
  * Global options:
  *   --output-path <path>   Default: ./tmp/workflow-artifacts
+ *   --db-path <path>       Override the SQLite path
  *
  * Exit codes:
  *   0  success (gate passed for check-gate)
@@ -33,7 +34,7 @@
 
 import Database from "better-sqlite3";
 import { readFileSync, existsSync, statSync, readdirSync, unlinkSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { resolve, join, dirname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
@@ -43,7 +44,7 @@ import yaml from "js-yaml";
 // ---------------------------------------------------------------------------
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH    = join(__dirname, "uwf-stages.db");
+const DEFAULT_DB_PATH = join(__dirname, "uwf-stages.db");
 const SCHEMA_PATH = join(__dirname, "stage-schema.yaml");
 const STAGE_CONTRACTS_DIR = join(__dirname, "stage-contracts");
 const TRAITS_DIR = join(__dirname, "..", "uwf-traits", "traits");
@@ -206,6 +207,9 @@ const flags = parseFlags(rest);
 
 const workflow   = flags["workflow"];
 const outputPath = flags["output-path"] ?? "./tmp/workflow-artifacts";
+const DB_PATH = flags["db-path"]
+  ? resolve(String(flags["db-path"]))
+  : DEFAULT_DB_PATH;
 
 if (!command) usageError("No command provided.");
 
@@ -559,13 +563,21 @@ function evaluateCheck(check) {
       return null;
     }
     case "run_script": {
-      // Runs a shell command; gate passes if exit code is 0.
-      // check.cmd   — the command string to execute
-      // check.label — human-readable description for failure messages
-      const cmd = resolveTemplates(check.cmd);
+      // With args, execute directly so templated values are passed as data.
+      // Without args, a static shell command remains available for pipelines.
+      const rawCmd = check.cmd;
+      if (!Array.isArray(check.args) && rawCmd?.includes("{{")) {
+        return `${check.label ?? "run_script"} cannot template a shell command; use args`;
+      }
+      const cmd = resolveTemplates(rawCmd);
       if (!cmd) return `${check.label ?? "run_script"} is missing cmd`;
       try {
-        execSync(cmd, { stdio: "pipe" });
+        if (Array.isArray(check.args)) {
+          const scriptArgs = check.args.map((arg) => resolveTemplates(String(arg)));
+          execFileSync(cmd, scriptArgs, { stdio: "pipe" });
+        } else {
+          execSync(cmd, { stdio: "pipe" });
+        }
         return null;
       } catch (err) {
         const detail = err.stdout?.toString().trim() || err.stderr?.toString().trim() || "";
