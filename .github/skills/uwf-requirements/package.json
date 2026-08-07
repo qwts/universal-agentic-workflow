@@ -1,0 +1,10 @@
+{
+  "name": "uwf-requirements",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "UWF Requirements skill — SQLite-backed requirements registry (PRD + NFRs + acceptance criteria)",
+  "dependencies": {
+    "better-sqlite3": "^9.6.0",
+    "js-yaml": "^4.1.0"
+  }
+}

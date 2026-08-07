@@ -1,0 +1,143 @@
+# stages.yaml — uwf-forensic-analyst persona stage definitions
+# Loaded by stage-tracker.mjs to drive gate enforcement and execution tracking.
+# Gate conditions are evaluated declaratively by the central stage-tracker script.
+#
+# Template variables available in paths:
+#   {{output_path}}  — resolved output-path (default: ./tmp/workflow-artifacts)
+#   {{cwd}}          — process.cwd()
+#
+# inputs/outputs use the same template variables and support glob patterns.
+# The orchestrator resolves these and passes them to the stage agent at invocation time.
+
+workflow: forensic-analyst
+artifact_prefix: forensic
+output_path: ./tmp/workflow-artifacts
+
+stages:
+
+  - name: repo-audit
+    agent: uwf-forensic-analyst-repo-audit
+    max_retries: 2
+    on_gate_failure: retry
+    run_as_subagent: true
+    advances_phase_to: discovery
+    inputs: []
+    outputs:
+      - "{{output_path}}/forensic-repo-audit.md"
+    gated: true
+    gate:
+      checks:
+        - type: require_non_empty
+          path: "{{output_path}}/forensic-repo-audit.md"
+          label: "forensic-repo-audit.md"
+        - type: require_contains
+          path: "{{output_path}}/forensic-repo-audit.md"
+          text: "Tech Stack"
+          label: "forensic-repo-audit.md contains Tech Stack section"
+        - type: require_contains
+          path: "{{output_path}}/forensic-repo-audit.md"
+          text: "Service Boundaries"
+          label: "forensic-repo-audit.md contains Service Boundaries section"
+
+  - name: artifact-harvest
+    agent: uwf-forensic-analyst-artifact-harvest
+    max_retries: 2
+    on_gate_failure: retry
+    run_as_subagent: true
+    advances_phase_to: discovery
+    inputs:
+      - "{{output_path}}/forensic-repo-audit.md"
+    outputs:
+      - "{{output_path}}/forensic-artifact-harvest.md"
+    gated: true
+    gate:
+      checks:
+        - type: require_non_empty
+          path: "{{output_path}}/forensic-artifact-harvest.md"
+          label: "forensic-artifact-harvest.md"
+        - type: require_contains
+          path: "{{output_path}}/forensic-artifact-harvest.md"
+          text: "Artifact Inventory"
+          label: "forensic-artifact-harvest.md contains Artifact Inventory section"
+
+  - name: intent-inference
+    agent: uwf-forensic-analyst-intent-inference
+    max_retries: 2
+    on_gate_failure: retry
+    run_as_subagent: true
+    advances_phase_to: discovery
+    inputs:
+      - "{{output_path}}/forensic-repo-audit.md"
+      - "{{output_path}}/forensic-artifact-harvest.md"
+    outputs:
+      - "{{output_path}}/forensic-intent.md"
+    gated: true
+    gate:
+      checks:
+        - type: require_non_empty
+          path: "{{output_path}}/forensic-intent.md"
+          label: "forensic-intent.md"
+        - type: require_contains
+          path: "{{output_path}}/forensic-intent.md"
+          text: "confidence"
+          label: "forensic-intent.md contains confidence field"
+
+  - name: confidence-score
+    agent: uwf-forensic-analyst-confidence-score
+    max_retries: 2
+    on_gate_failure: retry
+    run_as_subagent: true
+    advances_phase_to: forensic-scoring
+    inputs:
+      - "{{output_path}}/forensic-intent.md"
+      - "{{output_path}}/forensic-artifact-harvest.md"
+    outputs:
+      - "{{output_path}}/forensic-br.json"
+    gated: true
+    gate:
+      checks:
+        - type: require_non_empty
+          path: "{{output_path}}/forensic-br.json"
+          label: "forensic-br.json"
+        - type: require_contains
+          path: "{{output_path}}/forensic-br.json"
+          text: "confidence"
+          label: "forensic-br.json contains confidence fields"
+        - type: require_contains
+          path: "{{output_path}}/forensic-br.json"
+          text: "gap_log"
+          label: "forensic-br.json contains gap_log"
+        - type: require_contains
+          path: "{{output_path}}/forensic-br.json"
+          text: "brownfield"
+          label: "forensic-br.json project_type is brownfield"
+
+  - name: gap-report
+    agent: uwf-forensic-analyst-gap-report
+    max_retries: 3
+    on_gate_failure: retry
+    run_as_subagent: true
+    advances_phase_to: forensic-review
+    inputs:
+      - "{{output_path}}/forensic-br.json"
+    outputs:
+      - "{{output_path}}/forensic-gap-report.md"
+    gated: true
+    gate:
+      checks:
+        - type: require_non_empty
+          path: "{{output_path}}/forensic-gap-report.md"
+          label: "forensic-gap-report.md"
+        - type: require_contains
+          path: "{{output_path}}/forensic-gap-report.md"
+          text: "Gap Entries"
+          label: "forensic-gap-report.md contains Gap Entries section"
+        - type: run_script
+          command: >
+            node -e "const fs=require('fs'); const p=process.argv[1];
+            const d=JSON.parse(fs.readFileSync(p,'utf8'));
+            if(d.gap_report_reviewed!==true){
+              console.error('forensic-br.json: gap_report_reviewed must be true');
+              process.exit(1);
+            }" "{{output_path}}/forensic-br.json"
+          label: "forensic-br.json gap_report_reviewed is true"

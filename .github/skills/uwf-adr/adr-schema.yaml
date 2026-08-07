@@ -1,0 +1,43 @@
+# adr-schema.yaml
+# Defines the SQLite table shape for Architecture Decision Records.
+# Loaded by adrs.mjs on first run to CREATE TABLE IF NOT EXISTS.
+# Edit and re-initialize (delete the .db file) to change the table shape.
+
+table: adrs
+description: "Tracks Architecture Decision Records with status, impact, and file paths"
+columns:
+  - name: id
+    type: INTEGER
+    primary_key: true
+    autoincrement: true
+  - name: number
+    type: TEXT
+    not_null: true
+  - name: slug
+    type: TEXT
+    not_null: true
+  - name: title
+    type: TEXT
+    not_null: true
+  - name: status
+    type: TEXT
+    not_null: true
+    default: "proposed"
+  - name: impact
+    type: TEXT
+    not_null: true
+    default: "medium"
+  - name: stage
+    type: TEXT
+  - name: decision
+    type: TEXT
+  - name: file_path
+    type: TEXT
+  - name: superseded_by
+    type: TEXT
+  - name: created_at
+    type: TEXT
+    not_null: true
+  - name: updated_at
+    type: TEXT
+    not_null: true

@@ -1,0 +1,61 @@
+# review-schema.yaml
+# Defines the SQLite table shapes for review runs and findings.
+# Loaded by reviews.mjs on first run to CREATE TABLE IF NOT EXISTS.
+# Edit and re-initialize (delete the .db file) to change the table shape.
+
+tables:
+  - table: reviews
+    description: "One record per review run — tracks stage, verdict, and reviewer agent"
+    columns:
+      - name: id
+        type: INTEGER
+        primary_key: true
+        autoincrement: true
+      - name: role
+        type: TEXT
+        not_null: true
+      - name: stage
+        type: TEXT
+        not_null: true
+      - name: verdict
+        type: TEXT
+        not_null: true
+        default: "pending"
+      - name: notes
+        type: TEXT
+      - name: created_at
+        type: TEXT
+        not_null: true
+      - name: updated_at
+        type: TEXT
+        not_null: true
+
+  - table: findings
+    description: "One record per issue found — linked to a review, with severity and fix-loop status"
+    columns:
+      - name: id
+        type: INTEGER
+        primary_key: true
+        autoincrement: true
+      - name: review_id
+        type: INTEGER
+        not_null: true
+      - name: severity
+        type: TEXT
+        not_null: true
+        default: "major"
+      - name: status
+        type: TEXT
+        not_null: true
+        default: "open"
+      - name: file_path
+        type: TEXT
+      - name: description
+        type: TEXT
+        not_null: true
+      - name: created_at
+        type: TEXT
+        not_null: true
+      - name: updated_at
+        type: TEXT
+        not_null: true

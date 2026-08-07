@@ -1,0 +1,10 @@
+{
+  "name": "uwf-review",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "UWF Review skill — SQLite-backed review runs and findings with fix-loop gate support",
+  "dependencies": {
+    "better-sqlite3": "^9.6.0",
+    "js-yaml": "^4.1.0"
+  }
+}

@@ -1,8 +1,11 @@
 # Universal Agentic Workflow (UWF)
 
-> **⚠️ Project status (2026-08): cleanup in progress — not currently runnable.**
-> A partial skills extraction left 13 of 20 skills referenced but missing (details:
-> [docs/product/repo-audit-2026-08-03.md](docs/product/repo-audit-2026-08-03.md)).
+> **⚠️ Project status (2026-08): cleanup in progress — not yet CI-proven.**
+> The skill sources lost during a partial extraction have been restored from the
+> monorepo history; reference-integrity enforcement and CI proof remain tracked in
+> [M0](docs/product/roadmap-v1.md#m0--truth). Historical findings and the restore
+> source are recorded in
+> [docs/product/repo-audit-2026-08-03.md](docs/product/repo-audit-2026-08-03.md).
 > Direction, scope, and milestones to v1 are defined in
 > [docs/product/product-definition.md](docs/product/product-definition.md) and
 > [docs/product/roadmap-v1.md](docs/product/roadmap-v1.md); decisions are recorded
