@@ -1,0 +1,10 @@
+{
+  "name": "uwf-discovery",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "UWF Discovery skill — SQLite-backed discovery log for workspace inspection findings",
+  "dependencies": {
+    "better-sqlite3": "^9.6.0",
+    "js-yaml": "^4.1.0"
+  }
+}

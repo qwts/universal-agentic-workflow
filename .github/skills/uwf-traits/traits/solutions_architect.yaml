@@ -1,0 +1,20 @@
+trait_id: solutions_architect
+version: 1
+stage_policies:
+  discovery:
+    priority_order:
+      - system_boundaries
+      - interfaces
+      - quality_attributes
+      - dependencies
+    must_address:
+      - system_boundaries
+      - interfaces
+      - nfrs
+      - dependency_graph
+    question_policy: aggressive
+    risk_focus:
+      - scalability
+      - reliability
+      - interoperability
+    evidence_threshold: high

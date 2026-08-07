@@ -40,7 +40,8 @@ Tracked on GitHub: [milestone "M0 — Truth"](https://github.com/qwts/universal-
       authoritative source. This includes `uwf-local-tracking`: its external repo
       copy was verified byte-identical to the `2151b74^` version (2026-08-04), so
       no separate copy from `qwts/skills-uwf-local-tracking` is needed. Adopt the
-      in-repo copies as canonical for the two skills that drifted
+      in-repo copies as canonical for the two skills that drifted, and complete
+      the partial `uwf-traits` restore without replacing its two newer trait files
       ([ADR-0004](../adr/ADR-0004-skills-live-in-the-monorepo.md)).
 - [ ] Archive the three `skills-uwf-*` repos with a "superseded — see monorepo"
       note.

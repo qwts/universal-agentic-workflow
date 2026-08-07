@@ -19,10 +19,12 @@ discovery stage, and exactly what M0 must fix.
    `skills-uwf-orchestration-engine`, `skills-uwf-state-manager` — each a single
    "Initial commit" under `qwts`.
 3. **`9b4b460` — PR #29 (2026-04-19, current HEAD).** Branched before the move;
-   during conflict resolution re-added **7** skills to `.github/skills/`
-   (orchestration-engine, state-manager, model-adaptation, traits, and the three
-   persona skills) with newer content (canonical `intake` stage contract,
-   `uwf-stage-*` agent renames).
+   during conflict resolution re-added **7 skill directories** to
+   `.github/skills/` (orchestration-engine, state-manager, model-adaptation,
+   traits, and the three persona skills) with newer content (canonical `intake`
+   stage contract, `uwf-stage-*` agent renames). The traits directory was only
+   partially restored: its registry plus the `solutions_architect` and
+   `forensic_analyst` trait files remained missing.
 
 Net effect: three partially overlapping sources of truth, none complete.
 
@@ -33,10 +35,10 @@ Net effect: three partially overlapping sources of truth, none complete.
 | Skill | In repo | External (`qwts/skills-uwf-*`) | Status |
 | :--- | :---: | :---: | :--- |
 | uwf-orchestration-engine | ✅ | ✅ stale | In-repo is canonical (has `intake.yaml`, post-#29 agent names). External predates #29. |
-| uwf-state-manager | ✅ | ✅ stale | In-repo is canonical. External references deleted agent name `uwf-core-discovery`. |
+| uwf-state-manager | ✅ | ✅ stale | In-repo is canonical. External references the legacy discovery-agent name removed by PR #29. |
 | uwf-local-tracking | ❌ | ✅ | **Missing in-repo.** External copy verified byte-identical to `2151b74^` (2026-08-04) — restore from git history with the rest. |
 | uwf-model-adaptation | ✅ | — | OK |
-| uwf-traits | ✅ | — | OK |
+| uwf-traits | ⚠️ partial | — | Newer `project_manager` and `sw_dev` traits are present; restore the missing registry, `solutions_architect`, and `forensic_analyst` files from history. |
 | uwf-project_manager | ✅ | — | OK |
 | uwf-sw_dev | ✅ | — | OK |
 | uwf-solutions_architect | ✅ | — | OK |
@@ -83,7 +85,9 @@ Additional inconsistencies:
 
 ## Remediation (tracked as M0 in the roadmap)
 
-1. Restore all 13 missing skills + `reset-all.mjs` from `2151b74^`
+1. Restore all 13 missing skills + `reset-all.mjs` from `2151b74^`, and complete
+   the partial `uwf-traits` restore with its missing registry and two declared
+   trait files
    (`git checkout 2151b74^ -- .github/skills/<name>` per skill; drop any `*.db*`
    files; respect current `.gitignore`). Git history is the single authoritative
    restore source, including for `uwf-local-tracking` — verified 2026-08-04:

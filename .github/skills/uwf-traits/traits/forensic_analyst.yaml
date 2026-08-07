@@ -1,0 +1,21 @@
+trait_id: forensic_analyst
+version: 1
+stage_policies:
+  discovery:
+    priority_order:
+      - observed_facts
+      - inferred_facts
+      - gaps
+      - evidence_sources
+    must_address:
+      - observed_facts
+      - inferred_facts
+      - gaps
+      - confidence_levels
+      - evidence_sources
+    question_policy: aggressive
+    risk_focus:
+      - unknowns
+      - undocumented_dependencies
+      - confidence_gaps
+    evidence_threshold: high
