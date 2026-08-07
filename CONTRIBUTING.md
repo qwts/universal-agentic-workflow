@@ -21,7 +21,11 @@ Thank you for your interest in contributing. This guide covers everything you ne
 ## Prerequisites
 
 - **VS Code** with **GitHub Copilot** (custom agents / subagents must be enabled in settings — this feature is currently experimental)
-- **Node.js 20+** — all skill scripts and the companion extension use Node
+- **Node.js 20+** — required for the standalone skill scripts and repository
+  smoke suite
+- **Node.js 22.13+** and **VS Code 1.101+** — required for the UWF Companion;
+  its database readers use the unflagged `node:sqlite` API available in the
+  VS Code extension host from this release line
 - Familiarity with the UWF phase model described in [`docs/uwf-architecture.md`](docs/uwf-architecture.md)
 
 ---
@@ -57,8 +61,9 @@ The VS Code extension has its own setup:
 
 ```bash
 cd uwf-companion
-npm install
-npm run build
+npm ci
+npm test
+npm run package
 ```
 
 ### Resetting state between test runs
