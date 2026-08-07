@@ -25,16 +25,21 @@ The dashboard reads workflow archetype/stage/artifact expectations from declarat
 
 ## Requirements
 
-- VS Code 1.85+
+- VS Code 1.101+
 - A workspace with `.github/skills/` containing UWF skill databases
-- Node.js 20+ (for building from source)
+- Node.js 22.13+ (for building and testing from source)
+
+The minimum runtime ensures that the extension and its tests can use the
+unflagged `node:sqlite` API. Standalone UWF skill scripts outside this directory
+continue to support Node.js 20+.
 
 ## Building from Source
 
 ```bash
 cd uwf-companion
-npm install
-npm run build          # produces dist/extension.js
+npm ci
+npm test               # builds and runs the complete Node test suite
+npm run package        # produces uwf-companion-0.1.0.vsix
 ```
 
 ## Running in Development
