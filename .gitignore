@@ -8,3 +8,7 @@ tmp/
 *.db-shm
 *.db-wal
 package-lock.json
+!/.github/skills/uwf-adr/package-lock.json
+!/.github/skills/uwf-discovery/package-lock.json
+!/.github/skills/uwf-local-tracking/package-lock.json
+!/.github/skills/uwf-requirements/package-lock.json

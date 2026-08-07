@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  smoke:
+    name: UWF smoke suite
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install locked smoke-test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package_dir in \
+            .github/skills/uwf-model-adaptation \
+            .github/skills/uwf-orchestration-engine \
+            .github/skills/uwf-state-manager \
+            .github/skills/uwf-adr \
+            .github/skills/uwf-discovery \
+            .github/skills/uwf-local-tracking \
+            .github/skills/uwf-requirements
+          do
+            npm ci --no-audit --no-fund --prefix "$package_dir"
+          done
+
+      - name: Run complete UWF smoke suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in scripts/uwf-smoke/*.mjs; do
+            node "$test_file"
+          done

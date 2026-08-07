@@ -351,7 +351,7 @@ function cmdListStages(db) {
   });
 
   process.stdout.write(JSON.stringify(list, null, 2) + "\n");
-  process.exit(0);
+  process.exitCode = 0;
 }
 
 function cmdCheckGate(db) {
