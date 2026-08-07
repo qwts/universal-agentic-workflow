@@ -1,5 +1,6 @@
 /**
- * Smoke test: referenced UWF skills and supported traits resolve on disk.
+ * Smoke test: referenced UWF skills, traits, and persona trait-stage contracts
+ * resolve on disk.
  *
  * Usage:
  *   node scripts/uwf-smoke/test-skill-reference-integrity.mjs
@@ -18,7 +19,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -166,7 +174,10 @@ function collectTraitFindings(repoRoot) {
   );
   const traitsRoot = join(repoRoot, ".github/skills/uwf-traits/traits");
   const findings = [];
+  const stageContracts = new Map();
   const traitSources = new Map();
+  const personaTraitUses = [];
+  const traitDefinitions = new Map();
 
   if (!isDirectory(contractsRoot)) {
     return [
@@ -180,6 +191,11 @@ function collectTraitFindings(repoRoot) {
 
   const contractFiles = listFiles(contractsRoot).filter(
     (path) => path.endsWith(".yaml") || path.endsWith(".yml"),
+  );
+  const runtimeContractFiles = new Set(
+    readdirSync(contractsRoot)
+      .filter((name) => name.endsWith(".yaml"))
+      .map((name) => join(contractsRoot, name)),
   );
   if (contractFiles.length === 0) {
     findings.push({
@@ -216,6 +232,12 @@ function collectTraitFindings(repoRoot) {
 
     for (const traitId of parsed.value.supported_traits) {
       addTraitReference(findings, traitSources, traitId, source);
+    }
+    if (runtimeContractFiles.has(contractFile)) {
+      stageContracts.set(basename(contractFile, ".yaml"), {
+        source,
+        supportedTraits: new Set(parsed.value.supported_traits),
+      });
     }
   }
 
@@ -271,6 +293,17 @@ function collectTraitFindings(repoRoot) {
 
       for (const traitId of stage.traits) {
         addTraitReference(findings, traitSources, traitId, stageSource);
+        if (
+          typeof stage.stage_type === "string" &&
+          typeof traitId === "string" &&
+          TRAIT_ID_PATTERN.test(traitId)
+        ) {
+          personaTraitUses.push({
+            source: stageSource,
+            stageType: stage.stage_type,
+            traitId,
+          });
+        }
       }
     }
   }
@@ -297,6 +330,11 @@ function collectTraitFindings(repoRoot) {
       continue;
     }
 
+    traitDefinitions.set(traitId, {
+      source: repoPath(repoRoot, traitFile),
+      value: parsed.value,
+    });
+
     if (
       parsed.value == null ||
       typeof parsed.value !== "object" ||
@@ -306,6 +344,38 @@ function collectTraitFindings(repoRoot) {
         code: "trait-id-mismatch",
         subject: repoPath(repoRoot, traitFile),
         detail: `expected trait_id ${traitId}, found ${String(parsed.value?.trait_id)}`,
+      });
+    }
+  }
+
+  for (const { source, stageType, traitId } of personaTraitUses) {
+    const contract = stageContracts.get(stageType);
+    if (!contract || !contract.supportedTraits.has(traitId)) {
+      const supported = contract
+        ? [...contract.supportedTraits].join(", ")
+        : "no stage contract found";
+      const contractLocation = contract ? ` in ${contract.source}` : "";
+      findings.push({
+        code: "unsupported-stage-trait",
+        subject: source,
+        detail: `trait "${traitId}" is not supported by stage_type "${stageType}"${contractLocation}; supported: ${supported}`,
+      });
+      continue;
+    }
+
+    const traitDefinition = traitDefinitions.get(traitId);
+    if (
+      traitDefinition?.value != null &&
+      typeof traitDefinition.value === "object" &&
+      traitDefinition.value.trait_id === traitId &&
+      !traitDefinition.value.stage_policies?.[stageType]
+    ) {
+      findings.push({
+        code: "missing-stage-trait-policy",
+        subject: source,
+        detail:
+          `trait "${traitId}" in ${traitDefinition.source} has no ` +
+          `stage_policies entry for stage_type "${stageType}"`,
       });
     }
   }
@@ -360,8 +430,20 @@ function runNegativeFixture() {
         "  - missing_fixture",
         "  - mismatched_fixture",
         "  - invalid_fixture",
+        "  - persona_missing_fixture",
+        "  - policyless_fixture",
+        "  - valid_fixture",
         "",
       ].join("\n"),
+    );
+    writeFileSync(
+      join(contractsRoot, "fixture.yml"),
+      "supported_traits:\n  - unsupported_fixture\n",
+    );
+    mkdirSync(join(contractsRoot, "nested"), { recursive: true });
+    writeFileSync(
+      join(contractsRoot, "nested/fixture.yaml"),
+      "supported_traits:\n  - unsupported_fixture\n",
     );
     writeFileSync(
       join(personaRoot, "stages.yaml"),
@@ -372,6 +454,9 @@ function runNegativeFixture() {
         "    stage_type: fixture",
         "    traits:",
         "      - persona_missing_fixture",
+        "      - unsupported_fixture",
+        "      - policyless_fixture",
+        "      - valid_fixture",
         "",
       ].join("\n"),
     );
@@ -382,6 +467,36 @@ function runNegativeFixture() {
     writeFileSync(
       join(traitsRoot, "invalid_fixture.yaml"),
       "trait_id: [unterminated\n",
+    );
+    writeFileSync(
+      join(traitsRoot, "unsupported_fixture.yaml"),
+      [
+        "trait_id: unsupported_fixture",
+        "stage_policies:",
+        "  fixture:",
+        "    question_policy: standard",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(traitsRoot, "policyless_fixture.yaml"),
+      [
+        "trait_id: policyless_fixture",
+        "stage_policies:",
+        "  another_stage:",
+        "    question_policy: standard",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(traitsRoot, "valid_fixture.yaml"),
+      [
+        "trait_id: valid_fixture",
+        "stage_policies:",
+        "  fixture:",
+        "    question_policy: standard",
+        "",
+      ].join("\n"),
     );
 
     return auditRepository(fixtureRoot);
@@ -450,6 +565,35 @@ assert(
       finding.subject.endsWith("invalid_fixture.yaml"),
   ),
 );
+assert(
+  "persona trait unsupported by the direct runtime contract is rejected",
+  fixtureFindings.some(
+    (finding) =>
+      finding.code === "unsupported-stage-trait" &&
+      finding.subject.endsWith("stages.yaml stage fixture") &&
+      finding.detail.includes('trait "unsupported_fixture"') &&
+      finding.detail.includes("stage-contracts/fixture.yaml"),
+  ),
+);
+assert(
+  "persona trait without a stage policy is rejected",
+  fixtureFindings.some(
+    (finding) =>
+      finding.code === "missing-stage-trait-policy" &&
+      finding.subject.endsWith("stages.yaml stage fixture") &&
+      finding.detail.includes('trait "policyless_fixture"') &&
+      finding.detail.includes("traits/policyless_fixture.yaml"),
+  ),
+);
+assert(
+  "direct runtime contract wins over ignored yml and nested contracts",
+  !fixtureFindings.some(
+    (finding) =>
+      ["unsupported-stage-trait", "missing-stage-trait-policy"].includes(
+        finding.code,
+      ) && finding.detail.includes('trait "valid_fixture"'),
+  ),
+);
 
 console.log(`2. Repository references resolve (${targetRoot})`);
 if (!isDirectory(targetRoot)) {
@@ -457,7 +601,7 @@ if (!isDirectory(targetRoot)) {
 } else {
   const repositoryFindings = auditRepository(targetRoot);
   if (repositoryFindings.length === 0) {
-    assert("all referenced skills and supported traits resolve", true);
+    assert("all referenced skills and persona trait-stage contracts resolve", true);
   } else {
     for (const finding of repositoryFindings) {
       console.error(
