@@ -5,6 +5,6 @@
   "description": "UWF Orchestration Engine — stage tracking and gate enforcement utilities",
   "dependencies": {
     "better-sqlite3": "^9.4.3",
-    "js-yaml": "^4.1.0"
+    "js-yaml": "^4.3.1"
   }
 }
