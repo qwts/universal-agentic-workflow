@@ -22,9 +22,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  policy:
+    name: Action Policy
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: qwts/playbook-engineering/.github/actions/ci-policy@5455a3f5939369ea843b1bbb4d2573739f4381a6
+
   smoke:
     name: UWF smoke suite
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: policy
+    if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -38,23 +47,104 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install locked smoke-test dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          for package_dir in \
-            .github/skills/uwf-model-adaptation \
-            .github/skills/uwf-orchestration-engine \
-            .github/skills/uwf-state-manager \
-            .github/skills/uwf-adr \
-            .github/skills/uwf-discovery \
-            .github/skills/uwf-local-tracking \
-            .github/skills/uwf-question-protocol \
-            .github/skills/uwf-review \
-            .github/skills/uwf-requirements
-          do
-            npm ci --no-audit --no-fund --prefix "$package_dir"
-          done
+      - name: Install model-adaptation dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install model-adaptation dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-model-adaptation
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install orchestration-engine dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install orchestration-engine dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-orchestration-engine
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install state-manager dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install state-manager dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-state-manager
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install ADR dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install ADR dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-adr
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install discovery dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install discovery dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-discovery
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install local-tracking dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install local-tracking dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-local-tracking
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install question-protocol dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install question-protocol dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-question-protocol
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install review dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install review dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-review
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install requirements dependencies
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install requirements dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: .github/skills/uwf-requirements
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
 
       - name: Run complete UWF smoke suite
         shell: bash
@@ -66,7 +156,8 @@ jobs:
 
   companion:
     name: UWF Companion
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: policy
+    if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -86,7 +177,38 @@ jobs:
           cache-dependency-path: uwf-companion/package-lock.json
 
       - name: Install locked Companion dependencies
-        run: npm ci --no-audit --no-fund
+        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        with:
+          task: Install locked Companion dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf-companion
+          timeout-seconds: '600'
+          attempts: '2'
+          retry-delay-seconds: '5'
 
       - name: Build and test Companion
         run: npm test
+
+  workflow-runtime:
+    name: Workflow runtime policy
+    needs: policy
+    if: ${{ needs.policy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact validation commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Check out pinned runtime checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: qwts/playbook-engineering
+          ref: 5455a3f5939369ea843b1bbb4d2573739f4381a6
+          path: .ci-runtime-policy
+          sparse-checkout: tools/ci-runtime
+          persist-credentials: false
+      - name: Enforce bounded workflow runtime
+        run: node .ci-runtime-policy/tools/ci-runtime/runtime-policy.mjs --root "$GITHUB_WORKSPACE"
