@@ -22,9 +22,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  policy:
+    name: Action Policy
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: qwts/playbook-engineering/.github/actions/ci-policy@5455a3f5939369ea843b1bbb4d2573739f4381a6
+
   smoke:
     name: UWF smoke suite
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: policy
+    if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -147,7 +156,8 @@ jobs:
 
   companion:
     name: UWF Companion
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: policy
+    if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -182,7 +192,8 @@ jobs:
 
   workflow-runtime:
     name: Workflow runtime policy
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    needs: policy
+    if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
