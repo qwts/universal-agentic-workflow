@@ -1,0 +1,6 @@
+{
+  "description": "Windsurf (Devin desktop) Cascade hooks. The machine memory guard is retired (agent-sop discussion #370); this adapter preserves repository-owned identity entries.",
+  "hooks": {
+    "pre_run_command": []
+  }
+}
