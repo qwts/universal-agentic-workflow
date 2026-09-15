@@ -212,3 +212,16 @@ jobs:
           persist-credentials: false
       - name: Enforce bounded workflow runtime
         run: node .ci-runtime-policy/tools/ci-runtime/runtime-policy.mjs --root "$GITHUB_WORKSPACE"
+
+  codeql:
+    name: CodeQL
+    needs: policy
+    # Code scanning needs GitHub Advanced Security, which a private repository
+    # on a personal account cannot enable; the lane is skipped while private.
+    if: ${{ needs.policy.result == 'success' && github.event.repository.private == false }}
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
