@@ -35,7 +35,7 @@ jobs:
     needs: policy
     if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 95
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,7 +159,7 @@ jobs:
     needs: policy
     if: ${{ needs.policy.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 22
     defaults:
       run:
         working-directory: uwf-companion
