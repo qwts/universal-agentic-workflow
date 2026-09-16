@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: qwts/playbook-engineering/.github/actions/ci-policy@5455a3f5939369ea843b1bbb4d2573739f4381a6
+      - uses: qwts/qwts-agent-ci/.github/actions/ci-policy@3a5617b287d922e37f262210a1d8750d8217b56d
 
   smoke:
     name: UWF smoke suite
@@ -48,7 +48,7 @@ jobs:
           node-version: 20
 
       - name: Install model-adaptation dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install model-adaptation dependencies
           executable: npm
@@ -59,7 +59,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install orchestration-engine dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install orchestration-engine dependencies
           executable: npm
@@ -70,7 +70,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install state-manager dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install state-manager dependencies
           executable: npm
@@ -81,7 +81,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install ADR dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install ADR dependencies
           executable: npm
@@ -92,7 +92,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install discovery dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install discovery dependencies
           executable: npm
@@ -103,7 +103,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install local-tracking dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install local-tracking dependencies
           executable: npm
@@ -114,7 +114,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install question-protocol dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install question-protocol dependencies
           executable: npm
@@ -125,7 +125,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install review dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install review dependencies
           executable: npm
@@ -136,7 +136,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install requirements dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install requirements dependencies
           executable: npm
@@ -177,7 +177,7 @@ jobs:
           cache-dependency-path: uwf-companion/package-lock.json
 
       - name: Install locked Companion dependencies
-        uses: qwts/playbook-engineering/.github/actions/bounded-command@5455a3f5939369ea843b1bbb4d2573739f4381a6
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
         with:
           task: Install locked Companion dependencies
           executable: npm
@@ -205,8 +205,8 @@ jobs:
       - name: Check out pinned runtime checker
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: qwts/playbook-engineering
-          ref: 5455a3f5939369ea843b1bbb4d2573739f4381a6
+          repository: qwts/qwts-agent-ci
+          ref: 3a5617b287d922e37f262210a1d8750d8217b56d
           path: .ci-runtime-policy
           sparse-checkout: tools/ci-runtime
           persist-credentials: false
