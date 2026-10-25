@@ -93,3 +93,26 @@ re-invoked without counting against retries; a `failed` one restarts with retrie
 `max_turns` (positive integer; default 20, `implementation` 30) caps the agent turns of one attempt and is passed to the adapter (`claude -p --max-turns`; the fake adapter fails a fixture whose `turnsNeeded` exceeds it). A stage that stops at the cap is a gate failure whose retry prompt says: "The stage stopped after N turns without producing <outputs>; read only the listed inputs and write the outputs directly." `--list-stages` exposes it as `maxTurns`; `--dry-run` and `gates` print it.
 `runner.mjs cost --data-dir d [--workflow w] [--repo-root r]` reads `<d>/transcripts/*.json` and prints per stage the turns, context per turn ((cache_read + cache_write) / turns), cache and output tokens, thinking tokens, reported cost, and flags (`!50K` average context per turn above 50K, `!100K` final turn likely above the 100K pricing tier). With `--workflow` it adds the static prompt size (chars, ~tokens at 4 chars/token) and the size of the agent file plus the `.github/...` files it tells the stage to read.
 Tests: `node scripts/uwf-runner/test/runner.test.mjs` (fake adapter, fixtures in `test/fixtures/<workflow>/`).
+
+## Install story for a consumer repo
+
+Nothing to copy. The runner keeps two roots apart:
+
+- **skills root** holds the workflow definitions (`uwf-<workflow>/stages.yaml`), stage contracts, traits, model profiles, schemas, agent files (`.github/agents`) and SKILL docs. It defaults to the runner's own checkout.
+- **repo root** (`--repo-root`, default the current checkout) is the target repo: the agent's cwd, where `{{cwd}}` gate paths and `{{output_path}}` resolve, and where `tmp/workflow-artifacts` is written.
+
+Resolution rule for the skills root, first match wins:
+
+1. `--skills-root <dir>` (a directory that contains `.github/skills` and `.github/agents`)
+2. env `UWF_SKILLS_ROOT`
+3. the target repo's own copy, when `<repo-root>/.github/skills/uwf-<workflow>/stages.yaml` exists (the runner logs `using the target repo's own workflow definitions` once). Use this to override a stage, for example `max_retries`, in one repo. Engine resources and agent files the target does not carry fall back to the runner's checkout.
+4. the runner's own checkout
+
+The runner passes the resolved root to every CLI it spawns (`UWF_SKILLS_ROOT`) and to prompt materialization, which rewrites the `.github/skills/...` and `.github/agents/...` paths inside agent text to absolute paths under the skills root, so a stage never looks for them in the target. `run`, `resume`, `--dry-run`, `gates` and `cost` all use the same rule.
+
+What the target needs: a git repo and the output path (created on demand). No `.github/`, no skills, no agents.
+
+```
+node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md --repo-root ../my-app
+node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md --repo-root ../my-app --skills-root ../uwf-fork
+```

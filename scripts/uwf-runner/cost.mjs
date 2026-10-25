@@ -43,16 +43,17 @@ export function transcriptRow(file, t) {
 }
 
 /** Files the agent body tells the stage to read (`.github/...` paths in backticks), with their sizes. */
-function referencedChars(repoRoot, systemPrompt) {
+function referencedChars(skillsRoot, systemPrompt) {
   let total = 0;
-  for (const ref of new Set([...String(systemPrompt).matchAll(/`(\.github\/[^`\s]+)`/g)].map((x) => x[1]))) {
-    const p = resolve(repoRoot, ref);
+  // Relative refs resolve against skillsRoot; refs the prompt already made absolute resolve to themselves.
+  for (const ref of new Set([...String(systemPrompt).matchAll(/`([^`\s]*\.github\/[^`\s]+)`/g)].map((x) => x[1]))) {
+    const p = resolve(skillsRoot, ref);
     if (existsSync(p) && !p.endsWith("/")) { try { total += readFileSync(p, "utf8").length; } catch { /* directory */ } }
   }
   return total;
 }
 
-export async function costReport({ dataDir, workflow, repoRoot, outputPath }) {
+export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outputPath }) {
   const dir = join(dataDir, "transcripts");
   if (!existsSync(dir)) throw new Error(`No transcripts directory at ${dir}`);
   const rows = [];
@@ -68,8 +69,8 @@ export async function costReport({ dataDir, workflow, repoRoot, outputPath }) {
   if (workflow) {
     for (const st of new Set(rows.map((r) => r.stage))) {
       try {
-        const mp = await materializePrompt({ workflow, stage: st, repoRoot, outputPath, dataDir });
-        statics[st] = { prompt: mp.prompt.length, system: mp.systemPrompt.length, refs: referencedChars(repoRoot, mp.systemPrompt) };
+        const mp = await materializePrompt({ workflow, stage: st, repoRoot, skillsRoot, outputPath, dataDir });
+        statics[st] = { prompt: mp.prompt.length, system: mp.systemPrompt.length, refs: referencedChars(skillsRoot ?? repoRoot, mp.systemPrompt) };
       } catch { /* stage not in this workflow */ }
     }
   }

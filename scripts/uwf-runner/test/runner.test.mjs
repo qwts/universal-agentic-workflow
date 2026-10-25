@@ -61,7 +61,8 @@ function setup() {
   try {
     cpSync(FIXTURES, s.fixtures, { recursive: true });
     cpSync(join(ROOT, ".github", "agents"), join(s.repo, ".github", "agents"), { recursive: true });
-    // stage-tracker resolves stages.yaml relative to cwd, so the scratch repo needs the persona dir.
+    // This scratch repo ships its own definitions (a consumer repo that overrides them); the
+    // "bare target" cases below use setupBare() instead.
     cpSync(join(SKILLS, "uwf-sw_dev"), join(s.repo, ".github", "skills", "uwf-sw_dev"), { recursive: true });
   } catch (e) {
     rmSync(s.base, { recursive: true, force: true });
@@ -69,6 +70,29 @@ function setup() {
   }
   return s;
 }
+
+/** A target repo with no .github/ at all: definitions come from the runner's own root. */
+function setupBare() {
+  const s = scratch();
+  try {
+    cpSync(FIXTURES, s.fixtures, { recursive: true });
+    mkdirSync(s.repo, { recursive: true });
+  } catch (e) {
+    rmSync(s.base, { recursive: true, force: true });
+    throw e;
+  }
+  return s;
+}
+
+const SELF_COPY_LINE = "using the target repo's own workflow definitions";
+const bumpReviewRetries = (file, n) => {
+  const text = readFileSync(file, "utf8");
+  const next = text.replace(/^(  - name: review\n(?:.*\n)*?    max_retries: )\d+$/m, `$1${n}`);
+  if (next === text) throw new Error("review max_retries not found in " + file);
+  writeFileSync(file, next);
+};
+const reviewRetries = (out) => out.split("\n").find((l) => l.includes("] review "))
+  ? out.split("\n")[out.split("\n").findIndex((l) => l.includes("] review ")) + 2]?.match(/retries: (\d+)/)?.[1] : undefined;
 
 function transcripts(s) {
   const dir = join(s.data, "transcripts");
@@ -608,6 +632,65 @@ const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not a
     const none = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", join(c.base, "nope")], { encoding: "utf8" });
     check("cost on a missing data dir exits 2", none.status === 2, none.stderr);
   } finally { rmSync(c.base, { recursive: true, force: true }); }
+}
+
+// 11. Skills root vs repo root -------------------------------------------------
+{
+  console.log("# bare target: no .github/ in the target repo");
+  const s = setupBare();
+  try {
+    const r = run(s);
+    check("sw_dev runs end to end against a bare repo", r.code === 0, r.err.slice(-600));
+    for (const st of ALL_STAGES) {
+      const line = r.out.split("\n").find((l) => l.startsWith(st + " "));
+      check(`bare: ${st} ${SKIPPED.includes(st) ? "skipped" : "passed"}`, !!line && line.includes(SKIPPED.includes(st) ? "skipped" : "passed"), line ?? "(no row)");
+    }
+    check("bare: nothing was copied into the target (.github absent)", !existsSync(join(s.repo, ".github")));
+    check("bare: no target-definitions log line", !r.err.includes(SELF_COPY_LINE));
+    check("bare: artifacts landed in the target repo", existsSync(join(s.repo, "tmp", "workflow-artifacts")));
+    const prompts = transcripts(s).map((t) => JSON.stringify(t)).join("\n");
+    check("bare: no prompt points at <repo>/.github", !prompts.includes(join(s.repo, ".github")));
+    const dry = run(setupBareDry(s), ["--dry-run"]);
+    check("bare: --dry-run works", dry.code === 0 && ALL_STAGES.every((st) => dry.out.includes(`] ${st} `)), dry.err.slice(-300));
+    const gates = spawnSync(process.execPath, [RUNNER, "gates", "--workflow", "sw_dev", "--repo-root", s.repo], { encoding: "utf8" });
+    check("bare: gates works", gates.status === 0 && gates.stdout.includes("review"), gates.stderr.slice(-300));
+    const cost = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", s.data, "--workflow", "sw_dev", "--repo-root", s.repo], { encoding: "utf8" });
+    check("bare: cost works", cost.status === 0 || /No claude-code transcripts/.test(cost.stderr), cost.stderr.slice(-300));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
+
+{
+  console.log("# target ships its own stages.yaml");
+  const s = setup();
+  try {
+    bumpReviewRetries(join(s.repo, ".github", "skills", "uwf-sw_dev", "stages.yaml"), 7);
+    const r = run(s, ["--dry-run"]);
+    check("target definitions override: review retries 7", r.code === 0 && reviewRetries(r.out) === "7", r.out.slice(0, 300) + r.err.slice(-300));
+    check("auto-detect logs one line", r.err.split("\n").filter((l) => l.includes(SELF_COPY_LINE)).length === 1, r.err);
+    const own = run(s, ["--dry-run", "--skills-root", ROOT]);
+    check("explicit --skills-root beats the target's copy", own.code === 0 && reviewRetries(own.out) === "3" && !own.err.includes(SELF_COPY_LINE), own.out.slice(0, 300) + own.err.slice(-300));
+    const viaEnv = run(s, ["--dry-run"], { UWF_SKILLS_ROOT: ROOT });
+    check("UWF_SKILLS_ROOT beats the target's copy", viaEnv.code === 0 && reviewRetries(viaEnv.out) === "3", viaEnv.out.slice(0, 300));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# --skills-root pointing at a copied skills tree");
+  const s = setupBare();
+  try {
+    const tree = join(s.base, "skills-copy");
+    cpSync(join(ROOT, ".github", "skills"), join(tree, ".github", "skills"), { recursive: true, filter: (src) => !src.split("/").includes("node_modules") });
+    cpSync(join(ROOT, ".github", "agents"), join(tree, ".github", "agents"), { recursive: true });
+    bumpReviewRetries(join(tree, ".github", "skills", "uwf-sw_dev", "stages.yaml"), 9);
+    const dry = run(s, ["--dry-run", "--skills-root", tree]);
+    check("copied tree: review retries 9 (definitions read from --skills-root)", dry.code === 0 && reviewRetries(dry.out) === "9", dry.out.slice(0, 300) + dry.err.slice(-300));
+    const r = run(s, ["--skills-root", tree]);
+    check("copied tree: full loop passes against the bare repo", r.code === 0, r.err.slice(-600));
+    check("copied tree: target stays bare", !existsSync(join(s.repo, ".github")));
+    const missing = run(s, ["--dry-run", "--skills-root", join(s.base, "nope")]);
+    check("missing --skills-root exits 2", missing.code === 2, missing.err.slice(-300));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
