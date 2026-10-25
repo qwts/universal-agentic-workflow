@@ -1,0 +1,17 @@
+Run the review stage for the sw_dev workflow.
+
+Context:
+{
+  "workflow": "sw_dev",
+  "role": "issues",
+  "phase": "review",
+  "outputPath": "/OUT",
+  "statePath": "/DATA/uwf-state.json"
+}
+
+## Inputs
+### /OUT/issues-plan.md
+(missing)
+
+## Required outputs
+- /OUT/issues-review.md

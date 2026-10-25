@@ -1,0 +1,58 @@
+Run the discovery stage for the sw_dev workflow.
+
+Context:
+{
+  "workflow": "sw_dev",
+  "role": "issues",
+  "phase": "discovery",
+  "outputPath": "/OUT",
+  "statePath": "/DATA/uwf-state.json",
+  "stage_type": "discovery",
+  "trait_ids": [
+    "sw_dev"
+  ],
+  "model_profile": "balanced",
+  "behavior_policy": {
+    "priority_order": [
+      "unknowns",
+      "constraints",
+      "risks",
+      "codebase_facts",
+      "touched_systems",
+      "integration_points",
+      "dependencies",
+      "test_surface"
+    ],
+    "must_address": [
+      "unknowns",
+      "constraints",
+      "assumptions",
+      "touched_systems",
+      "interfaces",
+      "dependencies",
+      "implementation_constraints",
+      "test_surface"
+    ],
+    "question_policy": "standard",
+    "risk_focus": [
+      "technical",
+      "dependency",
+      "integration"
+    ],
+    "evidence_threshold": "high"
+  },
+  "steering_policy": {
+    "instruction_density": "standard",
+    "include_examples": false,
+    "step_expansion": true,
+    "schema_reminders": "standard",
+    "self_check": true
+  }
+}
+
+## Inputs
+### /OUT/issues-intake.md
+(missing)
+
+## Required outputs
+- /OUT/issues-discovery.md
