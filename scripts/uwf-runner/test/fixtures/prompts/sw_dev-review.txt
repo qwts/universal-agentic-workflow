@@ -6,7 +6,13 @@ Context:
   "role": "issues",
   "phase": "review",
   "outputPath": "/OUT",
-  "statePath": "/DATA/uwf-state.json"
+  "statePath": "/DATA/uwf-state.json",
+  "inputs": [
+    "/OUT/issues-plan.md"
+  ],
+  "outputs": [
+    "/OUT/issues-review.md"
+  ]
 }
 
 ## Inputs

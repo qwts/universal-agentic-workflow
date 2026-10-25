@@ -85,3 +85,16 @@ await test("CLI prints the same prompt as the API", async () => {
 
 if (failures) { console.log(`\n${failures} failed`); process.exit(1); }
 console.log("\nall prompt tests passed");
+
+// Node 20 has no fs.globSync: the fallback matcher must agree with the native one.
+{
+  const { globFiles } = await import("../prompt.mjs");
+  const pattern = "docs/adr/ADR-[0-9]*.md";
+  const native = globFiles(pattern, repoRoot).map((p) => p.replace(`${repoRoot}/`, "")).sort();
+  process.env.UWF_FORCE_GLOB_FALLBACK = "1";
+  const fallback = globFiles(pattern, repoRoot).map((p) => p.replace(`${repoRoot}/`, "")).sort();
+  delete process.env.UWF_FORCE_GLOB_FALLBACK;
+  assert.ok(native.length > 0, "glob pattern matched nothing");
+  assert.deepEqual(fallback, native, "glob fallback disagrees with fs.globSync");
+  console.log("ok   glob fallback matches native");
+}
