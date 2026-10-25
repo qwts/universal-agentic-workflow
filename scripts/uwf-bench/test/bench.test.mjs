@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { extractUsage, buildOutcomes } from "../bench.mjs";
+import { extractUsage, buildOutcomes, processTree, runProcess } from "../bench.mjs";
 import { parseYamlSubset, planRuns, loadMatrix } from "../matrix.mjs";
 import { openSqlite } from "../sqlite.mjs";
 
@@ -162,6 +162,36 @@ cells:
   check("--help exits 0", bench(["--help"]).code === 0);
   check("missing --matrix exits 2", bench(["run"]).code === 2);
   check("invalid matrix exits 2", (writeFileSync(join(base, "bad.yaml"), "cells:\n"), bench(["run", "--matrix", join(base, "bad.yaml")]).code === 2));
+}
+
+// Whole-run timeout must kill the runner's entire tree, including a grandchild that detached into its
+// own process group the way the claude-code and codex adapters start their CLIs.
+if (process.platform !== "win32") {
+  console.log("timeout kills detached grandchild");
+  const base = mkdtempSync(join(tmpdir(), "uwf-bench-kill-"));
+  bases.push(base);
+  const pidFile = join(base, "grandchild.pid");
+  const parent = join(base, "parent.mjs");
+  writeFileSync(parent, `
+    import { spawn } from "node:child_process";
+    import { writeFileSync } from "node:fs";
+    const g = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    g.unref();
+    writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+    setInterval(() => {}, 1000);
+  `);
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  // 1.5 s gives the parent time to start the grandchild and write its pid before the whole-run timer fires.
+  const res = await runProcess([parent], { cwd: base, env: process.env, timeout: 1500 });
+  const gpid = existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : 0;
+  const r = { res, gpid };
+  check("grandchild pid captured", r.gpid > 0);
+  check("timed out", r.res.timedOut === true && r.res.status === null);
+  await new Promise((t) => setTimeout(t, 200));
+  check("detached grandchild is dead", !alive(r.gpid), `pid ${r.gpid} still alive`);
+  if (alive(r.gpid)) { try { process.kill(r.gpid, "SIGKILL"); } catch {} }
+  const tree = processTree(process.pid);
+  check("processTree includes self", tree.pids.includes(process.pid));
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

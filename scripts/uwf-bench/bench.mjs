@@ -187,37 +187,83 @@ const sum = (rows, k) => (rows.some((r) => r[k] != null) ? rows.reduce((a, r) =>
 // One run
 // ---------------------------------------------------------------------------
 
+/** Own process group id (POSIX), so a tree kill never signals the harness's own group. */
+const ownPgid = (() => {
+  if (process.platform === "win32") return null;
+  const r = spawnSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" });
+  return r.status === 0 ? Number(r.stdout.trim()) : null;
+})();
+
 /**
- * Run the runner in its own process group and, on the whole-run timeout, kill the whole group:
- * the adapters start their CLIs detached, so killing only the runner would leave a live agent
- * spending budget and editing the fixture while the harness collects results and cleans up.
+ * Every live descendant of `root` (by parent pid) and the process groups they lead or belong to.
+ * The adapters start their CLIs detached (own group), so a group kill of the runner alone misses them;
+ * walking the parent chain finds them, since detaching changes the group, not the parent.
+ */
+export function processTree(root) {
+  if (process.platform === "win32") return { pids: [root], pgids: [] };
+  const r = spawnSync("ps", ["-eo", "pid=,ppid=,pgid="], { encoding: "utf8" });
+  if (r.status !== 0) return { pids: [root], pgids: [] };
+  const rows = r.stdout.trim().split("\n").map((l) => l.trim().split(/\s+/).map(Number)).filter((x) => x.length === 3);
+  const kids = new Map();
+  const pgidOf = new Map();
+  for (const [pid, ppid, pgid] of rows) { (kids.get(ppid) ?? kids.set(ppid, []).get(ppid)).push(pid); pgidOf.set(pid, pgid); }
+  const pids = [];
+  const stack = [root];
+  while (stack.length) { const pid = stack.pop(); pids.push(pid); for (const k of kids.get(pid) ?? []) stack.push(k); }
+  const pgids = [...new Set(pids.map((pid) => pgidOf.get(pid)))].filter((g) => g && g !== ownPgid);
+  return { pids, pgids };
+}
+
+/** SIGKILL the whole tree under `root`: detached groups first, then every pid. Never throws. */
+export function killTree(root) {
+  if (process.platform === "win32") { spawnSync("taskkill", ["/T", "/F", "/PID", String(root)], { stdio: "ignore" }); return; }
+  const { pids, pgids } = processTree(root);
+  for (const g of pgids) { try { process.kill(-g, "SIGKILL"); } catch { /* gone */ } }
+  for (const pid of pids) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+}
+
+/** The runner currently executing, so a SIGINT/SIGTERM to the harness can take its tree down too. */
+let activeChild = null;
+
+/**
+ * Run the runner, capture its output, and on the whole-run timeout kill its entire process tree,
+ * including the adapters' detached CLI groups, before resolving: a live agent must not keep spending
+ * budget or editing the fixture while the harness collects results and cleans up.
  */
 export function runProcess(args, { cwd, env, timeout }) {
   return new Promise((done) => {
     let out = "", err = "", timedOut = false, settled = false;
-    const child = spawn(process.execPath, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
-    const killTree = () => {
-      try { if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
-      catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
-    };
-    const timer = timeout ? setTimeout(() => { timedOut = true; killTree(); }, timeout) : null;
+    const child = spawn(process.execPath, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    activeChild = child;
+    const timer = timeout ? setTimeout(() => { timedOut = true; killTree(child.pid); }, timeout) : null;
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     const finish = (status, signal, error) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (activeChild === child) activeChild = null;
       done({ status: timedOut ? null : status, signal, stdout: out, stderr: err, timedOut, error });
     };
     child.on("error", (e) => finish(null, null, e));
-    // "close" (not "exit") waits for the pipes, which the killed group releases.
+    // "close" (not "exit") waits for the pipes, which the killed tree releases.
     child.on("close", (status, signal) => finish(status, signal));
   });
 }
 
+/** Ctrl-C or SIGTERM on the harness: take the active runner's tree down, then exit 130/143. */
+export function installSignalForwarding() {
+  for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+    process.on(sig, () => {
+      log(`[bench] ${sig}: stopping the active run`);
+      if (activeChild) { const c = activeChild; c.once("close", () => process.exit(code)); killTree(c.pid); setTimeout(() => process.exit(code), 5000).unref(); }
+      else process.exit(code);
+    });
+  }
+}
+
 const FAILURE = { 0: "none", 1: "model_failure", 2: "harness_error", 3: "harness_error" };
 const STATE = { 0: "complete", 1: "gate_blocked", 2: "usage_error", 3: "questions_pending" };
-
 /** Execute one planned run and return { run, outcomes } ready for insertRun. Never throws. */
 export async function executeRun(matrix, entry, ctx) {
   const { cell, fixture, run_index, block } = entry;
@@ -301,6 +347,7 @@ async function cmdRun(flags) {
     runnerSha: git(ROOT, ["rev-parse", "HEAD"]), gated: gatedStages(matrix.workflow),
     stagesYamlSha: sha256(join(SKILLS, `uwf-${matrix.workflow}`, "stages.yaml")),
   };
+  installSignalForwarding();
   const plan = planRuns(matrix);
   const counts = {};
   for (const [i, entry] of plan.entries()) {
