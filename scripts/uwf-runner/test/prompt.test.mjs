@@ -53,7 +53,7 @@ await test("existing input is excerpted to 12 lines and not reported missing", a
 await test("prompt tells the stage to read only its declared inputs", async () => {
   const r = await materializePrompt({ workflow: "sw_dev", stage: "blueprint", ...opts });
   assert.match(r.prompt, /## Reading rules\nRead the files listed under Inputs .*plus only the repository files your task requires/);
-  assert.match(r.prompt, /Do not list or read the whole artifacts directory or the whole repository/);
+  assert.match(r.prompt, /Do not list or read the whole artifacts directory, and do not dump the whole repository into context/);
   assert.ok(r.prompt.indexOf("## Reading rules") < r.prompt.indexOf("## Inputs"));
 });
 
