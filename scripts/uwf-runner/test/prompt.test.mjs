@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -111,8 +111,28 @@ await test("bare target: referenced files are absolute skillsRoot paths, none un
       assert.ok(!/(^|[^/\w])\.github\/(skills|agents)\//m.test(r.systemPrompt), `${stage}: relative .github path left in agent text`);
       assert.ok(!r.systemPrompt.includes(`${bare}/.github`) && !r.prompt.includes(`${bare}/.github`));
       assert.ok(r.agentFile.startsWith(`${repoRoot}/.github/agents/`));
+      assert.match(r.prompt, /## Skill files\n[^\n]*use the same path under /, `${stage}: no skill-files rule for the bare target`);
     }
   } finally { rmSync(bare, { recursive: true, force: true }); }
+});
+
+// Partial target: it carries only its workflow's stages.yaml, so it is its own skills root, but the agent
+// files and skill docs still come from this checkout and the references must point there.
+await test("partial target: fallback agent references resolve to this checkout, own files stay relative", async () => {
+  const t = mkdtempSync(join(tmpdir(), "uwf-partial-"));
+  try {
+    mkdirSync(join(t, ".github", "skills", "uwf-sw_dev"), { recursive: true });
+    copyFileSync(join(repoRoot, ".github", "skills", "uwf-sw_dev", "stages.yaml"), join(t, ".github", "skills", "uwf-sw_dev", "stages.yaml"));
+    mkdirSync(join(t, ".github", "skills", "uwf-review"), { recursive: true });
+    writeFileSync(join(t, ".github", "skills", "uwf-review", "SKILL.md"), "# local review skill\n");
+    const r = await materializePrompt({ workflow: "sw_dev", stage: "review", repoRoot: t, outputPath: "/OUT", dataDir: "/DATA" });
+    assert.ok(r.systemPrompt.includes("`.github/skills/uwf-review/SKILL.md`") || r.systemPrompt.includes(".github/skills/uwf-review/SKILL.md"), "the target's own skill file stays relative");
+    assert.ok(!r.systemPrompt.includes(`${repoRoot}/.github/skills/uwf-review/SKILL.md`));
+    const others = r.systemPrompt.match(/\.github\/(?:skills|agents)\/[^\s`'")]*/g).filter((x) => !x.includes("uwf-review/SKILL.md"));
+    assert.ok(others.length > 0, "review agent should reference other skill files");
+    for (const ref of others) assert.ok(r.systemPrompt.includes(`${repoRoot}/${ref}`), `${ref} should resolve to this checkout`);
+    assert.match(r.prompt, new RegExp(`## Skill files\\n[^\\n]*under ${repoRoot} instead`));
+  } finally { rmSync(t, { recursive: true, force: true }); }
 });
 
 await test("explicit skillsRoot is honoured and the target's own copy is auto-detected", async () => {

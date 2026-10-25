@@ -246,14 +246,25 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   if (!existsSync(agentFile)) throw new PromptError(`Agent file not found: ${join(skillsRoot, ".github", "agents", `${agentName}.agent.md`)}`);
   const parsed = parseAgentFile(yaml, readFileSync(agentFile, "utf8"));
   const { frontmatter } = parsed;
-  // The agent text names its reference files as `.github/skills/...` / `.github/agents/...`. When the
-  // definitions are not in the target repo those relative paths would miss, so point them at skillsRoot.
-  const body = skillsRoot === repoRoot ? parsed.body : parsed.body.replace(/\.github\/(?:skills|agents)\/[^\s`'")]*/g, (full) => {
+  // The agent text names its reference files as `.github/skills/...` / `.github/agents/...`, relative to
+  // the agent's cwd (repoRoot). A reference the target carries stays relative; any other points at the
+  // first root that has it (skillsRoot, then this checkout), so a bare or partial target reads the right files.
+  const fallbackRoots = [...new Set([skillsRoot, DEFAULT_REPO])].filter((r) => r !== repoRoot);
+  let rewrote = false;
+  const body = parsed.body.replace(/\.github\/(?:skills|agents)\/[^\s`'")]*/g, (full) => {
     const m = full.replace(/[.,;:]+$/, "");
-    const own = join(skillsRoot, m);
-    const at = existsSync(own) || !existsSync(join(DEFAULT_REPO, m)) ? own : join(DEFAULT_REPO, m);
+    if (existsSync(join(repoRoot, m))) return full;
+    const at = fallbackRoots.map((r) => join(r, m)).find((q) => existsSync(q)) ?? join(fallbackRoots[0] ?? skillsRoot, m);
+    rewrote = true;
     return at + full.slice(m.length);
   });
+  // Skill docs the agent is told to read carry their own relative `.github/skills/...` commands, which
+  // the prompt cannot rewrite; give the stage the rule instead.
+  const skillFilesNote = rewrote ? [
+    "## Skill files",
+    `The workflow skills are not all in this repository. When an instruction names a \`.github/skills/...\` or \`.github/agents/...\` path or command that does not exist in the working directory, use the same path under ${fallbackRoots.join(" or, failing that, ")} instead.`,
+    "",
+  ] : [];
 
   const subst = (s) => String(s).replace(/\{\{output_path\}\}/g, outputPath).replace(/\{\{cwd\}\}/g, repoRoot);
   const inputs = (stageDef.inputs ?? []).map(subst);
@@ -310,6 +321,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
       "Do not list or read the whole artifacts directory, and do not dump the whole repository into context. " +
       "Write the required outputs directly once you have what you need.",
     "",
+    ...skillFilesNote,
     "## Inputs",
     inputBlocks.length ? inputBlocks.join("\n\n") : "(none)",
     "",
