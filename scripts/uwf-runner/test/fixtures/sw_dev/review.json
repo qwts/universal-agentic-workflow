@@ -1,0 +1,7 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-review.md": "# Review\n\nverdict: approved\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "review: done",
+  "delayMs": 0
+}

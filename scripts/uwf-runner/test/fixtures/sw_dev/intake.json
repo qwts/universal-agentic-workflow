@@ -1,0 +1,7 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-intake.md": "# Intake\n\nObjective\n\nAcceptance criteria\n\nConstraints\n\nExplicit out-of-scope\n\nKnown touched systems\n\nDuplicate/backlog status\n\nSprint/order recommendations\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "intake: done",
+  "delayMs": 0
+}

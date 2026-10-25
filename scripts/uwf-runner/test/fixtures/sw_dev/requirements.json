@@ -1,0 +1,7 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-requirements.md": "# Requirements\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "requirements: done",
+  "delayMs": 0
+}
