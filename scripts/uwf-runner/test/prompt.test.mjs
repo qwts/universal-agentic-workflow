@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,6 +99,34 @@ await test("CLI prints the same prompt as the API", async () => {
 
 if (failures) { console.log(`\n${failures} failed`); process.exit(1); }
 console.log("\nall prompt tests passed");
+
+// Two roots: a bare target (no .github/) gets agent text whose references point into skillsRoot.
+await test("bare target: referenced files are absolute skillsRoot paths, none under <repoRoot>/.github", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "uwf-bare-"));
+  try {
+    for (const stage of ["discovery", "review", "retro", "blueprint"]) {
+      const r = await materializePrompt({ workflow: "sw_dev", stage, repoRoot: bare, outputPath: "/OUT", dataDir: "/DATA" });
+      const refs = r.systemPrompt.match(/\/[^\s`'")]*\.github\/(?:skills|agents)\/[^\s`'")]*/g) ?? [];
+      assert.ok(refs.length > 0, `${stage}: agent text has no skillsRoot references to check`);
+      for (const ref of refs) assert.ok(ref.startsWith(`${repoRoot}/.github/`), `${stage}: ${ref} is not under skillsRoot`);
+      assert.ok(!/(^|[^/\w])\.github\/(skills|agents)\//m.test(r.systemPrompt), `${stage}: relative .github path left in agent text`);
+      assert.ok(!r.systemPrompt.includes(`${bare}/.github`) && !r.prompt.includes(`${bare}/.github`));
+      assert.ok(r.agentFile.startsWith(`${repoRoot}/.github/agents/`));
+    }
+  } finally { rmSync(bare, { recursive: true, force: true }); }
+});
+
+await test("explicit skillsRoot is honoured and the target's own copy is auto-detected", async () => {
+  const t = mkdtempSync(join(tmpdir(), "uwf-own-"));
+  try {
+    const { resolveSkillsRoot } = await import("../prompt.mjs");
+    assert.deepEqual(resolveSkillsRoot({ explicit: t, repoRoot: t, workflow: "sw_dev" }), { root: t, source: "flag" });
+    assert.equal(resolveSkillsRoot({ repoRoot: t, workflow: "sw_dev" }).source, "own");
+    mkdirSync(join(t, ".github", "skills", "uwf-sw_dev"), { recursive: true });
+    writeFileSync(join(t, ".github", "skills", "uwf-sw_dev", "stages.yaml"), "workflow: sw_dev\nstages: []\n");
+    assert.deepEqual(resolveSkillsRoot({ repoRoot: t, workflow: "sw_dev" }), { root: t, source: "target" });
+  } finally { rmSync(t, { recursive: true, force: true }); }
+});
 
 // Node 20 has no fs.globSync: the fallback matcher must agree with the native one.
 {

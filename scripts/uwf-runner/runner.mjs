@@ -6,6 +6,7 @@
  *   node scripts/uwf-runner/runner.mjs run --workflow <w> --goal <file|text>
  *     [--adapter claude-code|fake] [--model <m>] [--data-dir <d>] [--output-path <p>]
  *     [--from-stage <s>] [--force] [--non-interactive] [--dry-run] [--timeout-ms <n>]
+ *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
  *   node scripts/uwf-runner/runner.mjs resume --workflow <w>
  *     [--adapter] [--model] [--data-dir] [--output-path] [--non-interactive] [--timeout-ms]
  *
@@ -13,6 +14,10 @@
  *     per-stage turns, context per turn, tokens and cost from <d>/transcripts (see cost.mjs)
  *
  * Exit codes: 0 complete | 1 gate blocked / abort | 2 usage or config error | 3 questions pending
+ *
+ * Two roots: --repo-root is where the agent works (cwd, artifacts, {{cwd}} gate paths); --skills-root
+ * (env UWF_SKILLS_ROOT) is where workflow definitions, agents and skill docs are read. Default: this
+ * checkout; if the target repo ships .github/skills/uwf-<w>/stages.yaml, that copy is used (one log line).
  *
  * The runner only sequences. State lives in the existing stores (stage-tracker, state-manager,
  * question-protocol); gates are evaluated by `uwf-<workflow>/run.mjs --check-gate`.
@@ -25,7 +30,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
-import { materializePrompt } from "./prompt.mjs";
+import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { costReport } from "./cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -65,6 +70,25 @@ export function runCli(scriptPath, args, { cwd, env } = {}) {
       ?? (r.stderr || r.error?.message || `exit ${code}`).trim();
   }
   return { ok, data, error, code };
+}
+
+/**
+ * Resolve where workflow definitions/agents/skill docs come from (see resolveSkillsRoot in prompt.mjs):
+ * --skills-root > UWF_SKILLS_ROOT > the target's own copy (logged) > this checkout.
+ */
+function pickSkillsRoot(flags, repoRoot, workflow) {
+  if (flags["skills-root"] !== undefined && typeof flags["skills-root"] !== "string") throw new UsageError("--skills-root needs a directory");
+  const { root, source } = resolveSkillsRoot({ explicit: flags["skills-root"], repoRoot, workflow });
+  if (source === "target") log(`[runner] using the target repo's own workflow definitions: ${join(root, ".github", "skills")}`);
+  if (!existsSync(join(root, ".github", "skills"))) throw new UsageError(`skills root has no .github/skills: ${root}`);
+  return root;
+}
+
+/** The run.mjs shim to invoke: this checkout's (it has the installed deps), else the skills root's copy. */
+function pickRunScript(skillsRoot, workflow) {
+  if (!existsSync(join(skillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml"))) return null;
+  const own = join(SKILLS, `uwf-${workflow}`, "run.mjs");
+  return existsSync(own) ? own : join(skillsRoot, ".github", "skills", `uwf-${workflow}`, "run.mjs");
 }
 
 function parseArgs(argv) {
@@ -123,8 +147,10 @@ async function main(argv) {
   }
 
   const workflow = flags.workflow;
-  const runScript = join(SKILLS, `uwf-${workflow}`, "run.mjs");
-  if (!existsSync(runScript)) throw new UsageError(`Unknown workflow "${workflow}" (no ${runScript})`);
+  const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT); // hidden: tests run in a scratch root
+  const skillsRoot = pickSkillsRoot(flags, repoRoot, workflow);
+  const runScript = pickRunScript(skillsRoot, workflow);
+  if (!runScript) throw new UsageError(`Unknown workflow "${workflow}" (no uwf-${workflow}/stages.yaml under ${join(skillsRoot, ".github", "skills")})`);
 
   const adapterName = flags.adapter ?? (process.env.UWF_FAKE_FIXTURE_DIR ? "fake" : "claude-code");
   if (!ADAPTERS.includes(adapterName)) throw new UsageError(`Unknown adapter "${adapterName}". Available: ${ADAPTERS.join(", ")}`);
@@ -139,7 +165,6 @@ async function main(argv) {
 
   const dryRun = flags["dry-run"] === true;
   const nonInteractive = flags["non-interactive"] === true;
-  const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT); // hidden: tests run in a scratch root
   const outputPath = flags["output-path"] ?? "./tmp/workflow-artifacts";
 
   // Dry run must write nothing: point every store at a throwaway dir.
@@ -154,7 +179,7 @@ async function main(argv) {
   else if (!existsSync(goalPath)) throw new UsageError(`No goal recorded at ${goalPath}; start with "runner.mjs run --goal ..." first`);
   else goal = readFileSync(goalPath, "utf8").trim();
 
-  const cliEnv = { UWF_DATA_DIR: dataDir };
+  const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
   const withOut = ["--output-path", outputPath, ...common];
   const cli = (script, args, extra = common) => runCli(script, [...args, ...extra], { cwd: repoRoot, env: cliEnv });
@@ -170,7 +195,7 @@ async function main(argv) {
       if (start < 0) throw new UsageError(`--from-stage "${flags["from-stage"]}" not in: ${stages.map((s) => s.name).join(", ")}`);
     }
 
-    if (dryRun) return await dryRunReport({ workflow, stages: stages.slice(start), total: stages.length, start, repoRoot, outputPath, dataDir, goal, flags });
+    if (dryRun) return await dryRunReport({ workflow, stages: stages.slice(start), total: stages.length, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags });
 
     const readTracker = () => {
       const r = cli(TRACKER, ["read", "--workflow", workflow], withOut);
@@ -273,7 +298,7 @@ async function main(argv) {
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut });
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
@@ -284,7 +309,7 @@ async function main(argv) {
  * returns an exit code. ctx carries everything resolved by main().
  */
 async function stageLoop(ctx) {
-  const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot,
+  const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
     outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut } = ctx;
   let first = true;
   for (let i = start; i < stages.length; i++) {
@@ -327,7 +352,7 @@ async function stageLoop(ctx) {
     // 3. materialize the prompt (goal goes first on the first stage of this run)
     const answered = cli(QUESTIONS, ["list", "--stage", st.name, "--status", "answered"]);
     const extraContext = { goal, answeredQuestions: answered.ok ? (answered.data?.questions ?? answered.data?.items ?? []) : [] };
-    const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, outputPath, dataDir, extraContext });
+    const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, skillsRoot, outputPath, dataDir, extraContext });
     if (mp.inputsMissing?.length) log(`${tag}: inputs not found: ${mp.inputsMissing.join(", ")}`);
     const basePrompt = first ? `Goal:\n${goal}\n\n${mp.prompt}` : mp.prompt;
     first = false;
@@ -449,8 +474,9 @@ function hitMaxTurns(res) {
 async function costCommand(flags) {
   if (!flags["data-dir"]) throw new UsageError("--data-dir is required");
   const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT);
+  const skillsRoot = flags.workflow ? pickSkillsRoot(flags, repoRoot, flags.workflow) : undefined;
   try {
-    process.stdout.write(await costReport({ dataDir: resolve(flags["data-dir"]), workflow: flags.workflow, repoRoot, outputPath: flags["output-path"] }));
+    process.stdout.write(await costReport({ dataDir: resolve(flags["data-dir"]), workflow: flags.workflow, repoRoot, skillsRoot, outputPath: flags["output-path"] }));
   } catch (e) {
     throw new UsageError(e.message);
   }
@@ -463,10 +489,11 @@ const sessionArgs = (id) => (id ? ["--session-id", id] : []);
 function gatesAudit(flags) {
   if (!flags.workflow) throw new UsageError("--workflow is required");
   const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT);
+  const skillsRoot = pickSkillsRoot(flags, repoRoot, flags.workflow);
   const dataDir = mkdtempSync(join(tmpdir(), "uwf-gates-"));
   try {
     const r = runCli(TRACKER, ["gate-prescriptions", "--workflow", flags.workflow, "--output-path", "<output_path>", "--data-dir", dataDir],
-      { cwd: repoRoot, env: { UWF_DATA_DIR: dataDir } });
+      { cwd: repoRoot, env: { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot } });
     if (!r.ok || !Array.isArray(r.data?.stages)) throw new UsageError(`Cannot read gates: ${r.error}`);
     const out = [`workflow: ${flags.workflow} (placeholders: <output_path> = --output-path, <repo> = repo root)`];
     for (const s of r.data.stages) {
@@ -526,18 +553,18 @@ function finish(code, rows, message, note) {
 // Dry run
 // ---------------------------------------------------------------------------
 
-async function dryRunReport({ workflow, stages, total, start, repoRoot, outputPath, dataDir, goal, flags }) {
+async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags }) {
   let gateChecks = {};
   try {
     const req = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"));
-    const doc = req("js-yaml").load(readFileSync(join(SKILLS, `uwf-${workflow}`, "stages.yaml"), "utf8"));
+    const doc = req("js-yaml").load(readFileSync(join(skillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml"), "utf8"));
     gateChecks = Object.fromEntries((doc.stages ?? []).map((s) => [s.name, s.gate?.checks ?? []]));
   } catch (e) {
     log(`[dry-run] gate checks unavailable: ${e.message}`);
   }
   const out = [`workflow: ${workflow}  stages: ${total}  starting at: ${stages[0]?.name}  output-path: ${outputPath}`, ""];
   for (const [j, st] of stages.entries()) {
-    const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, outputPath, dataDir, extraContext: { goal } });
+    const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, skillsRoot, outputPath, dataDir, extraContext: { goal } });
     out.push(`[${start + j + 1}/${total}] ${st.name}  (agent: ${mp.agentName})`);
     out.push(`  permissions: ${mp.permissions}   model: ${flags.model ?? mp.model ?? "(adapter default)"}`);
     out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   max_turns: ${st.maxTurns}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);

@@ -47,11 +47,29 @@ import { resolveDataDir, resolveDbPath } from "../uwf-state-manager/data-dir.mjs
 // ---------------------------------------------------------------------------
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SCHEMA_PATH = join(__dirname, "stage-schema.yaml");
-const STAGE_CONTRACTS_DIR = join(__dirname, "stage-contracts");
-const TRAITS_DIR = join(__dirname, "..", "uwf-traits", "traits");
-const PROFILES_PATH = join(__dirname, "..", "uwf-model-adaptation", "profiles.yaml");
-const AGENTS_DIR = join(__dirname, "..", "..", "agents");
+
+// Two roots: SKILLS_ROOT is where workflow definitions, stage contracts, traits,
+// profiles, schemas and agent files live (--skills-root / UWF_SKILLS_ROOT, a repo-like
+// dir containing .github/); process.cwd() is the target repo that {{cwd}} and the
+// gate file checks resolve against. Unset = this checkout's own tree (legacy behaviour,
+// where the definitions are expected under cwd/.github/skills for stages.yaml).
+function readSkillsRoot() {
+  const a = process.argv;
+  const i = a.indexOf("--skills-root");
+  const v = i !== -1 && a[i + 1] && !a[i + 1].startsWith("--") ? a[i + 1] : process.env.UWF_SKILLS_ROOT;
+  return v ? resolve(v) : null;
+}
+const SKILLS_ROOT = readSkillsRoot();
+const OWN_SKILLS_DIR = join(__dirname, "..");
+const SKILLS_DIR = SKILLS_ROOT ? join(SKILLS_ROOT, ".github", "skills") : OWN_SKILLS_DIR;
+const AGENTS_DIR = SKILLS_ROOT ? join(SKILLS_ROOT, ".github", "agents") : join(__dirname, "..", "..", "agents");
+/** Engine resource under SKILLS_DIR; falls back to this checkout's copy so a partial tree still works. */
+function skillResource(...segs) {
+  const p = join(SKILLS_DIR, ...segs);
+  return existsSync(p) ? p : join(OWN_SKILLS_DIR, ...segs);
+}
+/** Path of a skill CLI as printed in commands for agents: absolute under SKILLS_ROOT when one is set. */
+const skillCliPath = (rel) => (SKILLS_ROOT ? join(SKILLS_DIR, rel) : `.github/skills/${rel}`);
 
 // ---------------------------------------------------------------------------
 // Stage resolution helpers
@@ -59,22 +77,23 @@ const AGENTS_DIR = join(__dirname, "..", "..", "agents");
 
 /** Load a stage contract YAML by stage_type. Returns null if not found. */
 function loadStageContract(stageType) {
-  const contractPath = join(STAGE_CONTRACTS_DIR, `${stageType}.yaml`);
+  const contractPath = skillResource("uwf-orchestration-engine", "stage-contracts", `${stageType}.yaml`);
   if (!existsSync(contractPath)) return null;
   return yaml.load(readFileSync(contractPath, "utf8"));
 }
 
 /** Load a trait YAML by trait_id. Returns null if not found. */
 function loadTrait(traitId) {
-  const traitPath = join(TRAITS_DIR, `${traitId}.yaml`);
+  const traitPath = skillResource("uwf-traits", "traits", `${traitId}.yaml`);
   if (!existsSync(traitPath)) return null;
   return yaml.load(readFileSync(traitPath, "utf8"));
 }
 
 /** Load the model adaptation profiles.yaml. */
 function loadProfiles() {
-  if (!existsSync(PROFILES_PATH)) return null;
-  return yaml.load(readFileSync(PROFILES_PATH, "utf8"));
+  const profilesPath = skillResource("uwf-model-adaptation", "profiles.yaml");
+  if (!existsSync(profilesPath)) return null;
+  return yaml.load(readFileSync(profilesPath, "utf8"));
 }
 
 /** retry_mode: resume = a retry continues the previous attempt's adapter session; fresh = new session. */
@@ -199,7 +218,9 @@ function resolveNewStyleStage(stageDef, modelProfile) {
   const resolvedAgent = contract.default_agent;
 
   // Validate that the resolved agent file exists
-  const agentFilePath = join(AGENTS_DIR, `${resolvedAgent}.agent.md`);
+  const agentFilePath = existsSync(join(AGENTS_DIR, `${resolvedAgent}.agent.md`))
+    ? join(AGENTS_DIR, `${resolvedAgent}.agent.md`)
+    : join(__dirname, "..", "..", "agents", `${resolvedAgent}.agent.md`);
   if (!existsSync(agentFilePath)) {
     fail(`Stage "${name}": resolved agent "${resolvedAgent}" not found at ${agentFilePath}. Ensure the agent file exists.`);
   }
@@ -241,7 +262,7 @@ function openDb() {
 }
 
 function initTables(db) {
-  const schema = yaml.load(readFileSync(SCHEMA_PATH, "utf8"));
+  const schema = yaml.load(readFileSync(skillResource("uwf-orchestration-engine", "stage-schema.yaml"), "utf8"));
   db.transaction(() => {
     for (const [tableName, def] of Object.entries(schema.tables)) {
       db.exec(buildCreateTable(tableName, def.columns));
@@ -278,7 +299,9 @@ function buildCreateTable(tableName, columns) {
 // ---------------------------------------------------------------------------
 
 function loadStagesYaml(wf) {
-  const yamlPath = resolve(join(".github", "skills", `uwf-${wf}`, "stages.yaml"));
+  const yamlPath = SKILLS_ROOT
+    ? join(SKILLS_DIR, `uwf-${wf}`, "stages.yaml")
+    : resolve(join(".github", "skills", `uwf-${wf}`, "stages.yaml"));
   if (!existsSync(yamlPath)) usageError(`stages.yaml not found for workflow "${wf}": ${yamlPath}`);
   return yaml.load(readFileSync(yamlPath, "utf8"));
 }
@@ -326,7 +349,7 @@ try {
 function cmdListStages(db) {
   requireFlag("workflow", "list-stages");
   const { stages } = loadStagesYaml(workflow);
-  const Q_MJS = ".github/skills/uwf-question-protocol/questions.mjs";
+  const Q_MJS = skillCliPath("uwf-question-protocol/questions.mjs");
   const modelProfile = flags["model-profile"] ?? null;
 
   const list = stages.map((stageDef) => {
@@ -482,8 +505,8 @@ function cmdStageUpdate(db, toStatus) {
   const { stages } = loadStagesYaml(workflow);
   const stageDef   = stages.find((s) => s.name === stageName);
   const agentId    = stageDef?.agent ?? "uwf-core-orchestrator";
-  const STATE_MJS  = ".github/skills/uwf-state-manager/state.mjs";
-  const Q_MJS      = ".github/skills/uwf-question-protocol/questions.mjs";
+  const STATE_MJS  = skillCliPath("uwf-state-manager/state.mjs");
+  const Q_MJS      = skillCliPath("uwf-question-protocol/questions.mjs");
 
   let pre_flight_check = null;
   let state_actions    = [];
@@ -530,7 +553,7 @@ function cmdStageFail(db) {
 
   appendHistory(db, workflow, stageName, row.status, "failed", note);
   const updated   = db.prepare(`SELECT * FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, stageName);
-  const STATE_MJS = ".github/skills/uwf-state-manager/state.mjs";
+  const STATE_MJS = skillCliPath("uwf-state-manager/state.mjs");
   succeed({
     procedure:    "stage-fail",
     workflow,
@@ -724,7 +747,7 @@ function evaluateCheck(check) {
 
 /** Light structural validation against schemas/stage-result.schema.json (no ajv dependency). */
 function validateStageResult(doc) {
-  const schemaPath = join(dirname(fileURLToPath(import.meta.url)), "schemas", "stage-result.schema.json");
+  const schemaPath = skillResource("uwf-orchestration-engine", "schemas", "stage-result.schema.json");
   const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
   const errs = [];
   const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);

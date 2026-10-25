@@ -12,15 +12,21 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const tracker   = join(__dirname, "..", "uwf-orchestration-engine", "stage-tracker.mjs");
 
 // Read workflow name from the co-located stages.yaml (first-pass line scan — no yaml dep needed here)
-const stagesYaml = readFileSync(join(__dirname, "stages.yaml"), "utf8");
+// --skills-root <dir> / UWF_SKILLS_ROOT: definitions live under <dir>/.github/skills instead of next to this file.
+const rootIdx = process.argv.indexOf("--skills-root");
+const skillsRootArg = rootIdx !== -1 ? process.argv[rootIdx + 1] : process.env.UWF_SKILLS_ROOT;
+const skillsRoot = skillsRootArg ? resolve(skillsRootArg) : null;
+const ownStages = join(__dirname, "stages.yaml");
+const rootStages = skillsRoot ? join(skillsRoot, ".github", "skills", __dirname.split(/[\\/]/).pop(), "stages.yaml") : null;
+const stagesYaml = readFileSync(rootStages && existsSync(rootStages) ? rootStages : ownStages, "utf8");
 const workflowMatch = stagesYaml.match(/^workflow:\s*(\S+)/m);
 if (!workflowMatch) { process.stderr.write("stages.yaml must contain a 'workflow:' field.\n"); process.exit(2); }
 const workflow = workflowMatch[1];
@@ -49,7 +55,7 @@ spawn(process.execPath, [tracker, ...trackerArgs], { stdio: "inherit" })
 function forwardGlobalFlags(args) {
   const out = [];
   for (let i = 0; i < args.length; i++) {
-    if ((args[i] === "--output-path") && i + 1 < args.length) {
+    if ((args[i] === "--output-path" || args[i] === "--skills-root") && i + 1 < args.length) {
       out.push(args[i], args[++i]);
     }
   }
