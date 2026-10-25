@@ -242,6 +242,7 @@ stages:
       - "{{cwd}}/docs/adr/ADR-[0-9]*.md"
     outputs:
       - "{{output_path}}/design-review.md"
+      - "{{output_path}}/design-review.result.json"
     gated: true
     gate:
       checks:
@@ -252,6 +253,12 @@ stages:
           path: "{{output_path}}/design-review.md"
           text: "verdict: approved"
           label: "design-review.md"
+        - type: require_json_field
+          path: "{{output_path}}/design-review.result.json"
+          pointer: /verdict
+          equals: approved
+          schema: stage-result
+          label: "design-review.result.json"
 
   - name: acceptance
     agent: uwf-core-acceptance
@@ -263,6 +270,7 @@ stages:
       - "{{output_path}}/design-review.md"
     outputs:
       - "{{output_path}}/design-acceptance.md"
+      - "{{output_path}}/design-acceptance.result.json"
     gated: true
     gate:
       checks:
@@ -273,6 +281,12 @@ stages:
           path: "{{output_path}}/design-acceptance.md"
           text: "verdict: approved"
           label: "design-acceptance.md"
+        - type: require_json_field
+          path: "{{output_path}}/design-acceptance.result.json"
+          pointer: /verdict
+          equals: approved
+          schema: stage-result
+          label: "design-acceptance.result.json"
 
   - name: snapshot
     agent: uwf-core-snapshot

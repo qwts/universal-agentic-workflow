@@ -129,6 +129,24 @@ function transcripts(s) {
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
+// 2b. Structured verdict: changes_requested fails the review gate ----------------
+{
+  console.log("# gate failure: result.json changes_requested");
+  const s = setup();
+  try {
+    const fxPath = join(s.fixtures, "review.json");
+    const fx = JSON.parse(readFileSync(fxPath, "utf8"));
+    fx.files["tmp/workflow-artifacts/issues-review.result.json"] =
+      JSON.stringify({ verdict: "changes_requested", findings: [{ severity: "high", summary: "x" }] });
+    writeFileSync(fxPath, JSON.stringify(fx));
+    const r = run(s);
+    check("exits 1", r.code === 1, `${r.code} ${r.err.slice(-400)}`);
+    check("gate FAIL names the pointer and observed value",
+      /review gate: FAIL — .*pointer \/verdict: observed "changes_requested"/.test(r.err), r.err.slice(-500));
+    check("later stages never ran", !r.err.includes("[12/15]"));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 // 2b. Gate fails once, retry passes ------------------------------------------
 {
   console.log("# review fails once then passes");

@@ -612,6 +612,40 @@ if (!isDirectory(targetRoot)) {
   }
 }
 
+// Gate check types: every gate.checks[].type must be implemented by evaluateCheck.
+function implementedCheckTypes(root) {
+  const src = readFileSync(join(root, ".github/skills/uwf-orchestration-engine/stage-tracker.mjs"), "utf8");
+  const start = src.indexOf("function evaluateCheck(");
+  const end = src.indexOf("\n}\n", start);
+  const body = src.slice(start, end);
+  return new Set([...body.matchAll(/^ {4}case "([^"]+)":/gm)].map((m) => m[1]));
+}
+
+function unknownGateCheckTypes(root, known) {
+  const skillsDir = join(root, ".github/skills");
+  const bad = [];
+  for (const d of readdirSync(skillsDir)) {
+    const f = join(skillsDir, d, "stages.yaml");
+    if (!existsSync(f)) continue;
+    const doc = yaml.load(readFileSync(f, "utf8"));
+    for (const stage of doc?.stages ?? []) {
+      for (const c of stage?.gate?.checks ?? []) {
+        if (!known.has(c?.type)) bad.push(`${d}/${stage.name}: ${c?.type}`);
+      }
+    }
+  }
+  return bad;
+}
+
+console.log("3. Gate check types are implemented by evaluateCheck");
+{
+  const known = implementedCheckTypes(SOURCE_REPO_ROOT);
+  assert("evaluateCheck implements require_json_field", known.has("require_json_field"));
+  const bad = unknownGateCheckTypes(targetRoot, known);
+  assert("every gate.checks[].type is implemented", bad.length === 0, bad.join(", "));
+  assert("an unknown check type is detected", unknownGateCheckTypes(targetRoot, new Set([...known].filter((t) => t !== "require_json_field"))).length > 0);
+}
+
 console.log(`\n${"─".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
