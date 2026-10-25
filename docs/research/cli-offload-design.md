@@ -73,8 +73,10 @@ text, the goal, and tool access. It is told to complete the workflow and to
 decide for itself when each stage passes. It is not given `stage-tracker.mjs`,
 `state.mjs` or `run.mjs`. The prompt requires the model to run
 `node <bench>/mark-stage.mjs <stage>` the moment it considers a stage complete.
-On each such **stage-completion event** the harness copies the artifacts
-directory into an immutable snapshot and records the event. After the session,
+On each such **stage-completion event** the harness copies every path a gate
+check can read (the artifacts directory and each `{{cwd}}` path named in
+`stages.yaml`, for `sw_dev` that is `docs/adr`) into an immutable snapshot and
+records the event. After the session,
 every gate is evaluated with `stage-tracker.mjs` against the snapshot taken at
 that stage's first event, so a first-try pass is scored identically in both
 conditions; later events for the same stage are scored as retries. A stage with
@@ -154,10 +156,10 @@ condition) or one gate evaluation of the stage's snapshot (no-CLI condition).
 | `acceptance_pass` | Objective test `test/seeded-issues.test.mjs` passes on the final tree and the test file is unmodified. | boolean | run |
 
 Usage source: the figures are those **reported by the adapter**
-(`invokeStage` -> `usage`, `costUsd`). Today the `claude-code` adapter returns
-`{ inputTokens, outputTokens }` only. Recording cache read and cache write
-tokens requires extending the adapter and its `types.d.ts`; that work is a
-prerequisite of the harness (#101) and must land before the first recorded run.
+(`invokeStage` -> `usage`, `costUsd`). The `claude-code` adapter's `usage` carries
+`{ inputTokens, outputTokens }` only, but each transcript keeps the CLI's full
+JSON, from which the harness (#101) reads cache read, cache write and cost per
+attempt.
 A run with `usage: null` on any call is flagged `usage_incomplete` and excluded
 from H2 and from cost analysis (kept for H1 and H3).
 
@@ -175,9 +177,12 @@ provider-side behavior is spread across cells.
    store corruption, fixture setup failure) rather than a model failure, stop
    that cell, fix the harness, and restart the cell's run count from zero.
    Discarded harness-error runs are listed in the final report, not deleted.
-2. **Extension.** After the 60 runs, if the 95% confidence interval of the H1
-   interaction contrast straddles zero, add **5 more runs per cell per fixture** (5 x 3 x 4 = 60 more runs, in one batch). This extension happens
-   at most once. After it, the result is reported as-is.
+2. **Fixed sample.** The sample is 60 valid runs and is not extended on the
+   basis of the observed H1 interval; the 95% interval in section 8.1 is a
+   single fixed-sample interval. An interval that straddles zero is reported as
+   *not supported at this sample*, with the point estimate, the interval and the
+   sample that would be needed to resolve it. Any further runs are a new,
+   separately pre-registered experiment, analyzed on their own.
 3. **Budget cap.** Hard cap of **$CAP_PLACEHOLDER USD per cell**, to be set
    before the first run and committed in this file as an amendment dated before
    the first run's timestamp. A cell that reaches its cap stops; its completed
@@ -223,8 +228,8 @@ sensitivity analysis.
 **Support for H1:** the lower bound of the 95% CI of `DiD` is above 0 **and**
 `gap_CLI` is smaller than `gap_NOCLI` in each fixture individually (direction
 consistency). Point estimate and CI are reported either way. A CI that includes
-0 after the one permitted extension is reported as *not supported*, not as
-"trend".
+0 is reported as *not supported*, not as "trend"; the sample is not extended
+(section 7, rule 2).
 
 ### 8.2 H2: paired comparison of tokens
 
@@ -497,8 +502,8 @@ one model pair".
   fix those prompts or inputs, then re-test in a new pre-registered round.
 - Record the negative result in an ADR that amends ADR-0007's context section.
 
-**If it is inconclusive:** extend once under 7.2, then report the interval and
-what sample would resolve it. No further extensions without a new registration.
+**If it is inconclusive:** report the interval and what sample would resolve
+it. A larger sample is a new registration, not an extension of this one.
 
 ## 14. Pilot (not a result)
 
