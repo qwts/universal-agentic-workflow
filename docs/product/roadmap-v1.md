@@ -57,6 +57,11 @@ got us here). Current findings: [repo-audit-2026-08-03.md](repo-audit-2026-08-03
 
 ## M1 — Proof
 
+> Round 3 pivot ([ADR-0007](../adr/ADR-0007-runtime-owns-the-loop.md)): the
+> golden run is produced by the deterministic runner, tracked as
+> [R3-M4](https://github.com/qwts/universal-agentic-workflow/milestone/5) on
+> [project 15](https://github.com/users/qwts/projects/15).
+
 *The flagship path demonstrably works.*
 
 - [ ] Run `workflow=sw_dev` end to end on a toy repository.
