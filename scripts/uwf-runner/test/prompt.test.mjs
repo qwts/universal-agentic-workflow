@@ -97,14 +97,13 @@ await test("CLI prints the same prompt as the API", async () => {
   assert.equal(r.stdout, (await materializePrompt({ workflow: "sw_dev", stage: "review", ...opts })).prompt);
 });
 
-if (failures) { console.log(`\n${failures} failed`); process.exit(1); }
-console.log("\nall prompt tests passed");
 
 // Two roots: a bare target (no .github/) gets agent text whose references point into skillsRoot.
 await test("bare target: referenced files are absolute skillsRoot paths, none under <repoRoot>/.github", async () => {
   const bare = mkdtempSync(join(tmpdir(), "uwf-bare-"));
   try {
-    for (const stage of ["discovery", "review", "retro", "blueprint"]) {
+    // Only stages whose agent text references .github/ files (retro and the stage agents do not).
+    for (const stage of ["review", "blueprint"]) {
       const r = await materializePrompt({ workflow: "sw_dev", stage, repoRoot: bare, outputPath: "/OUT", dataDir: "/DATA" });
       const refs = r.systemPrompt.match(/\/[^\s`'")]*\.github\/(?:skills|agents)\/[^\s`'")]*/g) ?? [];
       assert.ok(refs.length > 0, `${stage}: agent text has no skillsRoot references to check`);
@@ -140,3 +139,6 @@ await test("explicit skillsRoot is honoured and the target's own copy is auto-de
   assert.deepEqual(fallback, native, "glob fallback disagrees with fs.globSync");
   console.log("ok   glob fallback matches native");
 }
+
+if (failures) { console.log(`\n${failures} failed`); process.exit(1); }
+console.log("\nall prompt tests passed");
