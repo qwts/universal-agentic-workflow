@@ -71,10 +71,15 @@ CLI condition, so content is identical and only the delivery differs. The model
 gets one session, the full stage list, every stage's inputs, outputs and gate
 text, the goal, and tool access. It is told to complete the workflow and to
 decide for itself when each stage passes. It is not given `stage-tracker.mjs`,
-`state.mjs` or `run.mjs`. The harness evaluates every gate with `stage-tracker.mjs`
-**after the fact**, against the artifacts on disk at the point the model moved on
-from each stage (snapshot taken by file mtime ordering), so a first-try pass is
-scored identically in both conditions. A session ends when the model stops, hits
+`state.mjs` or `run.mjs`. The prompt requires the model to run
+`node <bench>/mark-stage.mjs <stage>` the moment it considers a stage complete.
+On each such **stage-completion event** the harness copies the artifacts
+directory into an immutable snapshot and records the event. After the session,
+every gate is evaluated with `stage-tracker.mjs` against the snapshot taken at
+that stage's first event, so a first-try pass is scored identically in both
+conditions; later events for the same stage are scored as retries. A stage with
+no event is scored against the end-of-session state and flagged `never_marked`,
+which counts as a first-try failure. File modification times are never used. A session ends when the model stops, hits
 the turn or time cap, or exhausts the budget cap.
 
 ## 4. Fixtures
@@ -205,9 +210,12 @@ DiD       = gap_NOCLI - gap_CLI
 ```
 
 H1 predicts `DiD > 0`: the small-vs-large gap is smaller with the runner.
-Estimation: a linear model of `first_try_pass_rate` on model, state location,
-their interaction, and fixture as a fixed effect; the interaction coefficient is
-`DiD`. The 95% CI is a stratified (by fixture) bootstrap percentile interval,
+Estimation: a linear model of `first_try_pass_rate` on the indicators
+`small` (1 for the small model, 0 for the large) and `cli` (1 for the CLI
+condition, 0 for NOCLI), their interaction, and fixture as a fixed effect. With
+this coding the interaction coefficient equals `DiD` as defined above (the
+opposite coding, `large = 1`, flips its sign); the analysis script asserts the
+coding and reports `DiD` with the sign given here. The 95% CI is a stratified (by fixture) bootstrap percentile interval,
 10,000 resamples, seed fixed in the analysis script. A binomial GLM on
 stage-level `first_try_pass` with a run-level random intercept is reported as a
 sensitivity analysis.
@@ -247,10 +255,12 @@ lies inside (-1, +1). Failing to reject non-equivalence is reported as
 *inconclusive* when the CI is wider than the margin and as *refuted* when the
 whole CI lies below -1.
 
-Only runs whose three artifacts (`issues-plan.md`, `issues-review.md`,
-`issues-acceptance.md`) all exist are rated. Missing artifacts score 1 on the
-dimension and the run is flagged `artifact_missing`; a sensitivity analysis drops
-those runs.
+Every valid run is rated. Raters score the artifacts that exist
+(`issues-plan.md`, `issues-review.md`, `issues-acceptance.md`); a missing
+artifact scores 1 on its dimension and the run is flagged `artifact_missing`.
+`quality_mean` is therefore defined for every valid run and incomplete runs stay
+in the primary H3 analysis. A complete-case sensitivity analysis drops the
+flagged runs.
 
 ### 8.4 Pre-specified secondary and descriptive analyses
 
@@ -456,7 +466,8 @@ transcripts are kept as artifacts for audit and scrubbed before any sharing
 | Outcome | Reading |
 | --- | --- |
 | H1 supported, H2 supported, H3 supported | Thesis holds: a small model behind the runner matches a large model on gated work at lower cost. |
-| H1 supported, H3 not supported | Gates pass but artifacts are worse. The runner fixes sequencing, not content quality. Report the quality gap. |
+| H1 supported, H3 refuted (90% CI entirely below -1) | Gates pass but artifacts are worse. The runner fixes sequencing, not content quality. Report the quality gap. |
+| H1 supported, H3 inconclusive (CI wider than the margin) | Quality not shown equivalent and not shown worse. Report the interval and point estimate; make no quality claim either way. |
 | H1 not supported, H2 supported | The runner saves tokens but does not close the gap. Value is cost, not capability. |
 | H1 not supported, H2 not supported | Thesis not supported at this scale on these fixtures. |
 | Gap already near zero in the NOCLI cells | Floor/ceiling effect: the fixtures are too easy to discriminate. Report; the thesis is untested rather than refuted. |
