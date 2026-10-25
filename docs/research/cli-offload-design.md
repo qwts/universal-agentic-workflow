@@ -483,7 +483,7 @@ one model pair".
 
 ## 13. What changes if the hypothesis holds or fails
 
-**If it holds (H1 and H2 supported, H3 not refuted):**
+**If it holds (H1, H2 and H3 all supported):**
 
 - Add per-stage `model:` routing in each `stages.yaml`, defaulting stages to the
   small model and promoting only those with persistent first-try failure (the
@@ -493,6 +493,11 @@ one model pair".
   Behaviors" list in the orchestration engine SKILL, as ADR-0007 anticipates.
 - Set the small model as the default adapter model for PR-triggered runs and
   keep the large model as an escalation tier after N failed retries.
+
+**If H1 and H2 are supported but H3 is inconclusive:** no default changes. The
+quality safeguard is not established, so the small model is offered only as an
+opt-in per stage; a separate, pre-registered quality validation (larger rating
+sample, same rubric) must support H3 before the defaults above change.
 
 **If it fails (H1 not supported):**
 
