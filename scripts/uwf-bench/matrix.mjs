@@ -11,15 +11,18 @@ const STATE_LOCATIONS = ["cli", "nocli"];
 
 /** @param {string} raw */
 function scalar(raw) {
-  const v = raw.trim();
+  let v = raw.trim();
+  let q;
+  // Quoted first, so a `#` inside quotes survives; a trailing comment after the closing quote is dropped.
+  if ((q = v.match(/^"((?:[^"\\]|\\.)*)"\s*(#.*)?$/))) return q[1].replace(/\\(["\\])/g, "$1");
+  if ((q = v.match(/^'((?:[^']|'')*)'\s*(#.*)?$/))) return q[1].replace(/''/g, "'");
+  // Unquoted: strip an inline comment before deciding the type, so `true # note` is still a boolean.
+  v = v.replace(/\s+#.*$/, "").trim();
   if (v === "" || v === "null" || v === "~") return null;
   if (v === "true") return true;
   if (v === "false") return false;
   if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
-  let q;
-  if ((q = v.match(/^"((?:[^"\\]|\\.)*)"\s*(#.*)?$/))) return q[1].replace(/\\(["\\])/g, "$1");
-  if ((q = v.match(/^'((?:[^']|'')*)'\s*(#.*)?$/))) return q[1].replace(/''/g, "'");
-  return v.replace(/\s+#.*$/, "");
+  return v;
 }
 
 /** Parse the documented YAML subset into plain objects. @param {string} text */

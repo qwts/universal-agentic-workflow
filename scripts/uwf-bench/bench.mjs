@@ -12,7 +12,7 @@
  * run is recorded and never stops the matrix. Exit codes: 0 ok | 2 usage or config error.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -187,11 +187,85 @@ const sum = (rows, k) => (rows.some((r) => r[k] != null) ? rows.reduce((a, r) =>
 // One run
 // ---------------------------------------------------------------------------
 
+/** Own process group id (POSIX), so a tree kill never signals the harness's own group. */
+const ownPgid = (() => {
+  if (process.platform === "win32") return null;
+  const r = spawnSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" });
+  return r.status === 0 ? Number(r.stdout.trim()) : null;
+})();
+
+/**
+ * Every live descendant of `root` (by parent pid) and the process groups they lead or belong to.
+ * The adapters start their CLIs detached (own group), so a group kill of the runner alone misses them;
+ * walking the parent chain finds them, since detaching changes the group, not the parent.
+ */
+export function processTree(root) {
+  if (process.platform === "win32") return { pids: [root], pgids: [] };
+  const r = spawnSync("ps", ["-eo", "pid=,ppid=,pgid="], { encoding: "utf8" });
+  if (r.status !== 0) return { pids: [root], pgids: [] };
+  const rows = r.stdout.trim().split("\n").map((l) => l.trim().split(/\s+/).map(Number)).filter((x) => x.length === 3);
+  const kids = new Map();
+  const pgidOf = new Map();
+  for (const [pid, ppid, pgid] of rows) { (kids.get(ppid) ?? kids.set(ppid, []).get(ppid)).push(pid); pgidOf.set(pid, pgid); }
+  const pids = [];
+  const stack = [root];
+  while (stack.length) { const pid = stack.pop(); pids.push(pid); for (const k of kids.get(pid) ?? []) stack.push(k); }
+  const pgids = [...new Set(pids.map((pid) => pgidOf.get(pid)))].filter((g) => g && g !== ownPgid);
+  return { pids, pgids };
+}
+
+/** SIGKILL the whole tree under `root`: detached groups first, then every pid. Never throws. */
+export function killTree(root) {
+  if (process.platform === "win32") { spawnSync("taskkill", ["/T", "/F", "/PID", String(root)], { stdio: "ignore" }); return; }
+  const { pids, pgids } = processTree(root);
+  for (const g of pgids) { try { process.kill(-g, "SIGKILL"); } catch { /* gone */ } }
+  for (const pid of pids) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+}
+
+/** The runner currently executing, so a SIGINT/SIGTERM to the harness can take its tree down too. */
+let activeChild = null;
+
+/**
+ * Run the runner, capture its output, and on the whole-run timeout kill its entire process tree,
+ * including the adapters' detached CLI groups, before resolving: a live agent must not keep spending
+ * budget or editing the fixture while the harness collects results and cleans up.
+ */
+export function runProcess(args, { cwd, env, timeout }) {
+  return new Promise((done) => {
+    let out = "", err = "", timedOut = false, settled = false;
+    const child = spawn(process.execPath, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    activeChild = child;
+    const timer = timeout ? setTimeout(() => { timedOut = true; killTree(child.pid); }, timeout) : null;
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    const finish = (status, signal, error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (activeChild === child) activeChild = null;
+      done({ status: timedOut ? null : status, signal, stdout: out, stderr: err, timedOut, error });
+    };
+    child.on("error", (e) => finish(null, null, e));
+    // "close" (not "exit") waits for the pipes, which the killed tree releases.
+    child.on("close", (status, signal) => finish(status, signal));
+  });
+}
+
+/** Ctrl-C or SIGTERM on the harness: take the active runner's tree down, then exit 130/143. */
+export function installSignalForwarding() {
+  for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+    process.on(sig, () => {
+      log(`[bench] ${sig}: stopping the active run`);
+      if (activeChild) { const c = activeChild; c.once("close", () => process.exit(code)); killTree(c.pid); setTimeout(() => process.exit(code), 5000).unref(); }
+      else process.exit(code);
+    });
+  }
+}
+
 const FAILURE = { 0: "none", 1: "model_failure", 2: "harness_error", 3: "harness_error" };
 const STATE = { 0: "complete", 1: "gate_blocked", 2: "usage_error", 3: "questions_pending" };
-
 /** Execute one planned run and return { run, outcomes } ready for insertRun. Never throws. */
-export function executeRun(matrix, entry, ctx) {
+export async function executeRun(matrix, entry, ctx) {
   const { cell, fixture, run_index, block } = entry;
   const base = {
     cell: cell.name, workflow: matrix.workflow, adapter: cell.adapter, model: cell.model ?? null, state_location: cell.state_location,
@@ -219,8 +293,8 @@ export function executeRun(matrix, entry, ctx) {
       "--timeout-ms", String(matrix.timeout_ms)];
     const env = { ...process.env, UWF_DATA_DIR: "" };
     if (cell.fake_fixture_dir) env.UWF_FAKE_FIXTURE_DIR = resolve(ctx.baseDir, cell.fake_fixture_dir);
-    const r = spawnSync(process.execPath, args, { cwd: repo, env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: matrix.timeout_ms * 30 });
-    if (r.error && r.status === null && r.signal === null) throw r.error;
+    const r = await runProcess(args, { cwd: repo, env, timeout: matrix.timeout_ms * 30 });
+    if (r.error) throw r.error;
     const code = r.status;
     const transcripts = readTranscripts(dataDir);
     outcomes = buildOutcomes(readStageRuns(dataDir, matrix.workflow), transcripts, ctx.gated);
@@ -259,7 +333,7 @@ function acceptance(cmd, cwd, timeout) {
 // Commands
 // ---------------------------------------------------------------------------
 
-function cmdRun(flags) {
+async function cmdRun(flags) {
   if (!flags.matrix) throw new UsageError("--matrix is required");
   const matrixPath = resolve(flags.matrix);
   if (!existsSync(matrixPath)) throw new UsageError(`matrix not found: ${matrixPath}`);
@@ -273,18 +347,19 @@ function cmdRun(flags) {
     runnerSha: git(ROOT, ["rev-parse", "HEAD"]), gated: gatedStages(matrix.workflow),
     stagesYamlSha: sha256(join(SKILLS, `uwf-${matrix.workflow}`, "stages.yaml")),
   };
+  installSignalForwarding();
   const plan = planRuns(matrix);
   const counts = {};
-  plan.forEach((entry, i) => {
+  for (const [i, entry] of plan.entries()) {
     const { cell, fixture, run_index } = entry;
     const tag = `[${i + 1}/${plan.length}] ${cell.name} ${fixture.name} #${run_index}`;
-    if (flags.resume === true && hasRun(db, cell.name, fixture.name, run_index)) { log(`${tag}: already in db, skipped (--resume)`); return; }
-    const { run, outcomes } = executeRun(matrix, entry, ctx);
+    if (flags.resume === true && hasRun(db, cell.name, fixture.name, run_index)) { log(`${tag}: already in db, skipped (--resume)`); continue; }
+    const { run, outcomes } = await executeRun(matrix, entry, ctx);
     insertRun(db, run, outcomes);
     const key = run.failure_class ?? run.terminal_state;
     counts[key] = (counts[key] ?? 0) + 1;
     log(`${tag}: ${run.terminal_state} (${run.failure_class ?? "-"}) ${(run.wall_seconds ?? 0).toFixed(1)}s`);
-  });
+  }
   db.close();
   log(`[bench] done: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ") || "nothing to run"}`);
   return 0;
@@ -330,8 +405,8 @@ function main(argv) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { process.exitCode = main(process.argv.slice(2)); } catch (e) {
+  Promise.resolve().then(() => main(process.argv.slice(2))).then((code) => { process.exitCode = code; }).catch((e) => {
     log(`[bench] ${e instanceof UsageError ? e.message : `internal error: ${e.stack ?? e}`}`);
     process.exitCode = 2;
-  }
+  });
 }
