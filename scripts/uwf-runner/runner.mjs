@@ -188,10 +188,26 @@ async function main(argv) {
       if (!a.ok) log(`[runner] phase rollback to "${target}" not applied: ${a.error}`);
     };
 
+    // A crash between a stage passing and its phase advance leaves the phase behind the tracker.
+    // Catch the phase up (one legal step at a time) so the resumed stages start from the right phase.
+    const reconcilePhase = (tracked) => {
+      const reached = stages.filter((st) => isDone(tracked.find((x) => x.stage === st.name)?.status))
+        .map((st) => st.advancesTo).filter((p) => PHASES.includes(p)).pop();
+      let cur = readPhase();
+      if (!reached || !PHASES.includes(cur)) return;
+      while (PHASES.indexOf(cur) < PHASES.indexOf(reached)) {
+        const next = PHASES[PHASES.indexOf(cur) + 1];
+        const a = cli(STATE, ["advance", "--to", next, "--agent", AGENT_ID, "--note", `runner resume: phase reconciled to ${next}`], withOut);
+        if (!a.ok) { log(`[runner] phase reconcile to "${next}" not applied: ${a.error}`); return; }
+        cur = next;
+      }
+    };
+
     let priorRows = [];
     if (command === "resume") {
       const tracked = readTracker();
       if (!tracked.length) throw new UsageError(`No stage records in ${dataDir}; nothing to resume (use "run")`);
+      reconcilePhase(tracked);
       start = stages.findIndex((st) => !isDone(tracked.find((x) => x.stage === st.name)?.status));
       if (start < 0) {
         process.stdout.write(formatTable(tableRows(tracked)));

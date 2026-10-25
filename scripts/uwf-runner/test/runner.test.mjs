@@ -259,6 +259,25 @@ function setFixtureExit(s, stage, exitCode) {
 }
 
 {
+  console.log("# resume reconciles a phase left behind by a crash after a stage passed");
+  const s = setup();
+  try {
+    setFixtureExit(s, "risk-plan", 1);
+    run(s);
+    // Simulate: intake and discovery passed, but the process died before their phase advances landed.
+    const rb = skillJson("uwf-state-manager/state.mjs", ["rollback", "--to", "idea", "--agent", "test", "--note", "simulate crash"], s);
+    check("test setup: phase rolled back to idea", rb?.state?.phase === "idea", JSON.stringify(rb).slice(0, 200));
+    setFixtureExit(s, "risk-plan", undefined);
+    const rr = resume(s);
+    check("resume after reconcile exits 0", rr.code === 0, `${rr.code} ${rr.err.slice(-500)}`);
+    const hist = skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.history ?? [];
+    const rec = hist.filter((h) => /^runner resume: phase reconciled to/.test(h.note ?? "")).map((h) => h.to_phase ?? h.note);
+    check("phase stepped idea→intake→discovery before resuming", rec.length === 2 && /intake/.test(rec[0]) && /discovery/.test(rec[1]), JSON.stringify(rec));
+    check("phase closed at the end", skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.phase === "closed");
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
   console.log("# resume notes: one per resume, active stage re-invoked");
   const s = setup();
   try {
