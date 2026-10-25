@@ -30,6 +30,13 @@ const r = await adapter.invokeStage({
 | `codex` | `codex exec` | see below |
 | `fake` | none | offline fixture replay for CI |
 
+### What a stage inherits from the machine
+
+The `claude-code` adapter passes `--setting-sources project`, so a stage loads only the target repo's
+`.claude/settings.json` and project `CLAUDE.md`. The operator's user-level `~/.claude/CLAUDE.md` and user
+settings do not reach the stage. `--bare` would also skip hooks and CLAUDE.md discovery, but it only works
+with API-key auth, so the runner does not use it.
+
 ### `codex` adapter
 
 Command: `codex exec --cd <cwd> [--model m] --json -c sandbox_mode=".." -c approval_policy="never" --skip-git-repo-check --output-last-message <tmpfile> -`
