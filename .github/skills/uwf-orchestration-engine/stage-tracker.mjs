@@ -278,6 +278,7 @@ try {
   switch (command) {
     case "list-stages":    cmdListStages(db); break;
     case "check-gate":     cmdCheckGate(db);  break;
+    case "gate-prescriptions": cmdGatePrescriptions(); break;
     case "init":           cmdInit(db);        break;
     case "read":           cmdRead(db);        break;
     case "stage-start":    cmdStageUpdate(db, "active");    break;
@@ -352,6 +353,22 @@ function cmdListStages(db) {
   });
 
   process.stdout.write(JSON.stringify(list, null, 2) + "\n");
+  process.exitCode = 0;
+}
+
+/** Audit: every stage's gate checks with the prescription each would produce if it failed. */
+function cmdGatePrescriptions() {
+  requireFlag("workflow", "gate-prescriptions");
+  const { stages } = loadStagesYaml(workflow);
+  const out = stages.map((s) => ({
+    stage: s.name,
+    gated: s.gated !== false,
+    conditional: s.conditional === true,
+    on_gate_failure: s.on_gate_failure ?? "retry",
+    max_retries: s.max_retries ?? 2,
+    checks: (s.gate?.checks ?? []).map((c) => ({ type: c.type, label: c.label ?? null, prescription: prescribeCheck(c, null) })),
+  }));
+  process.stdout.write(JSON.stringify({ workflow, stages: out }, null, 2) + "\n");
   process.exitCode = 0;
 }
 
@@ -519,26 +536,67 @@ function cmdResetFrom(db) {
 function evaluateGate(stageDef, stageName) {
   // Ungated stages always pass
   if (stageDef.gated === false) {
-    return { stage: stageName, passed: true, failures: [], note: "ungated — always passes" };
+    return { stage: stageName, passed: true, failures: [], prescriptions: [], note: "ungated — always passes" };
   }
 
   // Conditional stage: check if condition is met; if not, auto-pass
   if (stageDef.conditional === true && stageDef.condition) {
     if (!evaluateCondition(stageDef.condition)) {
-      return { stage: stageName, passed: true, failures: [], note: "conditional — not required" };
+      return { stage: stageName, passed: true, failures: [], prescriptions: [], note: "conditional — not required" };
     }
   }
 
   // Evaluate gate checks
   const failures = [];
+  const prescriptions = [];
   for (const check of (stageDef.gate?.checks ?? [])) {
     const failure = evaluateCheck(check);
-    if (failure) failures.push(failure);
+    if (failure) { failures.push(failure); prescriptions.push(prescribeCheck(check, failure)); }
   }
 
+  const policy = { on_gate_failure: stageDef.on_gate_failure ?? "retry", max_retries: stageDef.max_retries ?? 2 };
   return failures.length
-    ? { stage: stageName, passed: false, failures }
-    : { stage: stageName, passed: true,  failures: [] };
+    ? { stage: stageName, passed: false, failures, prescriptions, ...policy }
+    : { stage: stageName, passed: true,  failures: [], prescriptions: [], ...policy };
+}
+
+/**
+ * One imperative sentence saying exactly what to produce for a failed check. Parallel to
+ * `failures`; it doubles as the runner's retry prompt. `failure` is the evaluateCheck string
+ * (null for the audit listing, which has no observed failure).
+ */
+function prescribeCheck(check, failure) {
+  const q = (v) => JSON.stringify(v);
+  switch (check.type) {
+    case "require_non_empty":
+      return `Write a non-empty file at ${resolveTemplates(check.path)}.`;
+    case "require_contains":
+      return `Include the text ${q(check.text)} in ${resolveTemplates(check.path)}.`;
+    case "require_files_with_prefix":
+      return `Create at least one file named ${check.prefix}* under ${resolveTemplates(check.dir)}.`;
+    case "require_file_matching_pattern":
+      return `Create a file under ${resolveTemplates(check.dir)} whose name matches ${check.pattern}.`;
+    case "run_script": {
+      const cmd = [resolveTemplates(check.cmd), ...(Array.isArray(check.args) ? check.args.map((a) => resolveTemplates(String(a))) : [])].join(" ");
+      const m = failure && failure.match(/ failed \(exit [^)]*\)(?:: ([\s\S]*))?$/);
+      const tail = m?.[1] ? m[1].split(/\r?\n/).slice(-5).join(" | ").slice(-400) : "no output";
+      return `Make ${q(cmd)} exit 0${failure ? `; it currently fails with: ${tail}` : ""}.`;
+    }
+    case "require_json_field": {
+      const p = resolveTemplates(check.path);
+      const ptr = check.pointer ? check.pointer : "(root)";
+      const schema = check.schema ? ` (schema: ${check.schema})` : "";
+      let want;
+      if ("exists" in check) want = `${ptr} ${check.exists === true ? "present" : "absent"}`;
+      else if ("in" in check) want = `${ptr} equal to one of ${q(check.in)}`;
+      else if ("equals" in check) want = `${ptr} equal to ${q(check.equals)}`;
+      else want = `${ptr} set as the gate requires`;
+      const detail = failure?.match(/does not match stage-result schema: ([\s\S]*)$/)?.[1];
+      return `Write ${p} as JSON with ${want}${schema}.${detail ? ` Fix: ${detail}.` : ""}`;
+    }
+    default:
+      return `Fix the gate configuration: unknown check type ${q(check.type)}.`;
+  }
 }
 
 function evaluateCondition(condition) {

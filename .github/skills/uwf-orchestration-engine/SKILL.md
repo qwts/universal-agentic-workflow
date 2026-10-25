@@ -235,6 +235,8 @@ When a gate check fails:
 3. Re-check the gate after the subagent returns.
 4. Allow up to **2 retries** per gate. After 2 failures, **halt** the sequence and report the blockage to the user with: gate name, missing artifacts, and the subagent's last response.
 
+**Prescriptions.** The `--check-gate` JSON carries `failures` (what is wrong) and a parallel `prescriptions: string[]` (one imperative sentence per failed check saying exactly what to produce, e.g. `Include the text "verdict: approved" in <path>.`), plus the gate's `on_gate_failure` and `max_retries`. Use the prescriptions as the retry instruction; the deterministic runner composes them into its retry prompt (`scripts/uwf-runner/runner.mjs`). `runner.mjs gates --workflow <w>` prints every stage's prescriptions for audit.
+
 ---
 
 ## Review Fix-Loop Protocol
