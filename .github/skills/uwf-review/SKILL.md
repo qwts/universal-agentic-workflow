@@ -108,6 +108,11 @@ The reviewer agent is **read-only**. It MUST NOT use `edit` or `execute` tools. 
    verdict: approved
    ```
    (or `verdict: changes_requested` / `verdict: rejected` as applicable). This is the stage gate artifact.
+7. **Also write the structured result** next to the markdown, with the same `{outputPath}/{prefix}-<stage>` stem and a `.result.json` suffix (e.g. `{outputPath}/{prefix}-review.md` -> `{outputPath}/{prefix}-review.result.json`; for acceptance, `{prefix}-acceptance.result.json`). It MUST match `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json`:
+   ```json
+   { "verdict": "approved", "findings": [ { "severity": "high", "summary": "...", "location": "path:line" } ], "notes": "..." }
+   ```
+   `verdict` is `approved` | `changes_requested` | `blocked` (map DB `rejected` to `blocked`); `findings[].severity` is `high` | `medium` | `low` (map DB `critical` to `high`, `major` to `medium`, `minor` to `low`); `location` and `notes` are optional. Use an empty `findings` array when there are none. The JSON `verdict` and the markdown `verdict:` line MUST agree.
 
 ### Severity guide
 
@@ -125,7 +130,7 @@ When verdict is `changes_requested`:
 4. Gate check: `list-findings --review-id <n> --status open` — exits `0` only when no open `critical`/`major` findings remain.
 
 ### Gate check
-The stage gate checks for `verdict: approved` in the output markdown file (e.g. `{prefix}-review.md`). The reviewer MUST write this line. The orchestrator does NOT call `list-findings` as the primary gate — the file check is authoritative.
+The stage gate checks `/verdict` equals `approved` in `{prefix}-<stage>.result.json` (`require_json_field`) AND for `verdict: approved` in the output markdown file (e.g. `{prefix}-review.md`). The reviewer MUST write both. The orchestrator does NOT call `list-findings` as the primary gate — the file check is authoritative.
 
 ---
 

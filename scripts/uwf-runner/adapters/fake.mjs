@@ -3,16 +3,32 @@
  *
  * Fixture (path in env.UWF_FAKE_FIXTURE, or second arg { fixture }):
  *   { files: { "<relative path>": "<content>" }, transcript: "<text>",
- *     sessionId?: string, exitCode?: number, delayMs?: number }
+ *     sessionId?: string, exitCode?: number, delayMs?: number,
+ *     attempts?: [ { files, transcript, exitCode, delayMs }, ... ] }
  * Files are written under `cwd`. A non-zero exitCode yields ok:false.
  * delayMs simulates a slow stage (used to exercise timeoutMs).
+ * attempts (optional): per-invocation variants. The Nth call for a fixture path uses
+ * attempts[N-1] (the last entry repeats). The call count lives in `<dataDir>/fake-attempts.json`
+ * so it survives separate adapter calls. Without `attempts` the top-level fields apply.
  */
 
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { resolve, dirname, relative, isAbsolute } from "node:path";
+import { resolve, dirname, relative, isAbsolute, join } from "node:path";
 import { writeTranscript } from "./index.mjs";
 
 export const name = "fake";
+
+/** Returns attempts[n] for this fixture path and bumps the persisted counter. */
+function pickAttempt(fx, fixturePath, dataDir) {
+  const file = join(dataDir, "fake-attempts.json");
+  let counts = {};
+  try { counts = JSON.parse(readFileSync(file, "utf8")); } catch { /* first call */ }
+  const n = counts[fixturePath] ?? 0;
+  counts[fixturePath] = n + 1;
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(file, JSON.stringify(counts));
+  return fx.attempts[Math.min(n, fx.attempts.length - 1)];
+}
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts @param {{fixture?: string}} [extra] */
 export async function invokeStage(opts, extra = {}) {
@@ -28,6 +44,10 @@ export async function invokeStage(opts, extra = {}) {
     fx = JSON.parse(readFileSync(fixturePath, "utf8"));
   } catch (e) {
     return fail(`fake adapter: cannot read fixture: ${e.message}`);
+  }
+  if (Array.isArray(fx.attempts) && fx.attempts.length > 0) {
+    if (!dataDir) return fail("fake adapter: attempts need a dataDir for the call counter");
+    fx = { ...fx, ...pickAttempt(fx, fixturePath, dataDir) };
   }
 
   if (fx.delayMs) {

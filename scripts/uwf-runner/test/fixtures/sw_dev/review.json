@@ -1,6 +1,7 @@
 {
   "files": {
-    "tmp/workflow-artifacts/issues-review.md": "# Review\n\nverdict: approved\n\nFixture content for the runner test.\n"
+    "tmp/workflow-artifacts/issues-review.md": "# Review\n\nverdict: approved\n\nFixture content for the runner test.\n",
+    "tmp/workflow-artifacts/issues-review.result.json": "{\"verdict\":\"approved\",\"findings\":[]}\n"
   },
   "transcript": "review: done",
   "delayMs": 0

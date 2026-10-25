@@ -19,6 +19,7 @@
  *   stage-complete --workflow <name> --stage <s>             Mark stage passed
  *   stage-fail     --workflow <name> --stage <s> [--note <t>] Increment retry, record failure
  *   stage-skip     --workflow <name> --stage <s>             Mark stage skipped
+ *   reset-from     --workflow <name> --stage <s> [--note <t>] Set stage and all later ones to pending
  *
  * Global options:
  *   --output-path <path>   Default: ./tmp/workflow-artifacts
@@ -283,6 +284,7 @@ try {
     case "stage-complete": cmdStageUpdate(db, "passed");    break;
     case "stage-fail":     cmdStageFail(db);               break;
     case "stage-skip":     cmdStageUpdate(db, "skipped");  break;
+    case "reset-from":     cmdResetFrom(db);               break;
     case "reset":          cmdReset(db);                    break;
     default: usageError(`Unknown command: "${command}"`);
   }
@@ -486,6 +488,30 @@ function cmdStageFail(db) {
   });
 }
 
+/** Set --stage and every later stage (YAML order) back to pending; one history row per stage. */
+function cmdResetFrom(db) {
+  requireFlag("workflow", "reset-from");
+  requireFlag("stage",    "reset-from");
+  const { stages } = loadStagesYaml(workflow);
+  const idx = stages.findIndex((s) => s.name === flags["stage"]);
+  if (idx < 0) usageError(`Unknown stage "${flags["stage"]}" in workflow "${workflow}".`);
+  const note = flags["note"] ?? `reset-from ${flags["stage"]}`;
+
+  const reset = stages.slice(idx).map((s) => s.name);
+  db.transaction(() => {
+    for (const name of reset) {
+      ensureRow(db, name);
+      const row = db.prepare(`SELECT status FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, name);
+      db.prepare(
+        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL WHERE workflow = ? AND stage = ?`
+      ).run(workflow, name);
+      appendHistory(db, workflow, name, row.status, "pending", note);
+    }
+  })();
+
+  succeed({ procedure: "reset-from", workflow, stage: flags["stage"], reset, state: readState(db) });
+}
+
 // ---------------------------------------------------------------------------
 // Gate evaluation
 // ---------------------------------------------------------------------------
@@ -585,9 +611,80 @@ function evaluateCheck(check) {
         return `${check.label ?? cmd} failed (exit ${err.status})${detail ? ": " + detail : ""}`;
       }
     }
+    case "require_json_field":
+      return evaluateJsonFieldCheck(check);
     default:
       return `Unknown check type: "${check.type}"`;
   }
+}
+
+/** Light structural validation against schemas/stage-result.schema.json (no ajv dependency). */
+function validateStageResult(doc) {
+  const schemaPath = join(dirname(fileURLToPath(import.meta.url)), "schemas", "stage-result.schema.json");
+  const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+  const errs = [];
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  if (!isObj(doc)) return ["/ must be an object"];
+  const props = schema.properties;
+  for (const k of schema.required) if (!(k in doc)) errs.push(`/${k} is required`);
+  if ("verdict" in doc && !props.verdict.enum.includes(doc.verdict)) {
+    errs.push(`/verdict must be one of ${props.verdict.enum.join("|")}`);
+  }
+  if ("findings" in doc) {
+    if (!Array.isArray(doc.findings)) errs.push("/findings must be an array");
+    else doc.findings.forEach((f, i) => {
+      if (!isObj(f)) { errs.push(`/findings/${i} must be an object`); return; }
+      const ip = props.findings.items.properties;
+      if (!ip.severity.enum.includes(f.severity)) errs.push(`/findings/${i}/severity must be one of ${ip.severity.enum.join("|")}`);
+      if (typeof f.summary !== "string") errs.push(`/findings/${i}/summary must be a string`);
+      if ("location" in f && typeof f.location !== "string") errs.push(`/findings/${i}/location must be a string`);
+    });
+  }
+  if ("notes" in doc && typeof doc.notes !== "string") errs.push("/notes must be a string");
+  return errs;
+}
+
+/** Resolve an RFC 6901 JSON pointer. Returns { found, value }. */
+function resolvePointer(doc, pointer) {
+  if (pointer === "") return { found: true, value: doc };
+  if (!pointer.startsWith("/")) return { found: false };
+  let cur = doc;
+  for (const raw of pointer.slice(1).split("/")) {
+    const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (cur === null || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, key)) return { found: false };
+    cur = cur[key];
+  }
+  return { found: true, value: cur };
+}
+
+function evaluateJsonFieldCheck(check) {
+  const p = resolveTemplates(check.path);
+  const pointer = check.pointer ?? "";
+  const where = `${check.label ?? p} (${p}) pointer ${pointer || "(root)"}`;
+  const modes = ["equals", "in", "exists"].filter((m) => m in check);
+  if (modes.length !== 1) return `${where}: misconfigured, needs exactly one of equals/in/exists`;
+  if (!existsSync(p)) return `${where}: file missing`;
+  let doc;
+  try { doc = JSON.parse(readFileSync(p, "utf8")); }
+  catch { return `${where}: invalid JSON`; }
+  if (check.schema === "stage-result") {
+    const errs = validateStageResult(doc);
+    if (errs.length) return `${where}: does not match stage-result schema: ${errs.join("; ")}`;
+  } else if (check.schema !== undefined) {
+    return `${where}: unknown schema "${check.schema}"`;
+  }
+  const { found, value } = resolvePointer(doc, pointer);
+  const observed = found ? JSON.stringify(value) : "<absent>";
+  if ("exists" in check) {
+    return found === (check.exists === true) ? null : `${where}: observed ${observed}, expected exists: ${check.exists}`;
+  }
+  if ("equals" in check) {
+    return found && JSON.stringify(value) === JSON.stringify(check.equals) ? null
+      : `${where}: observed ${observed}, expected equals ${JSON.stringify(check.equals)}`;
+  }
+  const allowed = Array.isArray(check.in) ? check.in : [];
+  return found && allowed.some((a) => JSON.stringify(a) === JSON.stringify(value)) ? null
+    : `${where}: observed ${observed}, expected one of ${JSON.stringify(allowed)}`;
 }
 
 // ---------------------------------------------------------------------------
