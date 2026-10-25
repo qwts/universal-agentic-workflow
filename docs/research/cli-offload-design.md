@@ -514,7 +514,9 @@ fixed. It was used to size the budget cap and to choose what to record. It is
 
 1. Harness (#101) complete: writes the three tables, exports CSV, tests the
    NOCLI gate snapshot logic.
-2. Adapter reports cache read and cache write tokens.
+2. Cache read and cache write tokens recorded per attempt: the harness reads them
+   from the Claude Code JSON kept in each transcript (#101), so the adapter
+   needs no change; confirmed on the first live run.
 3. Per-cell budget cap set and committed as an amendment.
 4. Randomization seed and run order committed.
 5. Fixture leakage checks (10.1) done and recorded.
