@@ -453,7 +453,7 @@ function artifactsForPhase(toPhase, artPath) {
     planning: [`${artPath}/{mode}-intake.md`, `${artPath}/{mode}-discovery.md`, `${artPath}/{mode}-plan.md`],
     execution: [],
     acceptance: [`${artPath}/{mode}-acceptance.md`],
-    snapshot: [`${artPath}/{mode}-acceptance.md`],
+    snapshot: [`${artPath}/{mode}-drs.json`, `${artPath}/{mode}-br.json`],
     closed: [],
   };
   return map[toPhase] ?? [];
