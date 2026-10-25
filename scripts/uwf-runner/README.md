@@ -43,6 +43,14 @@ node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapt
 
 Exit codes: 0 complete, 1 gate blocked or abort, 2 usage/config error, 3 questions pending
 (answer with `questions.mjs answer`, then rerun with `--from-stage <stage>`).
-A run without `--from-stage` re-initializes the stage-tracker and state stores in the data dir.
+A run without `--from-stage` re-initializes the stage-tracker and state stores in the data dir,
+unless the workflow in that data dir is already complete: then it prints the stage table and exits 0
+(`--force` re-initializes anyway). `--from-stage <s>` calls `stage-tracker.mjs reset-from` and rolls
+the phase back via `state.mjs rollback`.
+
+`runner.mjs resume --workflow w [--adapter a] [--model m] [--data-dir d] [--output-path p] [--non-interactive] [--timeout-ms n]`
+continues from the first stage not passed/skipped without re-initializing stores. The goal is read
+from `<data-dir>/runner-goal.md` (written by `run`; exit 2 if missing). An `active` stage (crash) is
+re-invoked without counting against retries; a `failed` one restarts with retries reset.
 `on_gate_failure: retry` retries `max_retries` times then fails; `skip` and `abort` act on the first failure.
 Tests: `node scripts/uwf-runner/test/runner.test.mjs` (fake adapter, fixtures in `test/fixtures/<workflow>/`).
