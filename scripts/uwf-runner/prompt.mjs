@@ -35,18 +35,51 @@ export class PromptError extends Error {}
 // Node 20 has no fs.globSync (added in 22). The stage inputs only use simple
 // patterns such as docs/adr/ADR-[0-9]*.md, so a small matcher covers the
 // supported runtime; fs.globSync is used when available.
-function globToRegExp(glob) {
-  let re = "";
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === "*") {
-      if (glob[i + 1] === "*") { re += ".*"; i++; if (glob[i + 1] === "/") i++; }
-      else re += "[^/]*";
-    } else if (c === "?") re += "[^/]";
-    else if (c === "[") { const j = glob.indexOf("]", i); if (j > i) { re += glob.slice(i, j + 1); i = j; } else re += "\\["; }
-    else re += c.replace(/[.+^${}()|\\]/g, "\\$&");
+// Direct glob matcher (no RegExp construction from stage input): supports
+// *, ?, [...] within a path segment and ** across segments.
+function matchClass(cls, ch) {
+  let neg = false, i = 0;
+  if (cls[0] === "!" || cls[0] === "^") { neg = true; i = 1; }
+  let hit = false;
+  for (; i < cls.length; i++) {
+    if (cls[i + 1] === "-" && i + 2 < cls.length) {
+      if (ch >= cls[i] && ch <= cls[i + 2]) hit = true;
+      i += 2;
+    } else if (cls[i] === ch) hit = true;
   }
-  return new RegExp(`^${re}$`);
+  return neg ? !hit : hit;
+}
+
+function matchSegment(pat, str, pi = 0, si = 0) {
+  while (pi < pat.length) {
+    const c = pat[pi];
+    if (c === "*") {
+      for (let k = si; k <= str.length; k++) if (matchSegment(pat, str, pi + 1, k)) return true;
+      return false;
+    }
+    if (si >= str.length) return false;
+    if (c === "[") {
+      const close = pat.indexOf("]", pi + 2);
+      if (close === -1) { if (str[si] !== "[") return false; pi++; si++; continue; }
+      if (!matchClass(pat.slice(pi + 1, close), str[si])) return false;
+      pi = close + 1; si++; continue;
+    }
+    if (c !== "?" && c !== str[si]) return false;
+    pi++; si++;
+  }
+  return si === str.length;
+}
+
+function matchPath(patSegs, strSegs, pi = 0, si = 0) {
+  while (pi < patSegs.length) {
+    if (patSegs[pi] === "**") {
+      for (let k = si; k <= strSegs.length; k++) if (matchPath(patSegs, strSegs, pi + 1, k)) return true;
+      return false;
+    }
+    if (si >= strSegs.length || !matchSegment(patSegs[pi], strSegs[si])) return false;
+    pi++; si++;
+  }
+  return si === strSegs.length;
 }
 
 function walk(dir, out = []) {
@@ -66,10 +99,9 @@ export function globFiles(pattern, cwd) {
   const firstGlob = segs.findIndex((s) => /[*?[{]/.test(s));
   if (firstGlob === -1) return existsSync(abs) ? [abs] : [];
   const base = segs.slice(0, firstGlob).join("/") || "/";
-  const re = globToRegExp(abs);
   const deep = segs.slice(firstGlob).some((s) => s.includes("**")) || segs.length - firstGlob > 1;
   const candidates = deep ? walk(base) : (() => { try { return readdirSync(base).map((n) => join(base, n)); } catch { return []; } })();
-  return candidates.filter((f) => re.test(f) && (() => { try { return statSync(f).isFile(); } catch { return false; } })());
+  return candidates.filter((f) => matchPath(segs, f.split("/")) && (() => { try { return statSync(f).isFile(); } catch { return false; } })());
 }
 
 const readYaml = (yaml, p) => (existsSync(p) ? yaml.load(readFileSync(p, "utf8")) : null);
