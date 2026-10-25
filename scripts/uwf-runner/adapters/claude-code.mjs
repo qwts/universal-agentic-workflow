@@ -45,20 +45,32 @@ export async function invokeStage(opts) {
   if (system) args.push("--append-system-prompt", system);
   if (sessionId) args.push("--resume", sessionId);
   if (model) args.push("--model", model);
-  args.push("--permission-mode", "dontAsk", "--allowedTools", TOOLS[permissions].join(","));
+  // --tools restricts what exists; --allowedTools pre-approves it. Both are
+  // needed: dontAsk keeps the user's own pre-approved tools unless --tools
+  // narrows the set, so a read-only stage must not depend on ambient settings.
+  const toolList = TOOLS[permissions].join(",");
+  args.push("--permission-mode", "dontAsk", "--tools", toolList, "--allowedTools", toolList);
 
   return new Promise((done) => {
     let out = "", err = "", timedOut = false, settled = false;
     let child;
     try {
+      // detached: the child leads its own process group, so a timeout can
+      // kill every descendant (tool subprocesses under edit+exec) at once.
       child = spawn("claude", args, {
-        cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"],
+        cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32",
       });
     } catch (e) {
       return done(fail(`spawn failed: ${e.message}`));
     }
+    const killTree = () => {
+      try { if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
+      catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+    };
+    // On timeout, settle immediately rather than waiting for "close": a
+    // surviving descendant holding the pipes must not extend the deadline.
     const timer = timeoutMs
-      ? setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs)
+      ? setTimeout(() => { timedOut = true; killTree(); finish(null); }, timeoutMs)
       : null;
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
