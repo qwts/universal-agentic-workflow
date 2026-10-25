@@ -190,6 +190,7 @@ async function main(argv) {
     };
 
     let priorRows = [];
+    let resumeSessionId; // adapter session recorded on the stage being resumed (retry_mode: resume only)
     if (command === "resume") {
       const tracked = readTracker();
       if (!tracked.length) throw new UsageError(`No stage records in ${dataDir}; nothing to resume (use "run")`);
@@ -202,6 +203,8 @@ async function main(argv) {
       const reason = status === "active" || status === "failed" ? status : "pending";
       // A failed stage restarts with retries reset (resume is an explicit human action).
       // An active one (crash) is simply re-invoked: the loop's attempt counter starts at 1 anyway.
+      // Read the recorded session before reset-from clears it; a resume continues the same conversation.
+      resumeSessionId = tracked.find((x) => x.stage === stages[start].name)?.session_id ?? undefined;
       if (reason === "failed") resetFrom(start);
       priorRows = tableRows(tracked).slice(0, start);
       const n = note(`runner resume: from=${stages[start].name} reason=${reason}`);
@@ -235,7 +238,7 @@ async function main(argv) {
 
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
-    return await stageLoop({ stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
+    return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
       repoRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
@@ -247,7 +250,7 @@ async function main(argv) {
  * returns an exit code. ctx carries everything resolved by main().
  */
 async function stageLoop(ctx) {
-  const { stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot,
+  const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot,
     outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut } = ctx;
   let first = true;
   for (let i = start; i < stages.length; i++) {
@@ -297,7 +300,11 @@ async function stageLoop(ctx) {
     const model = flags.model ?? mp.model ?? undefined;
     const maxAttempts = st.maxRetries + 1;
 
-    let sessionId;
+    // retry_mode "resume": each retry passes the previous attempt's session id to the adapter.
+    // "fresh": never pass one, so every attempt starts a new session. The first attempt of a stage
+    // starts fresh too, except when `resume` continues a stage whose tracker row holds a session id.
+    const keepSession = st.retryMode !== "fresh";
+    let sessionId = i === start && keepSession ? resumeSessionId : undefined;
     let prompt = basePrompt;
     for (let attempt = 1; ; attempt++) {
       row.attempts = attempt;
@@ -311,6 +318,8 @@ async function stageLoop(ctx) {
         model, sessionId, timeoutMs, env, permissions: mp.permissions, dataDir,
       });
       sessionId = res.sessionId ?? sessionId;
+      // Persist right away so the session survives a crash between attempts.
+      if (sessionId) cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
       cli(STATE, ["release-agent"], withOut); // 4.
 
       // 5. questions
@@ -347,7 +356,7 @@ async function stageLoop(ctx) {
         const g = cli(runScript, ["--check-gate", st.name], withOut);
         if (g.ok) {
           log(`${tag} gate: PASS`);
-          cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name], withOut);
+          cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
           row.result = "passed";
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
           if (adv) row.result += ` (${adv})`;
@@ -363,7 +372,7 @@ async function stageLoop(ctx) {
         log(gateSummary(st, failures, prescriptions, st.onGateFailure === "skip" ? "marked the stage skipped and continued" : "marked the stage failed and stopped the run"));
       }
       if (st.onGateFailure === "skip") {
-        cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`], withOut);
+        cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`, ...sessionArgs(sessionId)], withOut);
         row.result = "skipped (gate failed)";
         // A skipped stage still moves the workflow forward, as stage-tracker does.
         const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
@@ -371,10 +380,11 @@ async function stageLoop(ctx) {
         break;
       }
       if (st.onGateFailure === "abort" || attempt >= maxAttempts) {
-        cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; ")], withOut);
+        cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; "), ...sessionArgs(sessionId)], withOut);
         row.result = st.onGateFailure === "abort" ? "failed (abort)" : "failed";
         return finish(EXIT.GATE, rows, `${tag}: gate blocked after ${attempt} attempt(s): ${failures.join("; ")}`, note);
       }
+      if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
       prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
     }
   }
@@ -390,6 +400,8 @@ async function stageLoop(ctx) {
   }
 }
 
+const sessionArgs = (id) => (id ? ["--session-id", id] : []);
+
 /** `gates --workflow <w>`: print every stage's gate checks with the prescription each would give if it failed. */
 function gatesAudit(flags) {
   if (!flags.workflow) throw new UsageError("--workflow is required");
@@ -401,7 +413,7 @@ function gatesAudit(flags) {
     if (!r.ok || !Array.isArray(r.data?.stages)) throw new UsageError(`Cannot read gates: ${r.error}`);
     const out = [`workflow: ${flags.workflow} (placeholders: <output_path> = --output-path, <repo> = repo root)`];
     for (const s of r.data.stages) {
-      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
+      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, `retry_mode: ${s.retry_mode}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
       out.push("", `${s.stage}  (${flagsTxt})`);
       if (!s.checks.length) out.push("  (no checks)");
       for (const c of s.checks) out.push(`  - ${c.type}: ${c.prescription.split(repoRoot).join("<repo>")}`);
@@ -471,7 +483,7 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, outputPa
     const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, outputPath, dataDir, extraContext: { goal } });
     out.push(`[${start + j + 1}/${total}] ${st.name}  (agent: ${mp.agentName})`);
     out.push(`  permissions: ${mp.permissions}   model: ${flags.model ?? mp.model ?? "(adapter default)"}`);
-    out.push(`  retries: ${st.maxRetries}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
+    out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
     out.push(`  required outputs: ${mp.outputsRequired.length ? mp.outputsRequired.join(", ") : "(none)"}`);
     if (mp.inputsMissing.length) out.push(`  inputs not present yet: ${mp.inputsMissing.join(", ")}`);
     const checks = gateChecks[st.name] ?? [];

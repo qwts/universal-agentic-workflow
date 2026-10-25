@@ -3,7 +3,7 @@
  *
  * Fixture (path in env.UWF_FAKE_FIXTURE, or second arg { fixture }):
  *   { files: { "<relative path>": "<content>" }, transcript: "<text>",
- *     sessionId?: string, exitCode?: number, delayMs?: number,
+ *     sessionId?: string (fixed id when none is passed in; otherwise a unique one is minted), exitCode?: number, delayMs?: number,
  *     attempts?: [ { files, transcript, exitCode, delayMs }, ... ] }
  * Files are written under `cwd`. A non-zero exitCode yields ok:false.
  * delayMs simulates a slow stage (used to exercise timeoutMs).
@@ -28,6 +28,17 @@ function pickAttempt(fx, fixturePath, dataDir) {
   mkdirSync(dataDir, { recursive: true });
   writeFileSync(file, JSON.stringify(counts));
   return fx.attempts[Math.min(n, fx.attempts.length - 1)];
+}
+
+/** Next unique "fake-session-NNNN" (counter persisted in <dataDir>/fake-sessions.json). */
+function mintSession(dataDir) {
+  if (!dataDir) return "fake-session-0001";
+  const file = join(dataDir, "fake-sessions.json");
+  let n = 0;
+  try { n = JSON.parse(readFileSync(file, "utf8")).n ?? 0; } catch { /* first call */ }
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(file, JSON.stringify({ n: n + 1 }));
+  return `fake-session-${String(n + 1).padStart(4, "0")}`;
 }
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts @param {{fixture?: string}} [extra] */
@@ -70,7 +81,9 @@ export async function invokeStage(opts, extra = {}) {
     return fail(`fake adapter: ${e.message}`);
   }
 
-  const sid = sessionId ?? fx.sessionId ?? "fake-session-0001";
+  // Continuity: a given sessionId is returned unchanged (resume). Without one the fixture's fixed id
+  // is used if it has one, otherwise a new unique id is minted, so a "fresh" session is observable.
+  const sid = sessionId ?? fx.sessionId ?? mintSession(dataDir);
   const exitCode = fx.exitCode ?? 0;
   const stdout = fx.transcript ?? "";
   const transcriptPath = writeTranscript(dataDir, {

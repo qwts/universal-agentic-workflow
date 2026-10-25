@@ -53,4 +53,5 @@ continues from the first stage not passed/skipped without re-initializing stores
 from `<data-dir>/runner-goal.md` (written by `run`; exit 2 if missing). An `active` stage (crash) is
 re-invoked without counting against retries; a `failed` one restarts with retries reset.
 `on_gate_failure: retry` retries `max_retries` times then fails; `skip` and `abort` act on the first failure.
+`retry_mode: resume` (default) passes the previous attempt's session id to the adapter on each retry (and on `resume` of a stage whose tracker row has a `session_id`); `retry_mode: fresh` omits it so every attempt starts a new session. The id is recorded in `stage_runs.session_id`.
 Tests: `node scripts/uwf-runner/test/runner.test.mjs` (fake adapter, fixtures in `test/fixtures/<workflow>/`).
