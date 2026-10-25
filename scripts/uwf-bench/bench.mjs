@@ -59,7 +59,7 @@ const isGitDir = (p) => existsSync(join(p, ".git"));
 const isRemote = (repo) => /^[a-z][a-z0-9+.-]*:\/\/|^git@/i.test(repo);
 /** Paths with uncommitted changes (NUL-delimited porcelain, untrimmed so a leading-space status survives). */
 function changedPaths(cwd) {
-  const r = spawnSync("git", ["status", "--porcelain", "-z"], { cwd, encoding: "utf8" });
+  const r = spawnSync("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd, encoding: "utf8" });
   if (r.status !== 0) return [];
   return r.stdout.split("\0").filter(Boolean).map((e) => e.slice(3));
 }
