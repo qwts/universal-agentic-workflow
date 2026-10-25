@@ -22,6 +22,35 @@ const r = await adapter.invokeStage({
   (non-zero exit, timeout, bad output) return `ok:false` with `error`.
 - `usage` is `{ inputTokens, outputTokens }` when the CLI reports it, else `null`.
 
+## Adapters
+
+| name | CLI | notes |
+| --- | --- | --- |
+| `claude-code` | `claude -p` | `--append-system-prompt`, `--resume`, tool allowlist from `permissions`, reports cost |
+| `codex` | `codex exec` | see below |
+| `fake` | none | offline fixture replay for CI |
+
+### `codex` adapter
+
+Command: `codex exec --cd <cwd> [--model m] --json -c sandbox_mode=".." -c approval_policy="never" --skip-git-repo-check --output-last-message <tmpfile> -`
+(prompt on stdin). With `sessionId`: `codex exec resume <sessionId> ...` (no `--cd`; the cwd is set on the child process).
+
+| `permissions` | Codex |
+| --- | --- |
+| `read-only` | `sandbox_mode="read-only"` |
+| `edit` | `sandbox_mode="workspace-write"` |
+| `edit+exec` | `sandbox_mode="workspace-write"` |
+
+Never uses `danger-full-access` or `--dangerously-bypass-*`.
+
+Limitations:
+- No per-tool allowlist: `edit` and `edit+exec` are identical (commands always run in the workspace-write sandbox, network off by default).
+- No system-prompt flag: `agentFile`/`systemPrompt` are prepended to the prompt under `# Agent instructions`, so they are weaker than a real system prompt.
+- `exec resume` has no `--sandbox`/`--cd`; the adapter uses `-c sandbox_mode=...` and the child cwd instead.
+- No cost: `costUsd` is omitted. `usage` comes from `turn.completed` events and is `null` if absent.
+- `sessionId` is the `thread.started` thread id; if the CLI emits none, the passed-in id (or `null`) is returned.
+- The JSONL event names (`thread.started`, `item.completed`/`agent_message`, `turn.completed`) have not been verified against a live run; parsing is defensive and the final message prefers `--output-last-message`.
+
 ## Adding an adapter
 
 1. Create `adapters/<name>.mjs` exporting `name` and `invokeStage(opts)`.
@@ -32,7 +61,7 @@ const r = await adapter.invokeStage({
 
 ## Tests
 
-`node scripts/uwf-runner/test/adapters.test.mjs` (live: `UWF_TEST_LIVE=1`, uses haiku).
+`node scripts/uwf-runner/test/adapters.test.mjs` (live: `UWF_TEST_LIVE=1`; claude uses haiku, codex uses its default model unless `UWF_TEST_CODEX_MODEL` is set).
 
 ## Runner (`runner.mjs`)
 
