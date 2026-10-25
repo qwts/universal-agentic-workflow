@@ -15,7 +15,11 @@
  * Exit codes: 0 ok, 2 usage error.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, globSync as fsGlobSync } from "node:fs";
+import * as fs from "node:fs";
+// Named-importing globSync is a SyntaxError on Node 20 (no such export), so
+// go through the namespace and feature-detect at call time.
+const { existsSync, readFileSync, readdirSync, statSync } = fs;
+const fsGlobSync = fs.globSync;
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";

@@ -87,7 +87,7 @@ stages:
     max_retries: 2
     on_gate_failure: retry
     run_as_subagent: true
-    advances_phase_to: forensic-scoring
+    advances_phase_to: discovery
     inputs:
       - "{{output_path}}/forensic-intent.md"
       - "{{output_path}}/forensic-artifact-harvest.md"
@@ -117,7 +117,7 @@ stages:
     max_retries: 3
     on_gate_failure: retry
     run_as_subagent: true
-    advances_phase_to: forensic-review
+    advances_phase_to: discovery
     inputs:
       - "{{output_path}}/forensic-br.json"
     outputs:

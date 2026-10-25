@@ -2,7 +2,7 @@
  * UWF adapter contract test — runs the same assertions against each adapter.
  *
  * Usage: node scripts/uwf-runner/test/adapters.test.mjs
- * The claude-code adapter is SKIPPED unless `claude` is on PATH and UWF_TEST_LIVE is set
+ * The claude-code and codex adapters are SKIPPED unless their CLI is on PATH and UWF_TEST_LIVE is set
  * (live run uses model haiku and a tiny prompt).
  */
 
@@ -18,8 +18,8 @@ function check(label, cond, detail = "") {
   else { failures++; console.log(`  FAIL ${label} ${detail}`); }
 }
 
-function claudeAvailable() {
-  try { execFileSync("claude", ["--version"], { stdio: "ignore" }); return true; } catch { return false; }
+function cliAvailable(bin) {
+  try { execFileSync(bin, ["--version"], { stdio: "ignore" }); return true; } catch { return false; }
 }
 
 async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase }) {
@@ -83,12 +83,23 @@ async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase })
 }
 
 // --- claude-code adapter (opt-in live) ---
-if (!process.env.UWF_TEST_LIVE || !claudeAvailable()) {
+if (!process.env.UWF_TEST_LIVE || !cliAvailable("claude")) {
   console.log("# adapter: claude-code\nSKIP (needs `claude` on PATH and UWF_TEST_LIVE=1)");
 } else {
   await contract("claude-code", {
     prompt: "Reply with the single word OK. Do not use any tools.",
     model: process.env.UWF_TEST_MODEL ?? "haiku",
+    timeoutCase: { timeoutMs: 1 },
+  });
+}
+
+// --- codex adapter (opt-in live) ---
+if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
+  console.log("# adapter: codex\nSKIP (needs `codex` on PATH and UWF_TEST_LIVE=1)");
+} else {
+  await contract("codex", {
+    prompt: "Reply with the single word OK. Do not run any commands.",
+    model: process.env.UWF_TEST_CODEX_MODEL, // unset -> the CLI's configured default
     timeoutCase: { timeoutMs: 1 },
   });
 }

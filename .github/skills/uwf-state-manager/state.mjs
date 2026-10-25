@@ -52,7 +52,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = resolveDbPath(process.argv.slice(2), "uwf-state.db", __dirname);
 const WORKFLOW_SCHEMA_PATH = join(__dirname, "workflow-schema.yaml");
 
-const VALID_PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "closed"];
+const VALID_PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const VALID_STATUSES = ["idle", "active", "blocked"];
 const PHASE_ORDER = Object.fromEntries(VALID_PHASES.map((p, i) => [p, i]));
 
@@ -453,6 +453,7 @@ function artifactsForPhase(toPhase, artPath) {
     planning: [`${artPath}/{mode}-intake.md`, `${artPath}/{mode}-discovery.md`, `${artPath}/{mode}-plan.md`],
     execution: [],
     acceptance: [`${artPath}/{mode}-acceptance.md`],
+    snapshot: [`${artPath}/{mode}-drs.json`, `${artPath}/{mode}-br.json`],
     closed: [],
   };
   return map[toPhase] ?? [];
