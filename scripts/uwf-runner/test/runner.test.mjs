@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..", "..", "..");
@@ -417,6 +418,79 @@ function setFixtureExit(s, stage, exitCode) {
     const a = spawnSync(process.execPath, [RUNNER, "gates", "--workflow", "sw_dev"], { encoding: "utf8" });
     check("gates audit lists review prescription", a.status === 0 && /^review /m.test(a.stdout) && /issues-review\.md/.test(a.stdout), a.stderr);
   } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+// 7. Session continuity: retry_mode, persisted session ids, old-DB migration --------
+{
+  console.log("# session continuity");
+  const s = setup();
+  try {
+    const rmFixture = () => {
+      const fxPath = join(s.fixtures, "review.json");
+      const fx = JSON.parse(readFileSync(fxPath, "utf8"));
+      delete fx.files["tmp/workflow-artifacts/issues-review.md"];
+      writeFileSync(fxPath, JSON.stringify(fx));
+    };
+    rmFixture();
+    // default (resume): one session across all attempts, recorded on the tracker row
+    const r1 = run(s);
+    const rev1 = transcripts(s).filter((t) => t.prompt.includes("Run the review stage"));
+    check("resume mode: 4 attempts share one sessionId", r1.code === 1 && rev1.length === 4 && new Set(rev1.map((t) => t.sessionId)).size === 1, `${r1.code} ${rev1.length}`);
+    const row1 = byStage(trackerRows(s)).review;
+    check("tracker row carries the session_id of the failed stage", row1?.status === "failed" && row1.session_id === rev1[0].sessionId, JSON.stringify(row1));
+    check("passed stages carry a session_id", byStage(trackerRows(s)).intake?.session_id?.startsWith("fake-session-"), JSON.stringify(byStage(trackerRows(s)).intake));
+    check("skipped stages have no session_id", byStage(trackerRows(s)).adr?.session_id == null);
+
+    // resume of the failed stage passes the recorded session through
+    resume(s);
+    const after = transcripts(s).filter((t) => t.prompt.includes("Run the review stage"));
+    check("runner resume continues the recorded session", after.length > rev1.length && after.slice(rev1.length).every((t) => t.sessionId === row1.session_id), after.map((t) => t.sessionId).join(","));
+    const hist = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
+    check("tracker row keeps the session_id across the resume's reset-from", byStage(hist?.state ?? []).review?.session_id === row1.session_id, JSON.stringify(byStage(hist?.state ?? []).review));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+
+  const f = setup();
+  try {
+    const yamlPath = join(f.repo, ".github", "skills", "uwf-sw_dev", "stages.yaml");
+    const text = readFileSync(yamlPath, "utf8");
+    const marked = text.replace("    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n", "    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n    retry_mode: fresh\n");
+    check("test setup: stages.yaml patched", marked !== text);
+    writeFileSync(yamlPath, marked);
+    const fxPath = join(f.fixtures, "review.json");
+    const fx = JSON.parse(readFileSync(fxPath, "utf8"));
+    delete fx.files["tmp/workflow-artifacts/issues-review.md"];
+    writeFileSync(fxPath, JSON.stringify(fx));
+
+    const list = skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], f);
+    check("--list-stages exposes retryMode (fresh set, default resume)", list?.find((x) => x.name === "review")?.retryMode === "fresh" && list?.find((x) => x.name === "intake")?.retryMode === "resume");
+    const r = run(f);
+    const rev = transcripts(f).filter((t) => t.prompt.includes("Run the review stage"));
+    check("fresh mode: every attempt gets a different sessionId", r.code === 1 && rev.length === 4 && new Set(rev.map((t) => t.sessionId)).size === 4, rev.map((t) => t.sessionId).join(","));
+    check("fresh mode: tracker keeps the last attempt's session_id", byStage(trackerRows(f)).review?.session_id === rev[3].sessionId);
+
+    writeFileSync(yamlPath, text.replace("    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n", "    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n    retry_mode: sideways\n"));
+    const bad = spawnSync(process.execPath, [join(SKILLS, "uwf-sw_dev", "run.mjs"), "--list-stages", "--data-dir", f.data], { encoding: "utf8", cwd: f.repo });
+    check("invalid retry_mode is rejected", bad.status !== 0 && /retry_mode must be one of resume \| fresh/.test(bad.stdout), bad.stdout.slice(0, 200));
+  } finally { rmSync(f.base, { recursive: true, force: true }); }
+
+  const o = setup();
+  try {
+    // A DB created before session_id existed must still open, read, and accept --session-id.
+    const req = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"));
+    const Database = req("better-sqlite3");
+    mkdirSync(o.data, { recursive: true });
+    const db = new Database(join(o.data, "uwf-stages.db"));
+    db.exec(`CREATE TABLE stage_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+      started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT)`);
+    db.prepare("INSERT INTO stage_runs (workflow, stage, status) VALUES ('sw_dev', 'intake', 'passed')").run();
+    db.close();
+    const rd = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], o);
+    const row = rd?.state?.find((x) => x.stage === "intake");
+    check("old DB without session_id: read works, column added as null", rd?.ok !== false && row?.status === "passed" && row.session_id === null, JSON.stringify(rd)?.slice(0, 200));
+    const st = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["stage-start", "--workflow", "sw_dev", "--stage", "intake", "--session-id", "abc-1"], o);
+    check("old DB: stage-start --session-id stores it", st?.state?.find((x) => x.stage === "intake")?.session_id === "abc-1");
+  } finally { rmSync(o.base, { recursive: true, force: true }); }
 }
 
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
