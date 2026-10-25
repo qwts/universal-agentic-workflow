@@ -154,46 +154,14 @@ jobs:
             node "$test_file"
           done
 
-      - name: Runner tests
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
-        with:
-          task: Runner tests (adapters)
-          executable: node
-          arguments-json: '["scripts/uwf-runner/test/adapters.test.mjs"]'
-          working-directory: .
-          timeout-seconds: '300'
-          attempts: '1'
+      - name: Run runner tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in scripts/uwf-runner/test/*.test.mjs; do
+            node "$test_file"
+          done
 
-      - name: Runner tests (prompt)
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
-        with:
-          task: Runner tests (prompt)
-          executable: node
-          arguments-json: '["scripts/uwf-runner/test/prompt.test.mjs"]'
-          working-directory: .
-          timeout-seconds: '300'
-          attempts: '1'
-
-      - name: Runner tests (runner loop)
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
-        with:
-          task: Runner tests (runner loop)
-          executable: node
-          arguments-json: '["scripts/uwf-runner/test/runner.test.mjs"]'
-          working-directory: .
-          timeout-seconds: '300'
-          attempts: '1'
-
-  companion:
-    name: UWF Companion
-    needs: policy
-    if: ${{ needs.policy.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 22
-    defaults:
-      run:
-        working-directory: uwf-companion
-    steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
