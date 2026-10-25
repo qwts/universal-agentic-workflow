@@ -155,6 +155,9 @@ async function main(argv) {
         const r = cli(script, args, withOut);
         if (!r.ok) throw new UsageError(`Store init failed (${args[0]}): ${r.error}`);
       }
+      // A fresh start also forgets questions from earlier attempts in this data dir.
+      const qr = cli(QUESTIONS, ["reset"]);
+      if (!qr.ok) log(`[runner] questions reset not applied: ${qr.error}`);
     }
     const noted = note(`runner start: workflow=${workflow} adapter=${adapterName} from=${stages[start].name}`);
     if (!noted.ok) log(`[runner] note not recorded: ${noted.error}`);
@@ -171,8 +174,15 @@ async function main(argv) {
       const q = cli(QUESTIONS, ["check", "--stage", st.name]);
       if (!q.ok) {
         if (q.data?.gate !== "fail") throw new UsageError(`questions check failed: ${q.error}`);
-        row.result = "blocked: questions pending";
-        return finish(EXIT.QUESTIONS, rows, `${tag}: ${q.data.pending_count} pending required question(s); answer with questions.mjs answer --id <n> --answer ..., then rerun with --from-stage ${st.name}`, note);
+        if (nonInteractive) {
+          const pend = cli(QUESTIONS, ["list", "--stage", st.name, "--status", "pending"]);
+          const ids = (pend.data?.questions ?? []).map((x) => x.id);
+          for (const id of ids) cli(QUESTIONS, ["skip", "--id", String(id)]);
+          log(`${tag}: --non-interactive: skipped ${ids.length} pending question(s) (ids ${ids.join(",")}) and continuing`);
+        } else {
+          row.result = "blocked: questions pending";
+          return finish(EXIT.QUESTIONS, rows, `${tag}: ${q.data.pending_count} pending required question(s); answer with questions.mjs answer --id <n> --answer ..., then rerun with --from-stage ${st.name}`, note);
+        }
       }
 
       // Conditional stages whose condition is not met auto-pass in the gate; do not invoke them.
@@ -262,6 +272,9 @@ async function main(argv) {
         if (st.onGateFailure === "skip") {
           cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`], withOut);
           row.result = "skipped (gate failed)";
+          // A skipped stage still moves the workflow forward, as stage-tracker does.
+          const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
+          if (adv) row.result += ` (${adv})`;
           break;
         }
         if (st.onGateFailure === "abort" || attempt >= maxAttempts) {
