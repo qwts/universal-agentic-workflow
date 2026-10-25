@@ -68,8 +68,12 @@ function skillResource(...segs) {
   const p = join(SKILLS_DIR, ...segs);
   return existsSync(p) ? p : join(OWN_SKILLS_DIR, ...segs);
 }
-/** Path of a skill CLI as printed in commands for agents: absolute under SKILLS_ROOT when one is set. */
-const skillCliPath = (rel) => (SKILLS_ROOT ? join(SKILLS_DIR, rel) : `.github/skills/${rel}`);
+/**
+ * Path of a skill CLI as printed in commands for agents. With a skills root the path is absolute and
+ * resolved per file: the root's copy when it exists, else this checkout's (a partial tree that ships
+ * only its stages.yaml still gets runnable commands). Without a root it stays relative to cwd.
+ */
+const skillCliPath = (rel) => (SKILLS_ROOT ? skillResource(...rel.split("/")) : `.github/skills/${rel}`);
 
 // ---------------------------------------------------------------------------
 // Stage resolution helpers

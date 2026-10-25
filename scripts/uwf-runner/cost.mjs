@@ -2,7 +2,7 @@
  * cost.mjs — `runner.mjs cost --data-dir <d> [--workflow <w> [--repo-root <r>]]`.
  *
  * Reads <d>/transcripts/*.json (written by the claude-code adapter) and prints, per stage:
- * turns, context per turn (cache_read + cache_creation, divided by turns), cache read/write,
+ * turns, context per turn (uncached input + cache_read + cache_creation, divided by turns), cache read/write,
  * output and thinking tokens, the reported cost, and flags. With --workflow it also prints the
  * static prompt size (chars and ~tokens at 4 chars/token) from materializePrompt, plus the size of the
  * SKILL/reference files the stage's agent file tells it to read.
@@ -29,14 +29,14 @@ export function transcriptRow(file, t) {
   const u = r?.usage;
   if (!u || !Number.isFinite(r.num_turns) || r.num_turns <= 0) return null;
   const m = String(t.prompt ?? "").match(/^Run the (\S+) stage for the/m);
-  const read = num(u.cache_read_input_tokens), write = num(u.cache_creation_input_tokens);
+  const input = num(u.input_tokens), read = num(u.cache_read_input_tokens), write = num(u.cache_creation_input_tokens);
   const models = Object.values(r.modelUsage ?? {});
   const thinking = u.output_tokens_details?.thinking_tokens ?? (models.length ? models.reduce((a, x) => a + num(x.thinkingTokens), 0) : undefined);
   const last = Array.isArray(u.iterations) && u.iterations.length ? u.iterations[u.iterations.length - 1] : null;
   const lastCtx = last ? num(last.input_tokens) + num(last.cache_read_input_tokens) + num(last.cache_creation_input_tokens) : 0;
-  const perTurn = (read + write) / r.num_turns;
+  const perTurn = (input + read + write) / r.num_turns;
   return {
-    file, stage: m ? m[1] : "?", turns: r.num_turns, perTurn, lastCtx, read, write,
+    file, stage: m ? m[1] : "?", turns: r.num_turns, perTurn, lastCtx, input, read, write,
     output: num(u.output_tokens), thinking, cost: typeof r.total_cost_usd === "number" ? r.total_cost_usd : null,
     flags: [perTurn > AVG_LIMIT ? "!50K" : null, lastCtx > TURN_LIMIT || perTurn > TURN_LIMIT ? "!100K" : null].filter(Boolean),
   };
@@ -85,13 +85,13 @@ export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outp
     return cells;
   });
   const sum = (key) => rows.reduce((a, r) => a + (r[key] ?? 0), 0);
-  const total = ["TOTAL", String(sum("turns")), k((sum("read") + sum("write")) / sum("turns")), "-", String(sum("read")), String(sum("write")),
+  const total = ["TOTAL", String(sum("turns")), k((sum("input") + sum("read") + sum("write")) / sum("turns")), "-", String(sum("read")), String(sum("write")),
     String(sum("output")), String(sum("thinking")), "$" + sum("cost").toFixed(3), "-"];
   if (workflow) total.push("", "");
   const all = [head, ...body, total];
   const w = head.map((_, i) => Math.max(...all.map((r) => r[i].length)));
   const line = (r) => r.map((c, i) => (i === 0 || i === r.length - 1 || (workflow && i >= r.length - 2) ? c.padEnd(w[i]) : c.padStart(w[i]))).join("  ").trimEnd();
   const out = [line(head), ...body.map(line), line(total)];
-  out.push("", `ctx/turn = (cache_read + cache_write) / turns. Flags: !50K = average above ${AVG_LIMIT / 1000}K per turn; !100K = final turn likely above ${TURN_LIMIT / 1000}K (pricing tier).`);
+  out.push("", `ctx/turn = (uncached input + cache_read + cache_write) / turns. Flags: !50K = average above ${AVG_LIMIT / 1000}K per turn; !100K = final turn likely above ${TURN_LIMIT / 1000}K (pricing tier).`);
   return out.join("\n") + "\n";
 }

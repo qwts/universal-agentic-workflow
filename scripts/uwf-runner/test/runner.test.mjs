@@ -12,11 +12,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { transcriptRow } from "../cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..", "..", "..");
 const RUNNER = join(ROOT, "scripts", "uwf-runner", "runner.mjs");
 const SKILLS = join(ROOT, ".github", "skills");
+const TRACKER = join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs");
 const FIXTURES = join(HERE, "fixtures", "sw_dev");
 const ALL_STAGES = ["intake", "discovery", "requirements", "adr", "risk-plan", "security-plan", "test-plan", "blueprint",
   "work-plan", "implementation", "review", "technical-writing", "acceptance", "snapshot", "retro"];
@@ -672,6 +674,11 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
     check("explicit --skills-root beats the target's copy", own.code === 0 && reviewRetries(own.out) === "3" && !own.err.includes(SELF_COPY_LINE), own.out.slice(0, 300) + own.err.slice(-300));
     const viaEnv = run(s, ["--dry-run"], { UWF_SKILLS_ROOT: ROOT });
     check("UWF_SKILLS_ROOT beats the target's copy", viaEnv.code === 0 && reviewRetries(viaEnv.out) === "3", viaEnv.out.slice(0, 300));
+    // The target is its own skills root but ships no question-protocol skill: generated commands must
+    // still point at a script that exists (this checkout's), not at a missing target-local path.
+    const ls = spawnSync(process.execPath, [TRACKER, "list-stages", "--workflow", "sw_dev", "--data-dir", s.data], { encoding: "utf8", cwd: s.repo, env: { ...process.env, UWF_SKILLS_ROOT: s.repo } });
+    const cmds = [...ls.stdout.matchAll(/(\/\S*questions\.mjs)/g)].map((m) => m[1]);
+    check("partial target: generated skill commands resolve to an existing script", ls.status === 0 && cmds.length > 0 && cmds.every((c) => existsSync(c)), (cmds[0] ?? ls.stderr.slice(-200)));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
@@ -691,6 +698,12 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
     const missing = run(s, ["--dry-run", "--skills-root", join(s.base, "nope")]);
     check("missing --skills-root exits 2", missing.code === 2, missing.err.slice(-300));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# cost: uncached input counts toward ctx/turn");
+  const row = transcriptRow("t.json", { prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 120000, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, total_cost_usd: 0.1 }) });
+  check("ctx/turn includes uncached input tokens", row?.perTurn === 60000 && row.flags.includes("!50K"), JSON.stringify(row));
 }
 
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
