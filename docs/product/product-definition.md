@@ -127,7 +127,9 @@ These are design constraints, not documentation aspirations. Violations are bugs
 Written down so we stay honest. All real, all deferred, all blocked until the
 wedge lands:
 
-- Runtime adapters beyond VS Code Copilot (Claude Code, other SDKs) — v1.x+
+- Runtime adapters beyond the deterministic runner's `claude-code`, `codex` and
+  `fake` adapters, and beyond VS Code Copilot as the chat-surface alternative
+  ([ADR-0007](../adr/ADR-0007-runtime-owns-the-loop.md)) — v1.x+
 - Non-software personas — v2
 - Eval tier beyond structural gates (rubrics, scored verdicts) — v1.x
 - Skill extraction / marketplace / separate skill repos — superseded, see
