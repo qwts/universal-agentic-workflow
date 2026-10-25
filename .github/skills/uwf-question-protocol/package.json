@@ -4,7 +4,7 @@
   "type": "module",
   "description": "UWF question protocol — SQLite-backed question logging and dependency tracking",
   "dependencies": {
-    "better-sqlite3": "^9.6.0",
+    "better-sqlite3": "^12.9.0",
     "js-yaml": "^4.3.1"
   }
 }
