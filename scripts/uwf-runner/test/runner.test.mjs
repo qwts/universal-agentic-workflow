@@ -284,6 +284,61 @@ function setFixtureExit(s, stage, exitCode) {
 }
 
 {
+  console.log("# resume reconciles a phase left behind by a crash after a stage passed");
+  const s = setup();
+  try {
+    setFixtureExit(s, "risk-plan", 1);
+    run(s);
+    // Simulate: intake and discovery passed, but the process died before their phase advances landed.
+    const rb = skillJson("uwf-state-manager/state.mjs", ["rollback", "--to", "idea", "--agent", "test", "--note", "simulate crash"], s);
+    check("test setup: phase rolled back to idea", rb?.state?.phase === "idea", JSON.stringify(rb).slice(0, 200));
+    setFixtureExit(s, "risk-plan", undefined);
+    const rr = resume(s);
+    check("resume after reconcile exits 0", rr.code === 0, `${rr.code} ${rr.err.slice(-500)}`);
+    const hist = skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.history ?? [];
+    const rec = hist.filter((h) => /^runner resume: phase reconciled to/.test(h.note ?? "")).map((h) => h.to_phase ?? h.note);
+    check("phase stepped idea→intake→discovery before resuming", rec.length === 2 && /intake/.test(rec[0]) && /discovery/.test(rec[1]), JSON.stringify(rec));
+    check("phase closed at the end", skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.phase === "closed");
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+// Phase changes the runner logged as rejected. The "snapshot" phase is ignored until the state
+// manager learns it (#115): sw_dev's snapshot stage already advances to it.
+const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not applied/.test(l) && !/"snapshot"/.test(l));
+
+{
+  console.log("# resume reconciles a phase left ahead by a crash between reset-from and rollback");
+  const s = setup();
+  try {
+    check("test setup: full run exits 0", run(s).code === 0);
+    // Simulate: `run --from-stage review` died after reset-from but before the phase rollback.
+    const rs = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["reset-from", "--workflow", "sw_dev", "--stage", "review"], s);
+    check("test setup: review reset to pending", byStage(trackerRows(s)).review?.status === "pending", JSON.stringify(rs).slice(0, 200));
+    check("test setup: phase still closed", skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.phase === "closed");
+    const rr = resume(s);
+    check("resume exits 0", rr.code === 0, `${rr.code} ${rr.err.slice(-500)}`);
+    check("no phase change was rejected", !rejectedPhaseLines(rr.err).length, rejectedPhaseLines(rr.err).join(" | "));
+    const hist = skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.history ?? [];
+    check("phase rolled back to execution before resuming", hist.some((h) => /runner resume: phase reconciled to execution$/.test(h.note ?? "") && h.to_phase === "execution"), JSON.stringify(hist.slice(-6)));
+    check("phase closed at the end", skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.phase === "closed");
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# --from-stage on the first stage rolls the phase back to idea");
+  const s = setup();
+  try {
+    check("test setup: full run exits 0", run(s).code === 0);
+    const r = run(s, ["--from-stage", "intake"]);
+    check("rerun from intake exits 0", r.code === 0, `${r.code} ${r.err.slice(-500)}`);
+    check("no phase change was rejected", !rejectedPhaseLines(r.err).length, rejectedPhaseLines(r.err).join(" | "));
+    const hist = skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.history ?? [];
+    check("phase rolled back to idea first", hist.some((h) => /runner: reset from intake$/.test(h.note ?? "") && h.to_phase === "idea"), JSON.stringify(hist.filter((h) => /reset from/.test(h.note ?? ""))));
+    check("phase closed at the end", skillJson("uwf-state-manager/state.mjs", ["read"], s)?.state?.phase === "closed");
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
   console.log("# resume notes: one per resume, active stage re-invoked");
   const s = setup();
   try {
