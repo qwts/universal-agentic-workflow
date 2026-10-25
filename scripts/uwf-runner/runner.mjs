@@ -206,6 +206,11 @@ async function main(argv) {
       // Read the recorded session before reset-from clears it; a resume continues the same conversation.
       resumeSessionId = tracked.find((x) => x.stage === stages[start].name)?.session_id ?? undefined;
       if (reason === "failed") resetFrom(start);
+      // reset-from cleared the row's session; write it back now so a crash during the first
+      // resumed attempt still leaves the recorded session for the next resume.
+      if (resumeSessionId && stages[start].retryMode !== "fresh") {
+        cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", stages[start].name, "--session-id", resumeSessionId], withOut);
+      }
       priorRows = tableRows(tracked).slice(0, start);
       const n = note(`runner resume: from=${stages[start].name} reason=${reason}`);
       if (!n.ok) log(`[runner] note not recorded: ${n.error}`);

@@ -445,6 +445,8 @@ function setFixtureExit(s, stage, exitCode) {
     resume(s);
     const after = transcripts(s).filter((t) => t.prompt.includes("Run the review stage"));
     check("runner resume continues the recorded session", after.length > rev1.length && after.slice(rev1.length).every((t) => t.sessionId === row1.session_id), after.map((t) => t.sessionId).join(","));
+    const hist = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
+    check("tracker row keeps the session_id across the resume's reset-from", byStage(hist?.state ?? []).review?.session_id === row1.session_id, JSON.stringify(byStage(hist?.state ?? []).review));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 
   const f = setup();
