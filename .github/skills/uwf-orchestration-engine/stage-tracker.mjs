@@ -19,6 +19,7 @@
  *   stage-complete --workflow <name> --stage <s>             Mark stage passed
  *   stage-fail     --workflow <name> --stage <s> [--note <t>] Increment retry, record failure
  *   stage-skip     --workflow <name> --stage <s>             Mark stage skipped
+ *   reset-from     --workflow <name> --stage <s> [--note <t>] Set stage and all later ones to pending
  *
  * Global options:
  *   --output-path <path>   Default: ./tmp/workflow-artifacts
@@ -283,6 +284,7 @@ try {
     case "stage-complete": cmdStageUpdate(db, "passed");    break;
     case "stage-fail":     cmdStageFail(db);               break;
     case "stage-skip":     cmdStageUpdate(db, "skipped");  break;
+    case "reset-from":     cmdResetFrom(db);               break;
     case "reset":          cmdReset(db);                    break;
     default: usageError(`Unknown command: "${command}"`);
   }
@@ -484,6 +486,30 @@ function cmdStageFail(db) {
     state_actions: [`node ${STATE_MJS} release-agent`],
     state:        readState(db),
   });
+}
+
+/** Set --stage and every later stage (YAML order) back to pending; one history row per stage. */
+function cmdResetFrom(db) {
+  requireFlag("workflow", "reset-from");
+  requireFlag("stage",    "reset-from");
+  const { stages } = loadStagesYaml(workflow);
+  const idx = stages.findIndex((s) => s.name === flags["stage"]);
+  if (idx < 0) usageError(`Unknown stage "${flags["stage"]}" in workflow "${workflow}".`);
+  const note = flags["note"] ?? `reset-from ${flags["stage"]}`;
+
+  const reset = stages.slice(idx).map((s) => s.name);
+  db.transaction(() => {
+    for (const name of reset) {
+      ensureRow(db, name);
+      const row = db.prepare(`SELECT status FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, name);
+      db.prepare(
+        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL WHERE workflow = ? AND stage = ?`
+      ).run(workflow, name);
+      appendHistory(db, workflow, name, row.status, "pending", note);
+    }
+  })();
+
+  succeed({ procedure: "reset-from", workflow, stage: flags["stage"], reset, state: readState(db) });
 }
 
 // ---------------------------------------------------------------------------
