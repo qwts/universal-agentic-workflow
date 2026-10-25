@@ -101,7 +101,9 @@ export async function invokeStage(opts) {
       settled = true;
       if (timer) clearTimeout(timer);
 
-      let sid = null, lastAgentText = null, usage = null, eventError = null;
+      // `error` events can be transient ("Reconnecting..."); only the ones not
+      // followed by a successful turn.completed count as a failure.
+      let sid = null, lastAgentText = null, usage = null, eventError = null, pendingError = null;
       for (const line of out.split("\n")) {
         const t = line.trim();
         if (!t.startsWith("{")) continue;
@@ -115,9 +117,11 @@ export async function invokeStage(opts) {
             // a multi-turn run may emit several turn.completed; sum them
             usage = { inputTokens: (usage?.inputTokens ?? 0) + i, outputTokens: (usage?.outputTokens ?? 0) + o };
           }
+          pendingError = null; // the turn recovered from any earlier error event
         } else if (ev.type === "turn.failed") eventError = ev.error?.message ?? "turn failed";
-        else if (ev.type === "error" && !eventError) eventError = ev.message ?? "error";
+        else if (ev.type === "error" && !pendingError) pendingError = ev.message ?? "error";
       }
+      if (!eventError && pendingError) eventError = pendingError;
       let text = lastAgentText ?? "";
       if (lastMsgFile) { try { text = readFileSync(lastMsgFile, "utf8") || text; } catch { /* not written */ } }
       cleanup();
