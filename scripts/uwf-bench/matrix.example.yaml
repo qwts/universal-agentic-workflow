@@ -1,0 +1,47 @@
+# uwf-bench matrix for the CLI offload experiment (docs/research/cli-offload-design.md).
+# Paths are relative to this file. Copy, edit, then:
+#   node scripts/uwf-bench/bench.mjs run --matrix matrix.yaml
+workflow: sw_dev
+runs_per_cell: 5
+output_path: ./tmp/uwf-bench
+timeout_ms: 1800000
+seed: 20261025
+block_randomize: true
+
+fixtures:
+  - name: F1-delete-route
+    repo: ../../../uwf-toy-app
+    ref: main
+    issue: 1
+    goal: "Add a DELETE /items/:id route to src/server.mjs backed by a new Inventory.remove(id). Respond 204 on success and 404 when the id is unknown; a later GET must 404."
+    acceptance_cmd: "UWF_IMPLEMENTED=1 node --test test/seeded-issues.test.mjs"
+  - name: F2-negative-qty
+    repo: ../../../uwf-toy-app
+    ref: main
+    issue: 2
+    goal: "Inventory.adjust(id, delta) in src/inventory.mjs applies any delta, so stock can go negative. It must throw RangeError and leave the quantity unchanged when the result would be below zero."
+    acceptance_cmd: "UWF_IMPLEMENTED=1 node --test test/seeded-issues.test.mjs"
+  - name: F3-toJSON
+    repo: ../../../uwf-toy-app
+    ref: main
+    issue: 3
+    goal: "Add toJSON() to Inventory returning the item list, and have the GET /items route serialize the inventory object instead of calling list(). Behaviour of the route must not change."
+    acceptance_cmd: "UWF_IMPLEMENTED=1 node --test test/seeded-issues.test.mjs"
+
+cells:
+  - name: S-CLI
+    adapter: claude-code
+    model: claude-haiku-5-5
+    state_location: cli
+  - name: L-CLI
+    adapter: claude-code
+    model: claude-opus-5-5
+    state_location: cli
+  - name: S-NOCLI
+    adapter: claude-code
+    model: claude-haiku-5-5
+    state_location: nocli
+  - name: L-NOCLI
+    adapter: claude-code
+    model: claude-opus-5-5
+    state_location: nocli
