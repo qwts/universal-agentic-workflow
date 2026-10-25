@@ -15,10 +15,11 @@
  *   check-gate     --workflow <name> --stage <s>             Evaluate gate; exit 0=pass 1=fail
  *   init           --workflow <name>                          Reset stage tracking for workflow
  *   read           --workflow <name>                          Read current execution state
- *   stage-start    --workflow <name> --stage <s>             Mark stage active
- *   stage-complete --workflow <name> --stage <s>             Mark stage passed
- *   stage-fail     --workflow <name> --stage <s> [--note <t>] Increment retry, record failure
- *   stage-skip     --workflow <name> --stage <s>             Mark stage skipped
+ *   stage-start    --workflow <name> --stage <s> [--session-id <id>]  Mark stage active
+ *   stage-complete --workflow <name> --stage <s> [--session-id <id>]  Mark stage passed
+ *   stage-fail     --workflow <name> --stage <s> [--note <t>] [--session-id <id>]  Increment retry, record failure
+ *   stage-skip     --workflow <name> --stage <s> [--session-id <id>]  Mark stage skipped
+ *   stage-session  --workflow <name> --stage <s> --session-id <id>    Record the adapter session id only
  *   reset-from     --workflow <name> --stage <s> [--note <t>] Set stage and all later ones to pending
  *
  * Global options:
@@ -75,6 +76,9 @@ function loadProfiles() {
   if (!existsSync(PROFILES_PATH)) return null;
   return yaml.load(readFileSync(PROFILES_PATH, "utf8"));
 }
+
+/** retry_mode: resume = a retry continues the previous attempt's adapter session; fresh = new session. */
+const RETRY_MODES = ["resume", "fresh"];
 
 const QUESTION_POLICY_ORDER = ["minimal", "standard", "aggressive"];
 const EVIDENCE_THRESHOLD_ORDER = ["low", "standard", "high"];
@@ -229,22 +233,31 @@ function initTables(db) {
   db.transaction(() => {
     for (const [tableName, def] of Object.entries(schema.tables)) {
       db.exec(buildCreateTable(tableName, def.columns));
+      // Migrate DBs created before a column existed: add it when missing (never drops or rewrites).
+      const have = new Set(db.prepare(`PRAGMA table_info("${tableName}")`).all().map((c) => c.name));
+      for (const col of def.columns) {
+        if (have.has(col.name) || col.primary_key) continue;
+        if (col.not_null && col.default === undefined) continue; // SQLite cannot add this without a default
+        db.exec(`ALTER TABLE "${tableName}" ADD COLUMN ${columnDef(col)}`);
+      }
     }
   })();
 }
 
+function columnDef(col) {
+  let d = `"${col.name}" ${col.type}`;
+  if (col.primary_key && col.autoincrement) d += " PRIMARY KEY AUTOINCREMENT";
+  else if (col.primary_key) d += " PRIMARY KEY";
+  if (col.not_null) d += " NOT NULL";
+  if (col.default !== undefined) {
+    const v = typeof col.default === "string" ? `'${col.default}'` : col.default;
+    d += ` DEFAULT ${v}`;
+  }
+  return d;
+}
+
 function buildCreateTable(tableName, columns) {
-  const defs = columns.map((col) => {
-    let d = `"${col.name}" ${col.type}`;
-    if (col.primary_key && col.autoincrement) d += " PRIMARY KEY AUTOINCREMENT";
-    else if (col.primary_key) d += " PRIMARY KEY";
-    if (col.not_null) d += " NOT NULL";
-    if (col.default !== undefined) {
-      const v = typeof col.default === "string" ? `'${col.default}'` : col.default;
-      d += ` DEFAULT ${v}`;
-    }
-    return d;
-  });
+  const defs = columns.map(columnDef);
   return `CREATE TABLE IF NOT EXISTS "${tableName}" (${defs.join(", ")})`;
 }
 
@@ -278,11 +291,13 @@ try {
   switch (command) {
     case "list-stages":    cmdListStages(db); break;
     case "check-gate":     cmdCheckGate(db);  break;
+    case "gate-prescriptions": cmdGatePrescriptions(); break;
     case "init":           cmdInit(db);        break;
     case "read":           cmdRead(db);        break;
     case "stage-start":    cmdStageUpdate(db, "active");    break;
     case "stage-complete": cmdStageUpdate(db, "passed");    break;
     case "stage-fail":     cmdStageFail(db);               break;
+    case "stage-session":  cmdStageSession(db);            break;
     case "stage-skip":     cmdStageUpdate(db, "skipped");  break;
     case "reset-from":     cmdResetFrom(db);               break;
     case "reset":          cmdReset(db);                    break;
@@ -310,9 +325,15 @@ function cmdListStages(db) {
       fail(`Stage "${name}": a stage entry must use exactly one of "agent" or "stage_type", not both.`);
     }
 
+    const retry_mode = stageDef.retry_mode ?? "resume";
+    if (!RETRY_MODES.includes(retry_mode)) {
+      fail(`Stage "${name}": retry_mode must be one of ${RETRY_MODES.join(" | ")}, got ${JSON.stringify(retry_mode)}.`);
+    }
+
     const base = {
       name,
       maxRetries: max_retries ?? 2,
+      retryMode: retry_mode,
       onGateFailure: on_gate_failure ?? "retry",
       gated: gated !== false,
       conditional: conditional === true,
@@ -352,6 +373,23 @@ function cmdListStages(db) {
   });
 
   process.stdout.write(JSON.stringify(list, null, 2) + "\n");
+  process.exitCode = 0;
+}
+
+/** Audit: every stage's gate checks with the prescription each would produce if it failed. */
+function cmdGatePrescriptions() {
+  requireFlag("workflow", "gate-prescriptions");
+  const { stages } = loadStagesYaml(workflow);
+  const out = stages.map((s) => ({
+    stage: s.name,
+    gated: s.gated !== false,
+    conditional: s.conditional === true,
+    on_gate_failure: s.on_gate_failure ?? "retry",
+    max_retries: s.max_retries ?? 2,
+    retry_mode: s.retry_mode ?? "resume",
+    checks: (s.gate?.checks ?? []).map((c) => ({ type: c.type, label: c.label ?? null, prescription: prescribeCheck(c, null) })),
+  }));
+  process.stdout.write(JSON.stringify({ workflow, stages: out }, null, 2) + "\n");
   process.exitCode = 0;
 }
 
@@ -415,6 +453,7 @@ function cmdStageUpdate(db, toStatus) {
   const now = new Date().toISOString();
 
   const updates = { status: toStatus };
+  if (flags["session-id"]) updates.session_id = flags["session-id"];
   if (toStatus === "active")  updates.started_at   = now;
   if (toStatus === "passed" || toStatus === "skipped") updates.completed_at = now;
   if (note) updates.notes = note;
@@ -472,8 +511,8 @@ function cmdStageFail(db) {
   const row = db.prepare(`SELECT * FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, stageName);
 
   db.prepare(
-    `UPDATE stage_runs SET status = 'failed', retry_count = retry_count + 1, completed_at = ?, notes = ? WHERE workflow = ? AND stage = ?`
-  ).run(new Date().toISOString(), note, workflow, stageName);
+    `UPDATE stage_runs SET status = 'failed', retry_count = retry_count + 1, completed_at = ?, notes = ?, session_id = COALESCE(?, session_id) WHERE workflow = ? AND stage = ?`
+  ).run(new Date().toISOString(), note, flags["session-id"] ?? null, workflow, stageName);
 
   appendHistory(db, workflow, stageName, row.status, "failed", note);
   const updated   = db.prepare(`SELECT * FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, stageName);
@@ -486,6 +525,16 @@ function cmdStageFail(db) {
     state_actions: [`node ${STATE_MJS} release-agent`],
     state:        readState(db),
   });
+}
+
+/** Record the adapter session id without changing status (so a crash between attempts keeps it). */
+function cmdStageSession(db) {
+  requireFlag("workflow", "stage-session");
+  requireFlag("stage",    "stage-session");
+  requireFlag("session-id", "stage-session");
+  ensureRow(db, flags["stage"]);
+  db.prepare(`UPDATE stage_runs SET session_id = ? WHERE workflow = ? AND stage = ?`).run(flags["session-id"], workflow, flags["stage"]);
+  succeed({ procedure: "stage-session", workflow, stage: flags["stage"], session_id: flags["session-id"], state: readState(db) });
 }
 
 /** Set --stage and every later stage (YAML order) back to pending; one history row per stage. */
@@ -503,7 +552,7 @@ function cmdResetFrom(db) {
       ensureRow(db, name);
       const row = db.prepare(`SELECT status FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, name);
       db.prepare(
-        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL WHERE workflow = ? AND stage = ?`
+        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL, session_id = NULL WHERE workflow = ? AND stage = ?`
       ).run(workflow, name);
       appendHistory(db, workflow, name, row.status, "pending", note);
     }
@@ -519,26 +568,67 @@ function cmdResetFrom(db) {
 function evaluateGate(stageDef, stageName) {
   // Ungated stages always pass
   if (stageDef.gated === false) {
-    return { stage: stageName, passed: true, failures: [], note: "ungated — always passes" };
+    return { stage: stageName, passed: true, failures: [], prescriptions: [], note: "ungated — always passes" };
   }
 
   // Conditional stage: check if condition is met; if not, auto-pass
   if (stageDef.conditional === true && stageDef.condition) {
     if (!evaluateCondition(stageDef.condition)) {
-      return { stage: stageName, passed: true, failures: [], note: "conditional — not required" };
+      return { stage: stageName, passed: true, failures: [], prescriptions: [], note: "conditional — not required" };
     }
   }
 
   // Evaluate gate checks
   const failures = [];
+  const prescriptions = [];
   for (const check of (stageDef.gate?.checks ?? [])) {
     const failure = evaluateCheck(check);
-    if (failure) failures.push(failure);
+    if (failure) { failures.push(failure); prescriptions.push(prescribeCheck(check, failure)); }
   }
 
+  const policy = { on_gate_failure: stageDef.on_gate_failure ?? "retry", max_retries: stageDef.max_retries ?? 2 };
   return failures.length
-    ? { stage: stageName, passed: false, failures }
-    : { stage: stageName, passed: true,  failures: [] };
+    ? { stage: stageName, passed: false, failures, prescriptions, ...policy }
+    : { stage: stageName, passed: true,  failures: [], prescriptions: [], ...policy };
+}
+
+/**
+ * One imperative sentence saying exactly what to produce for a failed check. Parallel to
+ * `failures`; it doubles as the runner's retry prompt. `failure` is the evaluateCheck string
+ * (null for the audit listing, which has no observed failure).
+ */
+function prescribeCheck(check, failure) {
+  const q = (v) => JSON.stringify(v);
+  switch (check.type) {
+    case "require_non_empty":
+      return `Write a non-empty file at ${resolveTemplates(check.path)}.`;
+    case "require_contains":
+      return `Include the text ${q(check.text)} in ${resolveTemplates(check.path)}.`;
+    case "require_files_with_prefix":
+      return `Create at least one file named ${check.prefix}* under ${resolveTemplates(check.dir)}.`;
+    case "require_file_matching_pattern":
+      return `Create a file under ${resolveTemplates(check.dir)} whose name matches ${check.pattern}.`;
+    case "run_script": {
+      const cmd = [resolveTemplates(check.cmd), ...(Array.isArray(check.args) ? check.args.map((a) => resolveTemplates(String(a))) : [])].join(" ");
+      const m = failure && failure.match(/ failed \(exit [^)]*\)(?:: ([\s\S]*))?$/);
+      const tail = m?.[1] ? m[1].split(/\r?\n/).slice(-5).join(" | ").slice(-400) : "no output";
+      return `Make ${q(cmd)} exit 0${failure ? `; it currently fails with: ${tail}` : ""}.`;
+    }
+    case "require_json_field": {
+      const p = resolveTemplates(check.path);
+      const ptr = check.pointer ? check.pointer : "(root)";
+      const schema = check.schema ? ` (schema: ${check.schema})` : "";
+      let want;
+      if ("exists" in check) want = `${ptr} ${check.exists === true ? "present" : "absent"}`;
+      else if ("in" in check) want = `${ptr} equal to one of ${q(check.in)}`;
+      else if ("equals" in check) want = `${ptr} equal to ${q(check.equals)}`;
+      else want = `${ptr} set as the gate requires`;
+      const detail = failure?.match(/does not match stage-result schema: ([\s\S]*)$/)?.[1];
+      return `Write ${p} as JSON with ${want}${schema}.${detail ? ` Fix: ${detail}.` : ""}`;
+    }
+    default:
+      return `Fix the gate configuration: unknown check type ${q(check.type)}.`;
+  }
 }
 
 function evaluateCondition(condition) {

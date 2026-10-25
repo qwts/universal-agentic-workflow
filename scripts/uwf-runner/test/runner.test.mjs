@@ -6,11 +6,12 @@
  * purpose: they are conditional and the happy path asserts they are skipped, not invoked.
  */
 
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..", "..", "..");
@@ -165,6 +166,12 @@ function transcripts(s) {
     check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
     check("gate FAIL on attempt 1 names the missing file", /\[11\/15\] review gate: FAIL — .*issues-review\.md/.test(r.err));
     check("retry prompt carries the gate failure", transcripts(s).some((t) => t.prompt.includes("Gate failure (retry 1 of 3)")));
+    const retry = transcripts(s).map((t) => t.prompt).find((p) => p?.includes("## Gate failure (retry 1 of 3)")) ?? "";
+    check("retry prompt has the heading, a prescription naming issues-review.md, and the previous attempt",
+      retry.includes("## Gate failure (retry 1 of 3)") && /^- .*issues-review\.md/m.test(retry) && retry.includes("## Your previous attempt")
+      && retry.includes("review: first pass, output not written") && retry.includes("What happens next:"), retry.slice(-500));
+    check("base prompt comes first", retry.indexOf("## Gate failure") > 200, String(retry.indexOf("## Gate failure")));
+    check("trace shows attempts and the first prescription", /review → fake \(attempt 2\/4\)/.test(r.err) && /attempt 1\/4; to fix: .*issues-review\.md/.test(r.err), r.err.slice(-800));
     check("review row shows attempts=2 and passed", /^review\s+2\s+passed/m.test(r.out), r.out.split("\n").find((l) => l.startsWith("review")) ?? "(no row)");
     check("review gate PASS on attempt 2", r.err.includes("[11/15] review gate: PASS"));
     const tracked = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
@@ -295,9 +302,8 @@ function setFixtureExit(s, stage, exitCode) {
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
-// Phase changes the runner logged as rejected. The "snapshot" phase is ignored until the state
-// manager learns it (#115): sw_dev's snapshot stage already advances to it.
-const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not applied/.test(l) && !/"snapshot"/.test(l));
+// Phase changes the runner logged as rejected.
+const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not applied/.test(l));
 
 {
   console.log("# resume reconciles a phase left ahead by a crash between reset-from and rollback");
@@ -425,6 +431,120 @@ const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not a
     const badStage = run(s, ["--from-stage", "nope"]);
     check("unknown --from-stage exits 2", badStage.code === 2);
   } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+// 6. Prescriptions: every check type, plus the gates audit ----------------------
+{
+  console.log("# prescriptions");
+  const s = scratch();
+  try {
+    const skillDir = join(s.repo, ".github", "skills", "uwf-rx");
+    mkdirSync(skillDir, { recursive: true });
+    const out = "{{output_path}}";
+    const checks = [
+      { type: "require_non_empty", path: `${out}/missing.md`, label: "missing.md" },
+      { type: "require_contains", path: `${out}/present.md`, text: "needle", label: "present.md" },
+      { type: "require_files_with_prefix", dir: `${out}/nodir`, prefix: "ADR-" },
+      { type: "require_file_matching_pattern", dir: `${out}/nodir`, pattern: "\\.spec\\.mjs$" },
+      { type: "run_script", cmd: process.execPath, args: ["-e", "console.error('boom line'); process.exit(3)"], label: "boom" },
+      { type: "require_json_field", path: `${out}/r.json`, pointer: "/verdict", equals: "approved", schema: "stage-result" },
+      { type: "require_json_field", path: `${out}/r.json`, pointer: "/verdict", in: ["approved", "x"] },
+      { type: "require_json_field", path: `${out}/r.json`, pointer: "/a", exists: true },
+    ];
+    const yamlText = "stages:\n  - name: s1\n    max_retries: 4\n    on_gate_failure: skip\n    gated: true\n    gate:\n      checks:\n" +
+      checks.map((c) => `        - ${JSON.stringify(c)}`).join("\n") + "\n";
+    writeFileSync(join(skillDir, "stages.yaml"), yamlText);
+    mkdirSync(join(s.repo, "out"), { recursive: true });
+    writeFileSync(join(s.repo, "out", "present.md"), "no match here");
+    mkdirSync(s.data, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"), "check-gate", "--workflow", "rx",
+      "--stage", "s1", "--output-path", join(s.repo, "out"), "--data-dir", s.data], { encoding: "utf8", cwd: s.repo });
+    let g = null;
+    try { g = JSON.parse(r.stdout); } catch { /* reported below */ }
+    check("gate fails with JSON", r.status === 1 && g?.passed === false, r.stdout + r.stderr);
+    check("prescriptions parallel failures, none empty", Array.isArray(g?.prescriptions) && g.prescriptions.length === checks.length
+      && g.failures.length === checks.length && g.prescriptions.every((p) => typeof p === "string" && p.trim().length > 10), JSON.stringify(g?.prescriptions));
+    check("policy exposed", g?.on_gate_failure === "skip" && g?.max_retries === 4);
+    check("run_script prescription carries the output tail", /exit 0; it currently fails with: .*boom line/.test(g?.prescriptions?.[4] ?? ""), g?.prescriptions?.[4]);
+    check("require_json_field variants", /\/verdict equal to "approved" \(schema: stage-result\)/.test(g?.prescriptions?.[5] ?? "")
+      && /equal to one of/.test(g?.prescriptions?.[6] ?? "") && /\/a present/.test(g?.prescriptions?.[7] ?? ""), JSON.stringify(g?.prescriptions?.slice(5)));
+
+    const a = spawnSync(process.execPath, [RUNNER, "gates", "--workflow", "sw_dev"], { encoding: "utf8" });
+    check("gates audit lists review prescription", a.status === 0 && /^review /m.test(a.stdout) && /issues-review\.md/.test(a.stdout), a.stderr);
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+// 7. Session continuity: retry_mode, persisted session ids, old-DB migration --------
+{
+  console.log("# session continuity");
+  const s = setup();
+  try {
+    const rmFixture = () => {
+      const fxPath = join(s.fixtures, "review.json");
+      const fx = JSON.parse(readFileSync(fxPath, "utf8"));
+      delete fx.files["tmp/workflow-artifacts/issues-review.md"];
+      writeFileSync(fxPath, JSON.stringify(fx));
+    };
+    rmFixture();
+    // default (resume): one session across all attempts, recorded on the tracker row
+    const r1 = run(s);
+    const rev1 = transcripts(s).filter((t) => t.prompt.includes("Run the review stage"));
+    check("resume mode: 4 attempts share one sessionId", r1.code === 1 && rev1.length === 4 && new Set(rev1.map((t) => t.sessionId)).size === 1, `${r1.code} ${rev1.length}`);
+    const row1 = byStage(trackerRows(s)).review;
+    check("tracker row carries the session_id of the failed stage", row1?.status === "failed" && row1.session_id === rev1[0].sessionId, JSON.stringify(row1));
+    check("passed stages carry a session_id", byStage(trackerRows(s)).intake?.session_id?.startsWith("fake-session-"), JSON.stringify(byStage(trackerRows(s)).intake));
+    check("skipped stages have no session_id", byStage(trackerRows(s)).adr?.session_id == null);
+
+    // resume of the failed stage passes the recorded session through
+    resume(s);
+    const after = transcripts(s).filter((t) => t.prompt.includes("Run the review stage"));
+    check("runner resume continues the recorded session", after.length > rev1.length && after.slice(rev1.length).every((t) => t.sessionId === row1.session_id), after.map((t) => t.sessionId).join(","));
+    const hist = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
+    check("tracker row keeps the session_id across the resume's reset-from", byStage(hist?.state ?? []).review?.session_id === row1.session_id, JSON.stringify(byStage(hist?.state ?? []).review));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+
+  const f = setup();
+  try {
+    const yamlPath = join(f.repo, ".github", "skills", "uwf-sw_dev", "stages.yaml");
+    const text = readFileSync(yamlPath, "utf8");
+    const marked = text.replace("    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n", "    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n    retry_mode: fresh\n");
+    check("test setup: stages.yaml patched", marked !== text);
+    writeFileSync(yamlPath, marked);
+    const fxPath = join(f.fixtures, "review.json");
+    const fx = JSON.parse(readFileSync(fxPath, "utf8"));
+    delete fx.files["tmp/workflow-artifacts/issues-review.md"];
+    writeFileSync(fxPath, JSON.stringify(fx));
+
+    const list = skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], f);
+    check("--list-stages exposes retryMode (fresh set, default resume)", list?.find((x) => x.name === "review")?.retryMode === "fresh" && list?.find((x) => x.name === "intake")?.retryMode === "resume");
+    const r = run(f);
+    const rev = transcripts(f).filter((t) => t.prompt.includes("Run the review stage"));
+    check("fresh mode: every attempt gets a different sessionId", r.code === 1 && rev.length === 4 && new Set(rev.map((t) => t.sessionId)).size === 4, rev.map((t) => t.sessionId).join(","));
+    check("fresh mode: tracker keeps the last attempt's session_id", byStage(trackerRows(f)).review?.session_id === rev[3].sessionId);
+
+    writeFileSync(yamlPath, text.replace("    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n", "    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n    retry_mode: sideways\n"));
+    const bad = spawnSync(process.execPath, [join(SKILLS, "uwf-sw_dev", "run.mjs"), "--list-stages", "--data-dir", f.data], { encoding: "utf8", cwd: f.repo });
+    check("invalid retry_mode is rejected", bad.status !== 0 && /retry_mode must be one of resume \| fresh/.test(bad.stdout), bad.stdout.slice(0, 200));
+  } finally { rmSync(f.base, { recursive: true, force: true }); }
+
+  const o = setup();
+  try {
+    // A DB created before session_id existed must still open, read, and accept --session-id.
+    const req = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"));
+    const Database = req("better-sqlite3");
+    mkdirSync(o.data, { recursive: true });
+    const db = new Database(join(o.data, "uwf-stages.db"));
+    db.exec(`CREATE TABLE stage_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+      started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT)`);
+    db.prepare("INSERT INTO stage_runs (workflow, stage, status) VALUES ('sw_dev', 'intake', 'passed')").run();
+    db.close();
+    const rd = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], o);
+    const row = rd?.state?.find((x) => x.stage === "intake");
+    check("old DB without session_id: read works, column added as null", rd?.ok !== false && row?.status === "passed" && row.session_id === null, JSON.stringify(rd)?.slice(0, 200));
+    const st = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["stage-start", "--workflow", "sw_dev", "--stage", "intake", "--session-id", "abc-1"], o);
+    check("old DB: stage-start --session-id stores it", st?.state?.find((x) => x.stage === "intake")?.session_id === "abc-1");
+  } finally { rmSync(o.base, { recursive: true, force: true }); }
 }
 
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");

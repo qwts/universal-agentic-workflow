@@ -33,7 +33,7 @@ const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (used to roll the phase back on --from-stage).
-const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "closed"];
+const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
 
 const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3 };
@@ -107,7 +107,8 @@ export function parseQuestions(text) {
 async function main(argv) {
   const { flags, positional } = parseArgs(argv);
   const command = positional[0];
-  if (command !== "run" && command !== "resume") throw new UsageError("Usage: runner.mjs run|resume --workflow <w> [--goal <file|text>] [options]");
+  if (command === "gates") return gatesAudit(flags);
+  if (command !== "run" && command !== "resume") throw new UsageError("Usage: runner.mjs run|resume|gates --workflow <w> [--goal <file|text>] [options]");
   if (!flags.workflow) throw new UsageError("--workflow is required");
   if (command === "run" && !flags.goal) throw new UsageError("--goal is required");
   if (command === "resume") {
@@ -212,6 +213,7 @@ async function main(argv) {
     };
 
     let priorRows = [];
+    let resumeSessionId; // adapter session recorded on the stage being resumed (retry_mode: resume only)
     if (command === "resume") {
       const tracked = readTracker();
       if (!tracked.length) throw new UsageError(`No stage records in ${dataDir}; nothing to resume (use "run")`);
@@ -225,7 +227,14 @@ async function main(argv) {
       const reason = status === "active" || status === "failed" ? status : "pending";
       // A failed stage restarts with retries reset (resume is an explicit human action).
       // An active one (crash) is simply re-invoked: the loop's attempt counter starts at 1 anyway.
+      // Read the recorded session before reset-from clears it; a resume continues the same conversation.
+      resumeSessionId = tracked.find((x) => x.stage === stages[start].name)?.session_id ?? undefined;
       if (reason === "failed") resetFrom(start);
+      // reset-from cleared the row's session; write it back now so a crash during the first
+      // resumed attempt still leaves the recorded session for the next resume.
+      if (resumeSessionId && stages[start].retryMode !== "fresh") {
+        cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", stages[start].name, "--session-id", resumeSessionId], withOut);
+      }
       priorRows = tableRows(tracked).slice(0, start);
       const n = note(`runner resume: from=${stages[start].name} reason=${reason}`);
       if (!n.ok) log(`[runner] note not recorded: ${n.error}`);
@@ -258,7 +267,7 @@ async function main(argv) {
 
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
-    return await stageLoop({ stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
+    return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
       repoRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
@@ -270,7 +279,7 @@ async function main(argv) {
  * returns an exit code. ctx carries everything resolved by main().
  */
 async function stageLoop(ctx) {
-  const { stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot,
+  const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot,
     outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut } = ctx;
   let first = true;
   for (let i = start; i < stages.length; i++) {
@@ -320,7 +329,11 @@ async function stageLoop(ctx) {
     const model = flags.model ?? mp.model ?? undefined;
     const maxAttempts = st.maxRetries + 1;
 
-    let sessionId;
+    // retry_mode "resume": each retry passes the previous attempt's session id to the adapter.
+    // "fresh": never pass one, so every attempt starts a new session. The first attempt of a stage
+    // starts fresh too, except when `resume` continues a stage whose tracker row holds a session id.
+    const keepSession = st.retryMode !== "fresh";
+    let sessionId = i === start && keepSession ? resumeSessionId : undefined;
     let prompt = basePrompt;
     for (let attempt = 1; ; attempt++) {
       row.attempts = attempt;
@@ -334,6 +347,8 @@ async function stageLoop(ctx) {
         model, sessionId, timeoutMs, env, permissions: mp.permissions, dataDir,
       });
       sessionId = res.sessionId ?? sessionId;
+      // Persist right away so the session survives a crash between attempts.
+      if (sessionId) cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
       cli(STATE, ["release-agent"], withOut); // 4.
 
       // 5. questions
@@ -361,25 +376,32 @@ async function stageLoop(ctx) {
 
       // 6. gate
       let failures;
+      let prescriptions;
       if (!res.ok) {
         failures = [`adapter error: ${res.error ?? "unknown"}`];
+        prescriptions = [`Resolve the adapter error (${res.error ?? "unknown"}) and complete the stage outputs.`];
         log(`${tag} gate: NOT RUN (${failures[0]})`);
       } else {
         const g = cli(runScript, ["--check-gate", st.name], withOut);
         if (g.ok) {
           log(`${tag} gate: PASS`);
-          cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name], withOut);
+          cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
           row.result = "passed";
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
           if (adv) row.result += ` (${adv})`;
           break;
         }
         failures = g.data?.failures ?? [g.error];
+        prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
         log(`${tag} gate: FAIL — ${failures.join("; ")}`);
       }
+      log(`${tag}   attempt ${attempt}/${maxAttempts}; to fix: ${prescriptions[0]}`);
 
+      if (st.onGateFailure === "skip" || st.onGateFailure === "abort") {
+        log(gateSummary(st, failures, prescriptions, st.onGateFailure === "skip" ? "marked the stage skipped and continued" : "marked the stage failed and stopped the run"));
+      }
       if (st.onGateFailure === "skip") {
-        cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`], withOut);
+        cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`, ...sessionArgs(sessionId)], withOut);
         row.result = "skipped (gate failed)";
         // A skipped stage still moves the workflow forward, as stage-tracker does.
         const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
@@ -387,11 +409,12 @@ async function stageLoop(ctx) {
         break;
       }
       if (st.onGateFailure === "abort" || attempt >= maxAttempts) {
-        cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; ")], withOut);
+        cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; "), ...sessionArgs(sessionId)], withOut);
         row.result = st.onGateFailure === "abort" ? "failed (abort)" : "failed";
         return finish(EXIT.GATE, rows, `${tag}: gate blocked after ${attempt} attempt(s): ${failures.join("; ")}`, note);
       }
-      prompt = `${basePrompt}\n\nGate failure (retry ${attempt} of ${st.maxRetries}): ${failures.join("; ")}`;
+      if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
+      prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
     }
   }
   return finish(EXIT.OK, rows, "workflow complete", note);
@@ -404,6 +427,49 @@ async function stageLoop(ctx) {
     log(`[runner] phase "${target}" not applied after ${stageName}: ${a.error}`);
     return `phase ${target} not applied`;
   }
+}
+
+const sessionArgs = (id) => (id ? ["--session-id", id] : []);
+
+/** `gates --workflow <w>`: print every stage's gate checks with the prescription each would give if it failed. */
+function gatesAudit(flags) {
+  if (!flags.workflow) throw new UsageError("--workflow is required");
+  const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT);
+  const dataDir = mkdtempSync(join(tmpdir(), "uwf-gates-"));
+  try {
+    const r = runCli(TRACKER, ["gate-prescriptions", "--workflow", flags.workflow, "--output-path", "<output_path>", "--data-dir", dataDir],
+      { cwd: repoRoot, env: { UWF_DATA_DIR: dataDir } });
+    if (!r.ok || !Array.isArray(r.data?.stages)) throw new UsageError(`Cannot read gates: ${r.error}`);
+    const out = [`workflow: ${flags.workflow} (placeholders: <output_path> = --output-path, <repo> = repo root)`];
+    for (const s of r.data.stages) {
+      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, `retry_mode: ${s.retry_mode}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
+      out.push("", `${s.stage}  (${flagsTxt})`);
+      if (!s.checks.length) out.push("  (no checks)");
+      for (const c of s.checks) out.push(`  - ${c.type}: ${c.prescription.split(repoRoot).join("<repo>")}`);
+    }
+    process.stdout.write(out.join("\n") + "\n");
+    return EXIT.OK;
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+/** The gate failure doubles as the retry prompt, so it says exactly what to produce and what happens next. */
+export function retryPrompt({ basePrompt, stage, retry, maxRetries, prescriptions, transcript }) {
+  const left = maxRetries - retry;
+  const next = left <= 0 ? "this is the final attempt; if the gate still fails, the stage will be marked failed and the run stops"
+    : left === 1 ? "if the gate fails again you get one more attempt"
+    : `if the gate fails again you get ${left} more attempts`;
+  const tail = String(transcript ?? "").split(/\r?\n/).slice(-40).join("\n");
+  return `${basePrompt}\n\n## Gate failure (retry ${retry} of ${maxRetries})\nThe gate for stage ${stage} did not pass.\n` +
+    `${prescriptions.map((p) => `- ${p}`).join("\n")}\n\nWhat happens next: ${next}.\n\n` +
+    `## Your previous attempt (last 40 lines)\n${tail}`;
+}
+
+/** One-paragraph human-readable summary for on_gate_failure abort|skip. */
+function gateSummary(st, failures, prescriptions, did) {
+  return `[runner] Stage ${st.name} gate failed (on_gate_failure: ${st.onGateFailure}). Failures: ${failures.join("; ")}. ` +
+    `What would have fixed it: ${prescriptions.join(" ")} The runner ${did}.`;
 }
 
 function transcriptText(path) {
@@ -446,7 +512,7 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, outputPa
     const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, outputPath, dataDir, extraContext: { goal } });
     out.push(`[${start + j + 1}/${total}] ${st.name}  (agent: ${mp.agentName})`);
     out.push(`  permissions: ${mp.permissions}   model: ${flags.model ?? mp.model ?? "(adapter default)"}`);
-    out.push(`  retries: ${st.maxRetries}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
+    out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
     out.push(`  required outputs: ${mp.outputsRequired.length ? mp.outputsRequired.join(", ") : "(none)"}`);
     if (mp.inputsMissing.length) out.push(`  inputs not present yet: ${mp.inputsMissing.join(", ")}`);
     const checks = gateChecks[st.name] ?? [];

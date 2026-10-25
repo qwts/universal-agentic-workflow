@@ -36,6 +36,9 @@ tables:
         type: TEXT
       - name: notes
         type: TEXT
+      - name: session_id
+        type: TEXT
+        # Adapter session id of the latest attempt (nullable). Added to existing DBs by initTables().
 
   stage_history:
     description: "Append-only log of all stage status transitions"

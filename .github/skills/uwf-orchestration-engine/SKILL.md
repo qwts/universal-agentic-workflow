@@ -235,6 +235,8 @@ When a gate check fails:
 3. Re-check the gate after the subagent returns.
 4. Allow up to **2 retries** per gate. After 2 failures, **halt** the sequence and report the blockage to the user with: gate name, missing artifacts, and the subagent's last response.
 
+**Prescriptions.** The `--check-gate` JSON carries `failures` (what is wrong) and a parallel `prescriptions: string[]` (one imperative sentence per failed check saying exactly what to produce, e.g. `Include the text "verdict: approved" in <path>.`), plus the gate's `on_gate_failure` and `max_retries`. Use the prescriptions as the retry instruction; the deterministic runner composes them into its retry prompt (`scripts/uwf-runner/runner.mjs`). `runner.mjs gates --workflow <w>` prints every stage's prescriptions for audit.
+
 ---
 
 ## Review Fix-Loop Protocol
@@ -293,7 +295,7 @@ node .github/skills/uwf-<workflow>/run.mjs --check-gate <stageName> \
 | `1` | Gate failed — stdout contains JSON `{ stage, passed, failures[] }` |
 | `2` | Usage error (bad stage name / missing args) |
 
-On exit code `1`, apply the Gate Failure Protocol (re-invoke responsible subagent with failure details, up to `maxRetries` times). Retrieve `maxRetries` and `onGateFailure` for any stage via:
+On exit code `1`, apply the Gate Failure Protocol (re-invoke responsible subagent with failure details, up to `maxRetries` times). Retrieve `maxRetries`, `onGateFailure` and `retryMode` (`resume` = reuse the previous attempt's session, `fresh` = start a new one; the session id of each attempt is stored in `stage_runs.session_id`, `stage-start|stage-complete|stage-fail|stage-skip --session-id <id>`) for any stage via:
 
 ```sh
 node .github/skills/uwf-<workflow>/run.mjs --list-stages
@@ -363,6 +365,7 @@ stages:
     agent: <subagent-id>
     max_retries: 2                 # retries before gate failure escalates
     on_gate_failure: retry         # retry | abort | skip
+    retry_mode: resume             # resume (default) = retries continue the previous adapter session; fresh = new session per attempt
     gated: true                    # false = always passes (best-effort stages)
     conditional: true              # optional; gate auto-passes if condition is false
     condition:                     # evaluated only when conditional: true
