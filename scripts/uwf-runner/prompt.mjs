@@ -25,9 +25,15 @@ const DEFAULT_REPO = resolve(__dirname, "..", "..");
 const EXCERPT_LINES = 40;
 
 // js-yaml lives in the engine skill's node_modules (npm ci there).
+// Prefer the target repo's install; fall back to this checkout's so the runner
+// works against a scratch or target repository that has no skill installs.
 function loadYaml(repoRoot) {
-  const req = createRequire(join(repoRoot, ".github", "skills", "uwf-orchestration-engine", "package.json"));
-  return req("js-yaml");
+  for (const root of [repoRoot, DEFAULT_REPO]) {
+    const pkg = join(root, ".github", "skills", "uwf-orchestration-engine", "package.json");
+    if (!existsSync(pkg)) continue;
+    try { return createRequire(pkg)("js-yaml"); } catch { /* try next root */ }
+  }
+  throw new PromptError("js-yaml not found: run npm ci in .github/skills/uwf-orchestration-engine");
 }
 
 export class PromptError extends Error {}
@@ -59,17 +65,25 @@ function mergePolicy(def, traitPolicies) {
   return m;
 }
 
+// Engine resources (stage contracts, traits, profiles) come from the target repo
+// when it carries them, else from this checkout, so a target repo only needs
+// its persona skill and agents.
+function skillFile(skills, ...segs) {
+  const local = join(skills, ...segs);
+  return existsSync(local) ? local : join(DEFAULT_REPO, ".github", "skills", ...segs);
+}
+
 function resolveNewStyle(yaml, skills, stageDef, modelProfile) {
   const { stage_type, traits = [], name } = stageDef;
-  const contract = readYaml(yaml, join(skills, "uwf-orchestration-engine", "stage-contracts", `${stage_type}.yaml`));
+  const contract = readYaml(yaml, skillFile(skills, "uwf-orchestration-engine", "stage-contracts", `${stage_type}.yaml`));
   if (!contract) throw new PromptError(`Stage "${name}": unknown stage_type "${stage_type}"`);
   const policies = traits.map((t) => {
-    const def = readYaml(yaml, join(skills, "uwf-traits", "traits", `${t}.yaml`));
+    const def = readYaml(yaml, skillFile(skills, "uwf-traits", "traits", `${t}.yaml`));
     const p = def?.stage_policies?.[stage_type];
     if (!p) throw new PromptError(`Stage "${name}": trait "${t}" has no policy for stage_type "${stage_type}"`);
     return p;
   });
-  const profiles = readYaml(yaml, join(skills, "uwf-model-adaptation", "profiles.yaml"));
+  const profiles = readYaml(yaml, skillFile(skills, "uwf-model-adaptation", "profiles.yaml"));
   const profile = modelProfile ?? profiles?.default_profile ?? "balanced";
   const base = { ...(profiles?.profiles?.[profile]?.steering_policy ?? {}) };
   const override = profiles?.stage_overrides?.[profile]?.[stage_type];
