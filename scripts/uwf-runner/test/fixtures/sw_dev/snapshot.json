@@ -1,0 +1,9 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-drs.json": "{\"divergence_log\":[]}\n",
+    "tmp/workflow-artifacts/issues-br.json": "{\"requirements\":[],\"stratum\":5}\n",
+    "tmp/workflow-artifacts/uwf-changelog.md": "# Changelog\n\nClosure entry\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "snapshot: done",
+  "delayMs": 0
+}

@@ -1,0 +1,7 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-discovery.md": "# Discovery\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "discovery: done",
+  "delayMs": 0
+}

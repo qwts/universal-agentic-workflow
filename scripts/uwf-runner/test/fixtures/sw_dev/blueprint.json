@@ -1,0 +1,8 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-blueprint.md": "# Blueprint\n\nFixture content for the runner test.\n",
+    "tmp/workflow-artifacts/issues-br.json": "{\"requirements\":[]}\n"
+  },
+  "transcript": "blueprint: done",
+  "delayMs": 0
+}

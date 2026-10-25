@@ -33,3 +33,16 @@ const r = await adapter.invokeStage({
 ## Tests
 
 `node scripts/uwf-runner/test/adapters.test.mjs` (live: `UWF_TEST_LIVE=1`, uses haiku).
+
+## Runner (`runner.mjs`)
+
+```sh
+node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapter claude-code|fake] \
+  [--model m] [--data-dir d] [--output-path p] [--from-stage s] [--non-interactive] [--dry-run] [--timeout-ms n]
+```
+
+Exit codes: 0 complete, 1 gate blocked or abort, 2 usage/config error, 3 questions pending
+(answer with `questions.mjs answer`, then rerun with `--from-stage <stage>`).
+A run without `--from-stage` re-initializes the stage-tracker and state stores in the data dir.
+`on_gate_failure: retry` retries `max_retries` times then fails; `skip` and `abort` act on the first failure.
+Tests: `node scripts/uwf-runner/test/runner.test.mjs` (fake adapter, fixtures in `test/fixtures/<workflow>/`).

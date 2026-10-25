@@ -1,0 +1,7 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-retro.md": "# Retro\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "retro: done",
+  "delayMs": 0
+}

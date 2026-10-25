@@ -1,0 +1,7 @@
+{
+  "files": {
+    "tmp/workflow-artifacts/issues-risk-plan.md": "# Risk plan\n\nFixture content for the runner test.\n"
+  },
+  "transcript": "risk-plan: done",
+  "delayMs": 0
+}
