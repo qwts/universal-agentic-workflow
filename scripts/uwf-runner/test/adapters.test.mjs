@@ -6,9 +6,9 @@
  * (live run uses model haiku and a tiny prompt).
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, delimiter } from "node:path";
 import { execFileSync } from "node:child_process";
 import { loadAdapter } from "../adapters/index.mjs";
 
@@ -80,6 +80,38 @@ async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase })
   });
   check("fake: sessionId from fixture", r.sessionId === "fake-sess-1");
   check("fake: usage is null", r.usage === null);
+}
+
+// --- claude-code argv (offline: a fake `claude` on PATH records the argv it was spawned with) ---
+{
+  const root = mkdtempSync(join(tmpdir(), "uwf-argv-"));
+  const bin = join(root, "bin");
+  const argvFile = join(root, "argv.json");
+  mkdirSync(bin);
+  const fakeClaude = join(bin, "claude");
+  writeFileSync(fakeClaude, `#!${process.execPath}
+const { writeFileSync } = require("node:fs");
+writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({ result: "OK", session_id: "argv-sess", is_error: false, usage: { input_tokens: 1, output_tokens: 1 } }));
+`);
+  chmodSync(fakeClaude, 0o755);
+  try {
+    const adapter = await loadAdapter("claude-code");
+    const cwd = join(root, "work");
+    mkdirSync(cwd);
+    const r = await adapter.invokeStage({
+      prompt: "argv check", cwd, dataDir: join(root, "data"), permissions: "read-only", timeoutMs: 20000,
+      env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` },
+    });
+    check("claude-code argv run ok", r.ok === true, r.error ?? "");
+    const argv = existsSync(argvFile) ? JSON.parse(readFileSync(argvFile, "utf8")) : [];
+    const i = argv.indexOf("--setting-sources");
+    check("claude-code argv contains --setting-sources project", i >= 0 && argv[i + 1] === "project", JSON.stringify(argv));
+    check("claude-code argv passes --setting-sources right after --permission-mode dontAsk",
+      i > 0 && argv[i - 1] === "dontAsk" && argv[i - 2] === "--permission-mode", JSON.stringify(argv));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 // --- claude-code adapter (opt-in live) ---
