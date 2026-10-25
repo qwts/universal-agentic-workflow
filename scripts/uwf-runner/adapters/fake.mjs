@@ -6,6 +6,7 @@
  *     sessionId?: string (fixed id when none is passed in; otherwise a unique one is minted), exitCode?: number, delayMs?: number,
  *     attempts?: [ { files, transcript, exitCode, delayMs }, ... ] }
  * Files are written under `cwd`. A non-zero exitCode yields ok:false.
+ * turnsNeeded (optional): turns the stage would take; above opts.maxTurns the call fails with "max turns (N) exceeded".
  * delayMs simulates a slow stage (used to exercise timeoutMs).
  * attempts (optional): per-invocation variants. The Nth call for a fixture path uses
  * attempts[N-1] (the last entry repeats). The call count lives in `<dataDir>/fake-attempts.json`
@@ -68,6 +69,8 @@ export async function invokeStage(opts, extra = {}) {
     }
     await new Promise((r) => setTimeout(r, fx.delayMs));
   }
+
+  if (opts.maxTurns && fx.turnsNeeded > opts.maxTurns) return fail(`max turns (${opts.maxTurns}) exceeded`);
 
   try {
     for (const [rel, content] of Object.entries(fx.files ?? {})) {

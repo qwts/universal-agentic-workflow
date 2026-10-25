@@ -26,7 +26,11 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO = resolve(__dirname, "..", "..");
-const EXCERPT_LINES = 40;
+// The excerpt is only a preview: the stage reads the full file when it needs it, and every inlined
+// character is re-sent on every turn of the stage, so keep it small.
+const EXCERPT_LINES = 12;
+const EXCERPT_LINE_CHARS = 200;
+const clip = (l) => (l.length > EXCERPT_LINE_CHARS ? l.slice(0, EXCERPT_LINE_CHARS) + "..." : l);
 
 // js-yaml lives in the engine skill's node_modules (npm ci there).
 // Prefer the target repo's install; fall back to this checkout's so the runner
@@ -239,7 +243,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, outputPath,
     }
     for (const f of files) {
       const lines = readFileSync(f, "utf8").split(/\r?\n/);
-      const shown = lines.slice(0, EXCERPT_LINES).join("\n");
+      const shown = lines.slice(0, EXCERPT_LINES).map(clip).join("\n");
       const more = lines.length > EXCERPT_LINES ? `\n... (${lines.length - EXCERPT_LINES} more lines)` : "";
       inputBlocks.push(`### ${f === abs(p) ? p : f}\n\`\`\`\n${shown}${more}\n\`\`\``);
     }
@@ -270,6 +274,11 @@ export async function materializePrompt({ workflow, stage, repoRoot, outputPath,
     "",
     "Context:",
     JSON.stringify(ctx, null, 2),
+    "",
+    "## Reading rules",
+    "Read only the files listed under Inputs (the excerpts below are previews; open the file for the rest) plus the files you need to change. " +
+      "Do not list or read the whole artifacts directory or the whole repository, and do not search for files the inputs do not name. " +
+      "Write the required outputs directly once you have what you need.",
     "",
     "## Inputs",
     inputBlocks.length ? inputBlocks.join("\n\n") : "(none)",

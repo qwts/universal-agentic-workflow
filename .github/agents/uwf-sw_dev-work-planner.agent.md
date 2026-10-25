@@ -5,40 +5,24 @@ tools: ["agent", "todo", "search", "edit", "read", "execute"]
 user-invokable: false
 ---
 # Work Planning Stage
-This stage assembles the full implementation plan from already-completed upstream artifacts. Security and tests are already defined. Do not write code or source files. Do not re-scope the issue — that is Intake's job.
 
-## Required output: `./tmp/workflow-artifacts/issues-plan.md` (reset and scoped to this issue)
+Assemble the implementation plan from the upstream artifacts (security and tests are already defined). Read only the declared inputs. Do not write code or source files and do not re-scope the issue (Intake's job).
 
-> **Order matters:** tests are written before feature code. The plan must reflect this.
+## Required output: `./tmp/workflow-artifacts/issues-plan.md` (scoped to this issue)
 
-### Sections (in this order)
+Tests are written before feature code; the plan must reflect that. Sections, in order:
 
-#### 1. File / area touch list
-Bullet list of every file or directory that will be created, edited, or deleted.
-Separate into sub-lists: _test files_ and _implementation files_.
+1. **File / area touch list**: every file or directory created, edited or deleted, split into _test files_ and _implementation files_.
+2. **Test implementation steps**: ordered steps writing the tests from `./tmp/workflow-artifacts/issues-test-plan.md`. Each: file to create/edit, test-ids implemented, done-signal (the test fails with "not implemented" or similar).
+3. **Implementation steps**: ordered steps making the tests pass and satisfying all acceptance criteria. Each names what changes, where (file/module/service), why, and which test-ids it satisfies. Every security control in `./tmp/workflow-artifacts/issues-security-plan.md` maps to at least one step.
+4. **Rollout plan**: how the change is released (feature flags, phased rollout, migration steps).
+5. **Rollback plan**: specific revert path (revert commit, flag toggle, migration down).
+6. **Verification checklist**:
+   - [ ] All test stubs from `issues-test-plan.md` are covered in Test implementation steps
+   - [ ] All acceptance criteria from `issues-intake.md` map to an implementation step
+   - [ ] All security controls from `issues-security-plan.md` map to a step or test
+   - [ ] No files outside the touch list are modified
+   - [ ] Rollback path is confirmed viable
+   - [ ] The coverage verification command from `issues-test-plan.md` is included
 
-#### 2. Test implementation steps
-Ordered steps to write the tests defined in `./tmp/workflow-artifacts/issues-test-plan.md`.
-Each step: file to create/edit, test-ids being implemented, done-signal (test fails with "not implemented" or similar).
-
-#### 3. Implementation steps
-Ordered steps to make the tests pass and satisfy all acceptance criteria.
-Each step must name: what changes, where (file/module/service), why, and which test-ids it satisfies.
-Security controls from `./tmp/workflow-artifacts/issues-security-plan.md` must each map to at least one step here.
-
-#### 4. Rollout plan
-How the change is deployed or released. Include feature flags, phased rollout, or migration steps.
-
-#### 5. Rollback plan
-How to revert if the change causes a problem. Be specific (revert commit, flag toggle, migration down).
-
-#### 6. Verification checklist
-- [ ] All test stubs from `./tmp/workflow-artifacts/issues-test-plan.md` are covered in Test implementation steps
-- [ ] All acceptance criteria from `./tmp/workflow-artifacts/issues-intake.md` map to an implementation step
-- [ ] All security controls from `./tmp/workflow-artifacts/issues-security-plan.md` map to a step or test
-- [ ] No files outside the touch list are modified
-- [ ] Rollback path is confirmed viable
-- [ ] Coverage verification command from `./tmp/workflow-artifacts/issues-test-plan.md` is included in Verification checklist
-
-## After producing `./tmp/workflow-artifacts/issues-plan.md`
-Trigger "Stage — Implementation" handoff.
+After producing `./tmp/workflow-artifacts/issues-plan.md`, trigger the "Stage — Implementation" handoff.

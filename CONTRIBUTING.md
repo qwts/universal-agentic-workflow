@@ -116,6 +116,7 @@ stages:
     max_retries: 2
     on_gate_failure: retry   # retry | abort | skip
     retry_mode: resume       # resume (default) | fresh: reuse or restart the adapter session on retry
+    max_turns: 20            # positive integer, per-attempt turn cap (default 20; implementation 30)
     run_as_subagent: true
     advances_phase_to: intake
     inputs: []

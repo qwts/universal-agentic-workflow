@@ -45,6 +45,7 @@ export async function invokeStage(opts) {
   if (system) args.push("--append-system-prompt", system);
   if (sessionId) args.push("--resume", sessionId);
   if (model) args.push("--model", model);
+  if (opts.maxTurns) args.push("--max-turns", String(opts.maxTurns));
   // --tools restricts what exists; --allowedTools pre-approves it. Both are
   // needed: dontAsk keeps the user's own pre-approved tools unless --tools
   // narrows the set, so a read-only stage must not depend on ambient settings.

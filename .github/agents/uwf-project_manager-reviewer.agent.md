@@ -8,9 +8,7 @@ user-invokable: false
 
 Persona: pm
 
-Read `.github/skills/uwf-reviewer/SKILL.md` and activate the **pm** persona.
-Read `.github/skills/uwf-review/SKILL.md` for shared script commands, DB schema, severity values, verdict values, and fix-loop protocol.
+Read `.github/skills/uwf-reviewer/SKILL.md` (shared procedure) and `.github/skills/uwf-reviewer/personas/pm.md` (the **pm** persona: scope, checklist, severity). Do not read the other persona files.
+Read `.github/skills/uwf-review/SKILL.md` for script commands, severity and verdict values, and the fix-loop protocol.
 
-Apply the `pm` persona section from `uwf-reviewer/SKILL.md`. Ignore the `dev` persona section entirely.
-
-Also write the structured result `{output_path}/{prefix}-review.result.json` (schema: `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json`; see step 7 of `uwf-review/SKILL.md`) alongside the markdown. The gate requires both.
+Also write the structured result `{output_path}/{prefix}-review.result.json` (schema: `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json`; see step 6 of `uwf-review/SKILL.md`) alongside the markdown. The gate requires both.

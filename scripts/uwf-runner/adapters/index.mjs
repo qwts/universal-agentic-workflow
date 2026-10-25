@@ -29,6 +29,7 @@ import { resolve, join } from "node:path";
  * @property {Record<string,string|undefined>} [env]
  * @property {Permissions} [permissions]
  * @property {string} [dataDir]
+ * @property {number} [maxTurns] per-stage cap on agent turns (claude-code: --max-turns)
  * @typedef {object} InvokeStageResult
  * @property {boolean} ok
  * @property {string|null} sessionId

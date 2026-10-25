@@ -547,5 +547,68 @@ const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not a
   } finally { rmSync(o.base, { recursive: true, force: true }); }
 }
 
+// 8. max_turns: plumbing, cap failure, validation; cost command ---------------------
+{
+  console.log("# max_turns");
+  const s = setup();
+  try {
+    const fxPath = join(s.fixtures, "review.json");
+    const good = JSON.parse(readFileSync(fxPath, "utf8"));
+    writeFileSync(fxPath, JSON.stringify({
+      attempts: [
+        { turnsNeeded: 99, files: good.files, transcript: "review: ran out of turns" },
+        { turnsNeeded: 5, files: good.files, transcript: good.transcript },
+      ],
+    }));
+    const r = run(s);
+    check("exits 0 after the capped attempt is retried", r.code === 0, `${r.code} ${r.err.slice(-500)}`);
+    check("cap hit is reported as a gate failure naming max_turns", /review gate: NOT RUN \(stage hit the turn cap \(max_turns 20\)\)/.test(r.err), r.err.slice(-800));
+    const retry = transcripts(s).map((t) => t.prompt).find((p) => p?.includes("## Gate failure (retry 1 of 3)")) ?? "";
+    check("retry prompt carries the prescriptive text",
+      /The stage stopped after 20 turns without producing .*issues-review\.md.*; read only the listed inputs and write the outputs directly\./.test(retry), retry.slice(-600));
+    check("review row shows attempts=2 and passed", /^review\s+2\s+passed/m.test(r.out));
+    const dry = run(s, ["--dry-run"]);
+    check("dry run prints max_turns (implementation 30, review 20)", /implementation[\s\S]*?max_turns: 30/.test(dry.out) && /\] review [\s\S]*?max_turns: 20/.test(dry.out), dry.out.slice(0, 300));
+    const gates = spawnSync(process.execPath, [RUNNER, "gates", "--workflow", "sw_dev", "--repo-root", s.repo], { encoding: "utf8" });
+    check("gates audit prints max_turns", /max_turns: 30/.test(gates.stdout) && /max_turns: 20/.test(gates.stdout), gates.stdout.slice(0, 300));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+
+  const f = setup();
+  try {
+    const yamlPath = join(f.repo, ".github", "skills", "uwf-sw_dev", "stages.yaml");
+    const text = readFileSync(yamlPath, "utf8");
+    check("stages.yaml declares max_turns", /^    max_turns: 30$/m.test(text));
+    const list = skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], f);
+    check("--list-stages exposes maxTurns (implementation 30, review 20)", list?.find((x) => x.name === "implementation")?.maxTurns === 30 && list?.find((x) => x.name === "review")?.maxTurns === 20);
+    const noKey = text.replace(/^    max_turns: \d+\n/gm, "");
+    writeFileSync(yamlPath, noKey);
+    const dflt = skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], f);
+    check("omitted max_turns defaults to 20 (implementation 30)", dflt?.find((x) => x.name === "intake")?.maxTurns === 20 && dflt?.find((x) => x.name === "implementation")?.maxTurns === 30);
+    for (const bad of ["0", "-3", "2.5", "many"]) {
+      writeFileSync(yamlPath, text.replace(/^(  - name: review\n(?:.*\n)*?    max_turns: )\d+$/m, `$1${bad}`));
+      const r = spawnSync(process.execPath, [join(SKILLS, "uwf-sw_dev", "run.mjs"), "--list-stages", "--data-dir", f.data], { encoding: "utf8", cwd: f.repo });
+      check(`invalid max_turns ${bad} is rejected`, r.status !== 0 && /Stage \\"review\\": max_turns must be a positive integer/.test(r.stdout), r.stdout.slice(0, 200));
+    }
+  } finally { rmSync(f.base, { recursive: true, force: true }); }
+
+  const c = scratch();
+  try {
+    mkdirSync(join(c.data, "transcripts"), { recursive: true });
+    cpSync(join(HERE, "fixtures", "transcripts"), join(c.data, "transcripts"), { recursive: true });
+    const r = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", c.data, "--workflow", "sw_dev"], { encoding: "utf8" });
+    const row = (n) => r.stdout.split("\n").find((l) => l.startsWith(n)) ?? "";
+    check("cost exits 0 and prints a header and TOTAL", r.status === 0 && /^stage\s+turns\s+ctx\/turn/.test(r.stdout) && row("TOTAL").length > 0, r.stderr + r.stdout.slice(0, 300));
+    check("cost has a row per stage", ["review", "technical-writing", "retro"].every((n) => row(n)));
+    check("review: 26 turns, 70.8K per turn, flagged !50K and !100K", /^review\s+26\s+70\.8K\s+130\.7K/.test(row("review")) && row("review").includes("!50K") && row("review").includes("!100K"), row("review"));
+    check("technical-writing and retro are not flagged", !/!\d+K/.test(row("technical-writing")) && !/!\d+K/.test(row("retro")), row("technical-writing") + row("retro"));
+    check("thinking tokens and cost are shown", row("review").includes("19098") && row("review").includes("$0.195"), row("review"));
+    check("static prompt size column shown with --workflow", /prompt\(ch\/~tok\)/.test(r.stdout) && /\d+\/~\d+/.test(row("review")), r.stdout.slice(0, 400));
+    const bare = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", c.data], { encoding: "utf8" });
+    check("cost without --workflow omits the static column", bare.status === 0 && !/prompt\(ch/.test(bare.stdout));
+    const none = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", join(c.base, "nope")], { encoding: "utf8" });
+    check("cost on a missing data dir exits 2", none.status === 2, none.stderr);
+  } finally { rmSync(c.base, { recursive: true, force: true }); }
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

@@ -366,6 +366,7 @@ stages:
     max_retries: 2                 # retries before gate failure escalates
     on_gate_failure: retry         # retry | abort | skip
     retry_mode: resume             # resume (default) = retries continue the previous adapter session; fresh = new session per attempt
+    max_turns: 20                  # positive integer; cap on agent turns per attempt (default 20, implementation 30). Hitting it is a gate failure
     gated: true                    # false = always passes (best-effort stages)
     conditional: true              # optional; gate auto-passes if condition is false
     condition:                     # evaluated only when conditional: true

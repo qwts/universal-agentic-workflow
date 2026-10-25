@@ -40,14 +40,28 @@ await test("missing input is reported with its path", async () => {
   assert.deepEqual(r.outputsRequired, ["/OUT/issues-discovery.md"]);
 });
 
-await test("existing input is excerpted to 40 lines and not reported missing", async () => {
+await test("existing input is excerpted to 12 lines and not reported missing", async () => {
   const out = mkdtempSync(join(tmpdir(), "uwf-prompt-"));
   writeFileSync(join(out, "issues-intake.md"), Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n"));
   const r = await materializePrompt({ workflow: "sw_dev", stage: "discovery", repoRoot, outputPath: out, dataDir: "/DATA" });
   assert.deepEqual(r.inputsMissing, []);
-  assert.match(r.prompt, /line 40\b/);
-  assert.doesNotMatch(r.prompt, /line 41\b/);
-  assert.match(r.prompt, /10 more lines/);
+  assert.match(r.prompt, /line 12\b/);
+  assert.doesNotMatch(r.prompt, /line 13\b/);
+  assert.match(r.prompt, /38 more lines/);
+});
+
+await test("prompt tells the stage to read only its declared inputs", async () => {
+  const r = await materializePrompt({ workflow: "sw_dev", stage: "blueprint", ...opts });
+  assert.match(r.prompt, /## Reading rules\nRead only the files listed under Inputs/);
+  assert.match(r.prompt, /Do not list or read the whole artifacts directory or the whole repository/);
+  assert.ok(r.prompt.indexOf("## Reading rules") < r.prompt.indexOf("## Inputs"));
+});
+
+await test("long input lines are clipped in the excerpt", async () => {
+  const out = mkdtempSync(join(tmpdir(), "uwf-prompt-"));
+  writeFileSync(join(out, "issues-intake.md"), "x".repeat(5000) + "\n");
+  const r = await materializePrompt({ workflow: "sw_dev", stage: "discovery", repoRoot, outputPath: out, dataDir: "/DATA" });
+  assert.ok(r.prompt.length < 3000, `prompt is ${r.prompt.length} chars`);
 });
 
 await test("result shape and defaults", async () => {

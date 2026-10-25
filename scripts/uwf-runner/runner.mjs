@@ -9,6 +9,9 @@
  *   node scripts/uwf-runner/runner.mjs resume --workflow <w>
  *     [--adapter] [--model] [--data-dir] [--output-path] [--non-interactive] [--timeout-ms]
  *
+ *   node scripts/uwf-runner/runner.mjs cost --data-dir <d> [--workflow <w> [--repo-root <r>]]
+ *     per-stage turns, context per turn, tokens and cost from <d>/transcripts (see cost.mjs)
+ *
  * Exit codes: 0 complete | 1 gate blocked / abort | 2 usage or config error | 3 questions pending
  *
  * The runner only sequences. State lives in the existing stores (stage-tracker, state-manager,
@@ -23,6 +26,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt } from "./prompt.mjs";
+import { costReport } from "./cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -108,7 +112,8 @@ async function main(argv) {
   const { flags, positional } = parseArgs(argv);
   const command = positional[0];
   if (command === "gates") return gatesAudit(flags);
-  if (command !== "run" && command !== "resume") throw new UsageError("Usage: runner.mjs run|resume|gates --workflow <w> [--goal <file|text>] [options]");
+  if (command === "cost") return costCommand(flags);
+  if (command !== "run" && command !== "resume") throw new UsageError("Usage: runner.mjs run|resume|gates|cost --workflow <w> [--goal <file|text>] [options]");
   if (!flags.workflow) throw new UsageError("--workflow is required");
   if (command === "run" && !flags.goal) throw new UsageError("--goal is required");
   if (command === "resume") {
@@ -345,6 +350,7 @@ async function stageLoop(ctx) {
       const res = await adapter.invokeStage({
         systemPrompt: mp.systemPrompt, prompt, cwd: repoRoot, inputs: st.inputs, outputs: mp.outputsRequired,
         model, sessionId, timeoutMs, env, permissions: mp.permissions, dataDir,
+        maxTurns: st.maxTurns,
       });
       sessionId = res.sessionId ?? sessionId;
       // Persist right away so the session survives a crash between attempts.
@@ -377,7 +383,12 @@ async function stageLoop(ctx) {
       // 6. gate
       let failures;
       let prescriptions;
-      if (!res.ok) {
+      if (hitMaxTurns(res)) {
+        // The cap is a gate failure: the agent stopped before finishing, so name the cause and the fix.
+        failures = [`stage hit the turn cap (max_turns ${st.maxTurns})`];
+        prescriptions = [`The stage stopped after ${st.maxTurns} turns without producing ${mp.outputsRequired.join(", ") || "its outputs"}; read only the listed inputs and write the outputs directly.`];
+        log(`${tag} gate: NOT RUN (${failures[0]})`);
+      } else if (!res.ok) {
         failures = [`adapter error: ${res.error ?? "unknown"}`];
         prescriptions = [`Resolve the adapter error (${res.error ?? "unknown"}) and complete the stage outputs.`];
         log(`${tag} gate: NOT RUN (${failures[0]})`);
@@ -429,6 +440,23 @@ async function stageLoop(ctx) {
   }
 }
 
+/** True when the adapter stopped the stage at its turn cap (fake: error text; claude: result subtype). */
+function hitMaxTurns(res) {
+  if (/max turns \(\d+\) exceeded|error_max_turns/i.test(res.error ?? "")) return true;
+  try { return JSON.parse(JSON.parse(readFileSync(res.transcriptPath, "utf8")).stdout).subtype === "error_max_turns"; } catch { return false; }
+}
+
+async function costCommand(flags) {
+  if (!flags["data-dir"]) throw new UsageError("--data-dir is required");
+  const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT);
+  try {
+    process.stdout.write(await costReport({ dataDir: resolve(flags["data-dir"]), workflow: flags.workflow, repoRoot, outputPath: flags["output-path"] }));
+  } catch (e) {
+    throw new UsageError(e.message);
+  }
+  return EXIT.OK;
+}
+
 const sessionArgs = (id) => (id ? ["--session-id", id] : []);
 
 /** `gates --workflow <w>`: print every stage's gate checks with the prescription each would give if it failed. */
@@ -442,7 +470,7 @@ function gatesAudit(flags) {
     if (!r.ok || !Array.isArray(r.data?.stages)) throw new UsageError(`Cannot read gates: ${r.error}`);
     const out = [`workflow: ${flags.workflow} (placeholders: <output_path> = --output-path, <repo> = repo root)`];
     for (const s of r.data.stages) {
-      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, `retry_mode: ${s.retry_mode}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
+      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, `retry_mode: ${s.retry_mode}`, `max_turns: ${s.max_turns}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
       out.push("", `${s.stage}  (${flagsTxt})`);
       if (!s.checks.length) out.push("  (no checks)");
       for (const c of s.checks) out.push(`  - ${c.type}: ${c.prescription.split(repoRoot).join("<repo>")}`);
@@ -512,7 +540,7 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, outputPa
     const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, outputPath, dataDir, extraContext: { goal } });
     out.push(`[${start + j + 1}/${total}] ${st.name}  (agent: ${mp.agentName})`);
     out.push(`  permissions: ${mp.permissions}   model: ${flags.model ?? mp.model ?? "(adapter default)"}`);
-    out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
+    out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   max_turns: ${st.maxTurns}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
     out.push(`  required outputs: ${mp.outputsRequired.length ? mp.outputsRequired.join(", ") : "(none)"}`);
     if (mp.inputsMissing.length) out.push(`  inputs not present yet: ${mp.inputsMissing.join(", ")}`);
     const checks = gateChecks[st.name] ?? [];
