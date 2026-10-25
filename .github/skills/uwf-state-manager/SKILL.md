@@ -27,7 +27,7 @@ On first run (or after `init`), the script reads the YAML file and creates all t
 ## When to use
 Invoke this skill whenever an agent needs to:
 - Read the current workflow phase or status
-- Advance or roll back a phase (`idea → intake → discovery → planning → execution → acceptance → closed`)
+- Advance or roll back a phase (`idea → intake → discovery → planning → execution → acceptance → snapshot → closed`)
 - Record a hand-off between agents (`current_agent` field)
 - Mark `ready_for_implementation` after both `{role}-intake.md` and `{role}-plan.md` are confirmed present
 - Append an entry to the history log
@@ -121,13 +121,13 @@ Defined by `workflow-schema.yaml`.
 ### Phase lifecycle
 
 ```
-idea → intake → discovery → planning → execution → acceptance → closed
+idea → intake → discovery → planning → execution → acceptance → snapshot → closed
 ```
 
 ---
 
 ## Validation rules
-- `phase` must be one of: `idea`, `intake`, `discovery`, `planning`, `execution`, `acceptance`, `closed`.
+- `phase` must be one of: `idea`, `intake`, `discovery`, `planning`, `execution`, `acceptance`, `snapshot`, `closed`.
 - `status` must be one of: `idle`, `active`, `blocked`.
 - `workflow_history` is append-only — never remove or mutate existing rows.
 - Phase advances must follow lifecycle order unless `--force` is supplied.

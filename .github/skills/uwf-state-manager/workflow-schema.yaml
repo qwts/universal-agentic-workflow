@@ -9,6 +9,8 @@ tables:
       - name: id
         type: INTEGER
         primary_key: true
+      # Allowed values (must match VALID_PHASES in state.mjs):
+      # idea, intake, discovery, planning, execution, acceptance, snapshot, closed
       - name: phase
         type: TEXT
         not_null: true
