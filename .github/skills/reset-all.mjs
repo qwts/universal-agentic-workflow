@@ -16,6 +16,7 @@
 import { unlinkSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveDataDir } from "./uwf-state-manager/data-dir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const skillsDir  = resolve(__dirname);
@@ -32,7 +33,16 @@ function findDbs(dir) {
   return results;
 }
 
-const dbs = findDbs(skillsDir);
+function findDataDirDbs(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isFile() && /\.db(?:-shm|-wal)?$/.test(e.name))
+    .map((e) => join(dir, e.name));
+}
+
+// When a data directory is set, reset only the databases there; otherwise the skill folders.
+const dataDir = resolveDataDir(process.argv.slice(2), undefined);
+const dbs = dataDir ? findDataDirDbs(dataDir) : findDbs(skillsDir);
 const deleted = [];
 const missing = [];
 
@@ -46,7 +56,7 @@ for (const db of dbs) {
 }
 
 if (withArtifacts) {
-  const artPath = join(repoRoot, "tmp", "workflow-artifacts");
+  const artPath = dataDir ? join(dataDir, "workflow-artifacts") : join(repoRoot, "tmp", "workflow-artifacts");
   if (existsSync(artPath)) {
     rmSync(artPath, { recursive: true, force: true });
     deleted.push(artPath + "/ (directory)");

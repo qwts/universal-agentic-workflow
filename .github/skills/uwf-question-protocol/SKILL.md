@@ -242,3 +242,7 @@ When re-invoked with an `answered` field in your context:
 ❌ **Blocking on minor details** — Use assumptions for low-impact details, questions for critical ones
 
 ❌ **One question at a time** — Batch all questions to avoid multi-turn back-and-forth
+
+## Data directory
+
+Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.

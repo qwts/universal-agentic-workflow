@@ -154,3 +154,7 @@ The script prints structured JSON to stdout for every command. Agents must captu
 - `state.phase`, `state.status`, `state.current_agent`, `state.ready_for_implementation` — state snapshot after the operation
 - `history_entry` — the new history entry appended (where applicable)
 - `error` — error message (only present when `ok: false`)
+
+## Data directory
+
+Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.

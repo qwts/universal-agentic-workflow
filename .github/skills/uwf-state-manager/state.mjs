@@ -42,13 +42,14 @@ import { readFileSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
+import { resolveDbPath } from "./data-dir.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "uwf-state.db");
+const DB_PATH = resolveDbPath(process.argv.slice(2), "uwf-state.db", __dirname);
 const WORKFLOW_SCHEMA_PATH = join(__dirname, "workflow-schema.yaml");
 
 const VALID_PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "closed"];

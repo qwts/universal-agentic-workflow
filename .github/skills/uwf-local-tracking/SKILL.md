@@ -66,3 +66,7 @@ node .github/skills/uwf-local-tracking/issues.mjs close --id I-001
 ## When `next` returns `exhausted: true`
 
 All issues are closed or skipped. Recommend project completion summary and retrospective.
+
+## Data directory
+
+Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.
