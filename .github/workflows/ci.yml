@@ -154,6 +154,14 @@ jobs:
             node "$test_file"
           done
 
+      - name: Run runner tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in scripts/uwf-runner/test/*.test.mjs; do
+            node "$test_file"
+          done
+
   companion:
     name: UWF Companion
     needs: policy
