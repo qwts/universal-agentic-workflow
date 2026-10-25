@@ -179,22 +179,30 @@ async function main(argv) {
       const r = cli(TRACKER, ["reset-from", "--workflow", workflow, "--stage", stages[idx].name], withOut);
       if (!r.ok) throw new UsageError(`reset-from failed: ${r.error}`);
     };
-    // Roll the phase back to what the last earlier stage with advances_phase_to had reached.
+    // Roll the phase back to what the last earlier stage with advances_phase_to had reached
+    // (the very first phase when there is none, so a full rerun starts from scratch).
     const rollbackPhase = (idx) => {
-      const target = stages.slice(0, idx).map((s) => s.advancesTo).filter((p) => PHASES.includes(p)).pop();
+      const target = stages.slice(0, idx).map((s) => s.advancesTo).filter((p) => PHASES.includes(p)).pop() ?? PHASES[0];
       const cur = readPhase();
-      if (!target || !PHASES.includes(cur) || PHASES.indexOf(cur) <= PHASES.indexOf(target)) return;
+      if (!PHASES.includes(cur) || PHASES.indexOf(cur) <= PHASES.indexOf(target)) return;
       const a = cli(STATE, ["rollback", "--to", target, "--agent", AGENT_ID, "--note", `runner: reset from ${stages[idx].name}`], withOut);
       if (!a.ok) log(`[runner] phase rollback to "${target}" not applied: ${a.error}`);
     };
 
-    // A crash between a stage passing and its phase advance leaves the phase behind the tracker.
-    // Catch the phase up (one legal step at a time) so the resumed stages start from the right phase.
+    // The phase must match the completed-stage prefix before resuming. A crash between a stage
+    // passing and its phase advance leaves the phase behind; a crash between reset-from and the
+    // phase rollback (--from-stage) leaves it ahead. Catch up one legal step at a time, or roll back.
     const reconcilePhase = (tracked) => {
-      const reached = stages.filter((st) => isDone(tracked.find((x) => x.stage === st.name)?.status))
-        .map((st) => st.advancesTo).filter((p) => PHASES.includes(p)).pop();
+      const doneStages = [];
+      for (const st of stages) { if (!isDone(tracked.find((x) => x.stage === st.name)?.status)) break; doneStages.push(st); }
+      const reached = doneStages.map((st) => st.advancesTo).filter((p) => PHASES.includes(p)).pop() ?? PHASES[0];
       let cur = readPhase();
-      if (!reached || !PHASES.includes(cur)) return;
+      if (!PHASES.includes(cur)) return;
+      if (PHASES.indexOf(cur) > PHASES.indexOf(reached)) {
+        const a = cli(STATE, ["rollback", "--to", reached, "--agent", AGENT_ID, "--note", `runner resume: phase reconciled to ${reached}`], withOut);
+        if (!a.ok) log(`[runner] phase reconcile to "${reached}" not applied: ${a.error}`);
+        return;
+      }
       while (PHASES.indexOf(cur) < PHASES.indexOf(reached)) {
         const next = PHASES[PHASES.indexOf(cur) + 1];
         const a = cli(STATE, ["advance", "--to", next, "--agent", AGENT_ID, "--note", `runner resume: phase reconciled to ${next}`], withOut);
