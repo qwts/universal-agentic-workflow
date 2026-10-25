@@ -5,6 +5,8 @@
  *   -p <prompt> --output-format json --append-system-prompt <text>
  *   --resume <id> (when sessionId)   --model <m> (when model)
  *   --permission-mode dontAsk --allowedTools <list>   (from `permissions`)
+ *   --setting-sources project  (help: "Comma-separated list of setting sources
+ *     to load (user, project, local)"; a stage never inherits ~/.claude settings)
  * There is no --cwd flag; the working directory is set on the child process.
  *
  * Permission mapping (dontAsk denies anything not allow-listed):
@@ -49,7 +51,7 @@ export async function invokeStage(opts) {
   // needed: dontAsk keeps the user's own pre-approved tools unless --tools
   // narrows the set, so a read-only stage must not depend on ambient settings.
   const toolList = TOOLS[permissions].join(",");
-  args.push("--permission-mode", "dontAsk", "--tools", toolList, "--allowedTools", toolList);
+  args.push("--permission-mode", "dontAsk", "--setting-sources", "project", "--tools", toolList, "--allowedTools", toolList);
 
   return new Promise((done) => {
     let out = "", err = "", timedOut = false, settled = false;
