@@ -154,6 +154,36 @@ jobs:
             node "$test_file"
           done
 
+      - name: Runner tests
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Runner tests (adapters)
+          executable: node
+          arguments-json: '["scripts/uwf-runner/test/adapters.test.mjs"]'
+          working-directory: .
+          timeout-seconds: '300'
+          attempts: '1'
+
+      - name: Runner tests (prompt)
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Runner tests (prompt)
+          executable: node
+          arguments-json: '["scripts/uwf-runner/test/prompt.test.mjs"]'
+          working-directory: .
+          timeout-seconds: '300'
+          attempts: '1'
+
+      - name: Runner tests (runner loop)
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Runner tests (runner loop)
+          executable: node
+          arguments-json: '["scripts/uwf-runner/test/runner.test.mjs"]'
+          working-directory: .
+          timeout-seconds: '300'
+          attempts: '1'
+
   companion:
     name: UWF Companion
     needs: policy

@@ -22,6 +22,14 @@ const ALL_STAGES = ["intake", "discovery", "requirements", "adr", "risk-plan", "
 const SKIPPED = ["adr", "security-plan"];
 
 let failures = 0;
+
+// Every scratch base is registered here and removed on exit, including after an uncaught
+// exception, so a failing run does not leave uwf-runner-test-* dirs behind in tmpdir().
+const scratchBases = [];
+process.on("exit", () => {
+  for (const d of scratchBases) rmSync(d, { recursive: true, force: true });
+});
+
 function check(label, cond, detail = "") {
   if (cond) console.log(`  ok   ${label}`);
   else { failures++; console.log(`  FAIL ${label} ${detail}`); }
@@ -29,6 +37,7 @@ function check(label, cond, detail = "") {
 
 function scratch() {
   const base = mkdtempSync(join(tmpdir(), "uwf-runner-test-"));
+  scratchBases.push(base);
   return { base, repo: join(base, "repo"), data: join(base, "data"), fixtures: join(base, "fixtures") };
 }
 
@@ -48,10 +57,15 @@ function skillJson(script, args, s) {
 
 function setup() {
   const s = scratch();
-  cpSync(FIXTURES, s.fixtures, { recursive: true });
-  cpSync(join(ROOT, ".github", "agents"), join(s.repo, ".github", "agents"), { recursive: true });
-  // stage-tracker resolves stages.yaml relative to cwd, so the scratch repo needs the persona dir.
-  cpSync(join(SKILLS, "uwf-sw_dev"), join(s.repo, ".github", "skills", "uwf-sw_dev"), { recursive: true });
+  try {
+    cpSync(FIXTURES, s.fixtures, { recursive: true });
+    cpSync(join(ROOT, ".github", "agents"), join(s.repo, ".github", "agents"), { recursive: true });
+    // stage-tracker resolves stages.yaml relative to cwd, so the scratch repo needs the persona dir.
+    cpSync(join(SKILLS, "uwf-sw_dev"), join(s.repo, ".github", "skills", "uwf-sw_dev"), { recursive: true });
+  } catch (e) {
+    rmSync(s.base, { recursive: true, force: true });
+    throw e;
+  }
   return s;
 }
 
@@ -115,6 +129,35 @@ function transcripts(s) {
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
+// 2b. Gate fails once, retry passes ------------------------------------------
+{
+  console.log("# review fails once then passes");
+  const s = setup();
+  try {
+    const fxPath = join(s.fixtures, "review.json");
+    const good = JSON.parse(readFileSync(fxPath, "utf8"));
+    // Attempt 1 omits the required review output; attempt 2 writes it.
+    writeFileSync(fxPath, JSON.stringify({
+      attempts: [
+        { files: {}, transcript: "review: first pass, output not written" },
+        { files: good.files, transcript: good.transcript },
+      ],
+    }));
+    const r = run(s);
+    check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
+    check("gate FAIL on attempt 1 names the missing file", /\[11\/15\] review gate: FAIL — .*issues-review\.md/.test(r.err));
+    check("retry prompt carries the gate failure", transcripts(s).some((t) => t.prompt.includes("Gate failure (retry 1 of 3)")));
+    check("review row shows attempts=2 and passed", /^review\s+2\s+passed/m.test(r.out), r.out.split("\n").find((l) => l.startsWith("review")) ?? "(no row)");
+    check("review gate PASS on attempt 2", r.err.includes("[11/15] review gate: PASS"));
+    const tracked = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
+    const review = (tracked?.state ?? []).find((x) => x.stage === "review");
+    check("review stage ends passed in the tracker", review?.status === "passed", JSON.stringify(review));
+    check("later stages ran", r.err.includes("[15/15] retro"));
+    const state = skillJson("uwf-state-manager/state.mjs", ["read"], s);
+    check("state phase is closed", state?.state?.phase === "closed", JSON.stringify(state?.state?.phase));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 // 3. Dry run ---------------------------------------------------------------------
 {
   console.log("# dry run");
@@ -142,6 +185,13 @@ function transcripts(s) {
     check("required question stops with exit 3", r.code === 3, `${r.code} ${r.err.slice(-300)}`);
     const list = skillJson("uwf-question-protocol/questions.mjs", ["list", "--stage", "discovery"], s);
     check("question logged", JSON.stringify(list).includes("Which widget?"));
+    const pending = skillJson("uwf-question-protocol/questions.mjs", ["list", "--stage", "discovery", "--status", "pending"], s);
+    const pendingQs = pending?.questions ?? [];
+    check("exactly one pending required question", pendingQs.length === 1 && Boolean(pendingQs[0].required), JSON.stringify(pending));
+    const tracked = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
+    const discoveryRow = (tracked?.state ?? []).find((x) => x.stage === "discovery");
+    check("discovery stage left active in the tracker", discoveryRow?.status === "active", JSON.stringify(discoveryRow));
+    check("no later stage was started", !(tracked?.state ?? []).some((x) => x.stage === "requirements" && x.status !== "pending"));
     const resumed = run(s, ["--from-stage", "discovery"]);
     check("rerun without answer is blocked up front (exit 3)", resumed.code === 3 && resumed.err.includes("pending required question"), resumed.err.slice(-300));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
