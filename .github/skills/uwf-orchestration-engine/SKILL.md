@@ -404,3 +404,7 @@ stages:
 | `Stage Sequence` | Ordered table: `# \| Stage \| Subagent \| Purpose` — gate logic lives in `stages.yaml` |
 | `Subagent Roster` | List of all subagent names this persona uses |
 | `Artifact Prefix` | The filename prefix for all generated artifacts |
+
+## Data directory
+
+Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.

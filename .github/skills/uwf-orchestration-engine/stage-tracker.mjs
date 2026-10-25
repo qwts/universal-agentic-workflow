@@ -38,13 +38,13 @@ import { execFileSync, execSync } from "node:child_process";
 import { resolve, join, dirname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
+import { resolveDataDir, resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DB_PATH = join(__dirname, "uwf-stages.db");
 const SCHEMA_PATH = join(__dirname, "stage-schema.yaml");
 const STAGE_CONTRACTS_DIR = join(__dirname, "stage-contracts");
 const TRAITS_DIR = join(__dirname, "..", "uwf-traits", "traits");
@@ -206,10 +206,9 @@ const [command, ...rest] = args;
 const flags = parseFlags(rest);
 
 const workflow   = flags["workflow"];
-const outputPath = flags["output-path"] ?? "./tmp/workflow-artifacts";
-const DB_PATH = flags["db-path"]
-  ? resolve(String(flags["db-path"]))
-  : DEFAULT_DB_PATH;
+const dataDirFlag = resolveDataDir(flags, undefined);
+const outputPath = flags["output-path"] ?? (dataDirFlag ? join(dataDirFlag, "workflow-artifacts") : "./tmp/workflow-artifacts");
+const DB_PATH = resolveDbPath(flags, "uwf-stages.db", __dirname);
 
 if (!command) usageError("No command provided.");
 
@@ -571,12 +570,14 @@ function evaluateCheck(check) {
       }
       const cmd = resolveTemplates(rawCmd);
       if (!cmd) return `${check.label ?? "run_script"} is missing cmd`;
+      // Gate subprocesses read the same run's stores: forward the chosen data dir.
+      const env = { ...process.env, ...(dataDirFlag ? { UWF_DATA_DIR: dataDirFlag } : {}) };
       try {
         if (Array.isArray(check.args)) {
           const scriptArgs = check.args.map((arg) => resolveTemplates(String(arg)));
-          execFileSync(cmd, scriptArgs, { stdio: "pipe" });
+          execFileSync(cmd, scriptArgs, { stdio: "pipe", env });
         } else {
-          execSync(cmd, { stdio: "pipe" });
+          execSync(cmd, { stdio: "pipe", env });
         }
         return null;
       } catch (err) {

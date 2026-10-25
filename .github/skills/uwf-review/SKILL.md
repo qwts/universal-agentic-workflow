@@ -176,3 +176,7 @@ The stage gate checks for `verdict: approved` in the output markdown file (e.g. 
 | `--verdict` not in allowed set | Reject with validation error |
 | Review `id` not found | Return not-found error |
 | Finding `id` not found | Return not-found error |
+
+## Data directory
+
+Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.

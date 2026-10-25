@@ -28,12 +28,13 @@
 
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
+import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
 import { readFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "uwf-questions.db");
+const DB_PATH = resolveDbPath(process.argv.slice(2), "uwf-questions.db", __dirname);
 const SCHEMA_PATH = join(__dirname, "questions-schema.yaml");
 
 // ---------------------------------------------------------------------------

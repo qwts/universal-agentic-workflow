@@ -35,12 +35,12 @@
 
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
+import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
 import { readFileSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DB_PATH = join(__dirname, "uwf-discoveries.db");
 const SCHEMA_PATH = join(__dirname, "discovery-schema.yaml");
 
 const VALID_CATEGORIES = [
@@ -75,9 +75,7 @@ for (let i = 1; i < args.length; i++) {
     }
   }
 }
-const DB_PATH = flags["db-path"]
-  ? resolve(String(flags["db-path"]))
-  : DEFAULT_DB_PATH;
+const DB_PATH = resolveDbPath(flags, "uwf-discoveries.db", __dirname);
 
 // ---------------------------------------------------------------------------
 // Output helpers

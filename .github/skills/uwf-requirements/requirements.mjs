@@ -36,12 +36,12 @@
 
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
+import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
 import { readFileSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DB_PATH = join(__dirname, "uwf-requirements.db");
 const SCHEMA_PATH = join(__dirname, "requirements-schema.yaml");
 
 const VALID_TYPES = ["functional", "non_functional", "data", "acceptance_criteria", "risk"];
@@ -78,9 +78,7 @@ for (let i = 1; i < args.length; i++) {
     }
   }
 }
-const DB_PATH = flags["db-path"]
-  ? resolve(String(flags["db-path"]))
-  : DEFAULT_DB_PATH;
+const DB_PATH = resolveDbPath(flags, "uwf-requirements.db", __dirname);
 
 // ---------------------------------------------------------------------------
 // Output helpers

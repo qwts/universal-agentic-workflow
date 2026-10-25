@@ -137,3 +137,7 @@ accepted → deprecated
 | ADR `id` not found | Return not-found error |
 | Superseding ADR `id` not found | Return not-found error |
 | No update fields provided | Return usage error |
+
+## Data directory
+
+Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.
