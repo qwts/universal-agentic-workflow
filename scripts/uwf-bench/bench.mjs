@@ -12,7 +12,7 @@
  * run is recorded and never stops the matrix. Exit codes: 0 ok | 2 usage or config error.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -187,11 +187,39 @@ const sum = (rows, k) => (rows.some((r) => r[k] != null) ? rows.reduce((a, r) =>
 // One run
 // ---------------------------------------------------------------------------
 
+/**
+ * Run the runner in its own process group and, on the whole-run timeout, kill the whole group:
+ * the adapters start their CLIs detached, so killing only the runner would leave a live agent
+ * spending budget and editing the fixture while the harness collects results and cleans up.
+ */
+export function runProcess(args, { cwd, env, timeout }) {
+  return new Promise((done) => {
+    let out = "", err = "", timedOut = false, settled = false;
+    const child = spawn(process.execPath, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+    const killTree = () => {
+      try { if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
+      catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+    };
+    const timer = timeout ? setTimeout(() => { timedOut = true; killTree(); }, timeout) : null;
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    const finish = (status, signal, error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      done({ status: timedOut ? null : status, signal, stdout: out, stderr: err, timedOut, error });
+    };
+    child.on("error", (e) => finish(null, null, e));
+    // "close" (not "exit") waits for the pipes, which the killed group releases.
+    child.on("close", (status, signal) => finish(status, signal));
+  });
+}
+
 const FAILURE = { 0: "none", 1: "model_failure", 2: "harness_error", 3: "harness_error" };
 const STATE = { 0: "complete", 1: "gate_blocked", 2: "usage_error", 3: "questions_pending" };
 
 /** Execute one planned run and return { run, outcomes } ready for insertRun. Never throws. */
-export function executeRun(matrix, entry, ctx) {
+export async function executeRun(matrix, entry, ctx) {
   const { cell, fixture, run_index, block } = entry;
   const base = {
     cell: cell.name, workflow: matrix.workflow, adapter: cell.adapter, model: cell.model ?? null, state_location: cell.state_location,
@@ -219,8 +247,8 @@ export function executeRun(matrix, entry, ctx) {
       "--timeout-ms", String(matrix.timeout_ms)];
     const env = { ...process.env, UWF_DATA_DIR: "" };
     if (cell.fake_fixture_dir) env.UWF_FAKE_FIXTURE_DIR = resolve(ctx.baseDir, cell.fake_fixture_dir);
-    const r = spawnSync(process.execPath, args, { cwd: repo, env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: matrix.timeout_ms * 30 });
-    if (r.error && r.status === null && r.signal === null) throw r.error;
+    const r = await runProcess(args, { cwd: repo, env, timeout: matrix.timeout_ms * 30 });
+    if (r.error) throw r.error;
     const code = r.status;
     const transcripts = readTranscripts(dataDir);
     outcomes = buildOutcomes(readStageRuns(dataDir, matrix.workflow), transcripts, ctx.gated);
@@ -259,7 +287,7 @@ function acceptance(cmd, cwd, timeout) {
 // Commands
 // ---------------------------------------------------------------------------
 
-function cmdRun(flags) {
+async function cmdRun(flags) {
   if (!flags.matrix) throw new UsageError("--matrix is required");
   const matrixPath = resolve(flags.matrix);
   if (!existsSync(matrixPath)) throw new UsageError(`matrix not found: ${matrixPath}`);
@@ -275,16 +303,16 @@ function cmdRun(flags) {
   };
   const plan = planRuns(matrix);
   const counts = {};
-  plan.forEach((entry, i) => {
+  for (const [i, entry] of plan.entries()) {
     const { cell, fixture, run_index } = entry;
     const tag = `[${i + 1}/${plan.length}] ${cell.name} ${fixture.name} #${run_index}`;
-    if (flags.resume === true && hasRun(db, cell.name, fixture.name, run_index)) { log(`${tag}: already in db, skipped (--resume)`); return; }
-    const { run, outcomes } = executeRun(matrix, entry, ctx);
+    if (flags.resume === true && hasRun(db, cell.name, fixture.name, run_index)) { log(`${tag}: already in db, skipped (--resume)`); continue; }
+    const { run, outcomes } = await executeRun(matrix, entry, ctx);
     insertRun(db, run, outcomes);
     const key = run.failure_class ?? run.terminal_state;
     counts[key] = (counts[key] ?? 0) + 1;
     log(`${tag}: ${run.terminal_state} (${run.failure_class ?? "-"}) ${(run.wall_seconds ?? 0).toFixed(1)}s`);
-  });
+  }
   db.close();
   log(`[bench] done: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ") || "nothing to run"}`);
   return 0;
@@ -330,8 +358,8 @@ function main(argv) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { process.exitCode = main(process.argv.slice(2)); } catch (e) {
+  Promise.resolve().then(() => main(process.argv.slice(2))).then((code) => { process.exitCode = code; }).catch((e) => {
     log(`[bench] ${e instanceof UsageError ? e.message : `internal error: ${e.stack ?? e}`}`);
     process.exitCode = 2;
-  }
+  });
 }

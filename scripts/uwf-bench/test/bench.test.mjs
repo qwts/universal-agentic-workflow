@@ -49,6 +49,8 @@ const query = (dbPath, sql) => {
   let dots = "";
   try { loadMatrix("fixtures:\n  - name: ..\n    repo: r\n    goal: g\ncells:\n  - name: .\n    adapter: fake\n    state_location: cli\n"); } catch (e) { dots = e.message; }
   check("validation rejects . and .. as names", /fixture name must be/.test(dots) && /cell name must be/.test(dots), dots);
+  const annotated = parseYamlSubset("runs_per_cell: 5 # pilot\nblock_randomize: true # randomize execution\nseed: ~ # none\nname: \"a # b\" # tail\n");
+  check("inline comments stripped before typing unquoted scalars, kept inside quotes", annotated.runs_per_cell === 5 && annotated.block_randomize === true && annotated.seed === null && annotated.name === "a # b", JSON.stringify(annotated));
   const u = extractUsage({ stdout: JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 7, cache_creation_input_tokens: 3 }, total_cost_usd: 0.25, modelUsage: { "claude-x": {} } }) });
   check("claude transcript usage incl. cache and cost", u.tokens_input === 10 && u.tokens_output === 5 && u.tokens_cache_read === 7 && u.tokens_cache_write === 3 && u.cost_usd === 0.25 && u.model === "claude-x", JSON.stringify(u));
   check("fake transcript usage is all null", Object.values(extractUsage({ stdout: "intake: done" })).every((v) => v === null));
