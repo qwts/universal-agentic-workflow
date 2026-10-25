@@ -570,12 +570,14 @@ function evaluateCheck(check) {
       }
       const cmd = resolveTemplates(rawCmd);
       if (!cmd) return `${check.label ?? "run_script"} is missing cmd`;
+      // Gate subprocesses read the same run's stores: forward the chosen data dir.
+      const env = { ...process.env, ...(dataDirFlag ? { UWF_DATA_DIR: dataDirFlag } : {}) };
       try {
         if (Array.isArray(check.args)) {
           const scriptArgs = check.args.map((arg) => resolveTemplates(String(arg)));
-          execFileSync(cmd, scriptArgs, { stdio: "pipe" });
+          execFileSync(cmd, scriptArgs, { stdio: "pipe", env });
         } else {
-          execSync(cmd, { stdio: "pipe" });
+          execSync(cmd, { stdio: "pipe", env });
         }
         return null;
       } catch (err) {

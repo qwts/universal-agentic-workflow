@@ -6,7 +6,11 @@ Context:
   "role": "issues",
   "phase": "closed",
   "outputPath": "/OUT",
-  "statePath": "/DATA/uwf-state.json"
+  "statePath": "/DATA/uwf-state.json",
+  "inputs": [],
+  "outputs": [
+    "/OUT/issues-retro.md"
+  ]
 }
 
 ## Inputs

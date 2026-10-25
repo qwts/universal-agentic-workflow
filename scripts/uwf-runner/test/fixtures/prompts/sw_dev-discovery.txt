@@ -7,6 +7,12 @@ Context:
   "phase": "discovery",
   "outputPath": "/OUT",
   "statePath": "/DATA/uwf-state.json",
+  "inputs": [
+    "/OUT/issues-intake.md"
+  ],
+  "outputs": [
+    "/OUT/issues-discovery.md"
+  ],
   "stage_type": "discovery",
   "trait_ids": [
     "sw_dev"

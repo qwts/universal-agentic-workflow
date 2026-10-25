@@ -37,12 +37,12 @@
  */
 
 import Database from "better-sqlite3";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
-import { resolveDbPath } from "./data-dir.mjs";
+import { resolveDataDir, resolveDbPath } from "./data-dir.mjs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -56,7 +56,11 @@ const VALID_PHASES = ["idea", "intake", "discovery", "planning", "execution", "a
 const VALID_STATUSES = ["idle", "active", "blocked"];
 const PHASE_ORDER = Object.fromEntries(VALID_PHASES.map((p, i) => [p, i]));
 
-const DEFAULT_OUTPUT_PATH = "./tmp/workflow-artifacts";
+// Same rule as stage-tracker.mjs: artifacts live under <data-dir>/workflow-artifacts
+// when a data dir is chosen, else the shared ./tmp/workflow-artifacts.
+const DATA_DIR = resolveDataDir(process.argv.slice(2), undefined);
+const DEFAULT_OUTPUT_PATH = DATA_DIR ? join(DATA_DIR, "workflow-artifacts") : "./tmp/workflow-artifacts";
+const CHILD_ENV = { ...process.env, ...(DATA_DIR ? { UWF_DATA_DIR: DATA_DIR } : {}) };
 
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -372,7 +376,9 @@ function cmdSetModelProfile(db) {
 }
 
 function cmdSync(db) {
-  const raw = execSync("node .github/skills/uwf-local-tracking/issues.mjs list", { encoding: "utf8" });
+  // Read the issues store of the same run: forward the data dir to the child.
+  const issuesCli = join(__dirname, "..", "uwf-local-tracking", "issues.mjs");
+  const raw = execFileSync(process.execPath, [issuesCli, "list"], { encoding: "utf8", env: CHILD_ENV });
   const { issues } = JSON.parse(raw);
   const counts = { open: 0, active: 0, closed: 0 };
   for (const iss of (issues ?? [])) {

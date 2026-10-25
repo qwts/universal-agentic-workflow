@@ -15,7 +15,7 @@
  * Exit codes: 0 ok, 2 usage error.
  */
 
-import { existsSync, readFileSync, globSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, globSync as fsGlobSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,46 @@ function loadYaml(repoRoot) {
 }
 
 export class PromptError extends Error {}
+
+// Node 20 has no fs.globSync (added in 22). The stage inputs only use simple
+// patterns such as docs/adr/ADR-[0-9]*.md, so a small matcher covers the
+// supported runtime; fs.globSync is used when available.
+function globToRegExp(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") { re += ".*"; i++; if (glob[i + 1] === "/") i++; }
+      else re += "[^/]*";
+    } else if (c === "?") re += "[^/]";
+    else if (c === "[") { const j = glob.indexOf("]", i); if (j > i) { re += glob.slice(i, j + 1); i = j; } else re += "\\["; }
+    else re += c.replace(/[.+^${}()|\\]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function walk(dir, out = []) {
+  let entries = [];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walk(p, out); else out.push(p);
+  }
+  return out;
+}
+
+export function globFiles(pattern, cwd) {
+  if (typeof fsGlobSync === "function" && !process.env.UWF_FORCE_GLOB_FALLBACK) return fsGlobSync(pattern, { cwd });
+  const abs = resolve(cwd, pattern);
+  const segs = abs.split("/");
+  const firstGlob = segs.findIndex((s) => /[*?[{]/.test(s));
+  if (firstGlob === -1) return existsSync(abs) ? [abs] : [];
+  const base = segs.slice(0, firstGlob).join("/") || "/";
+  const re = globToRegExp(abs);
+  const deep = segs.slice(firstGlob).some((s) => s.includes("**")) || segs.length - firstGlob > 1;
+  const candidates = deep ? walk(base) : (() => { try { return readdirSync(base).map((n) => join(base, n)); } catch { return []; } })();
+  return candidates.filter((f) => re.test(f) && (() => { try { return statSync(f).isFile(); } catch { return false; } })());
+}
 
 const readYaml = (yaml, p) => (existsSync(p) ? yaml.load(readFileSync(p, "utf8")) : null);
 
@@ -121,8 +161,11 @@ function personaRole(skills, workflow) {
 
 export async function materializePrompt({ workflow, stage, repoRoot, outputPath, dataDir, extraContext, modelProfile } = {}) {
   repoRoot = resolve(repoRoot ?? DEFAULT_REPO);
-  dataDir = dataDir ?? process.env.UWF_DATA_DIR ?? "./tmp/uwf";
-  outputPath = outputPath ?? join(dataDir, "workflow-artifacts");
+  // Match stage-tracker.mjs: artifacts live under <data-dir>/workflow-artifacts
+  // only when a data dir was chosen; otherwise the shared ./tmp/workflow-artifacts.
+  const chosenDataDir = dataDir ?? process.env.UWF_DATA_DIR;
+  dataDir = chosenDataDir ?? "./tmp/uwf";
+  outputPath = outputPath ?? (chosenDataDir ? join(chosenDataDir, "workflow-artifacts") : "./tmp/workflow-artifacts");
   if (!workflow || !stage) throw new PromptError("workflow and stage are required");
 
   const yaml = loadYaml(repoRoot);
@@ -148,7 +191,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, outputPath,
 
   const abs = (p) => resolve(repoRoot, p);
   const expand = (p) =>
-    /[*?[{]/.test(p) ? globSync(p, { cwd: repoRoot }).map(abs).sort() : existsSync(abs(p)) ? [abs(p)] : [];
+    /[*?[{]/.test(p) ? globFiles(p, repoRoot).map(abs).sort() : existsSync(abs(p)) ? [abs(p)] : [];
   const inputsMissing = [];
   const inputBlocks = [];
   for (const p of inputs) {
@@ -172,6 +215,8 @@ export async function materializePrompt({ workflow, stage, repoRoot, outputPath,
     phase: stageDef.advances_phase_to ?? stage,
     outputPath,
     statePath: join(dataDir, "uwf-state.json"),
+    inputs,
+    outputs,
   };
   if (resolved) {
     Object.assign(ctx, {
