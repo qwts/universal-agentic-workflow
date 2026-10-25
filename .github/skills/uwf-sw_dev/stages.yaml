@@ -20,6 +20,7 @@ stages:
     traits:
       - sw_dev
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: intake
@@ -66,6 +67,7 @@ stages:
     traits:
       - sw_dev
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: discovery
@@ -83,6 +85,7 @@ stages:
   - name: requirements
     agent: uwf-core-requirements
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -99,6 +102,7 @@ stages:
   - name: adr
     agent: uwf-core-adr
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -121,6 +125,7 @@ stages:
   - name: risk-plan
     agent: uwf-core-risk-planner
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -140,6 +145,7 @@ stages:
   - name: security-plan
     agent: uwf-core-security-plan
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -165,6 +171,7 @@ stages:
   - name: test-plan
     agent: uwf-core-test-planner
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -183,6 +190,7 @@ stages:
   - name: blueprint
     agent: uwf-core-blueprint
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -209,6 +217,7 @@ stages:
   - name: work-plan
     agent: uwf-sw_dev-work-planner
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: planning
@@ -230,6 +239,7 @@ stages:
   - name: implementation
     agent: uwf-issue-implementer
     max_retries: 1
+    max_turns: 30
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: execution
@@ -247,6 +257,7 @@ stages:
   - name: review
     agent: uwf-sw_dev-reviewer
     max_retries: 3
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
@@ -274,6 +285,7 @@ stages:
   - name: technical-writing
     agent: uwf-core-technical-writer
     max_retries: 1
+    max_turns: 20
     on_gate_failure: abort
     run_as_subagent: true
     inputs:
@@ -284,6 +296,7 @@ stages:
   - name: acceptance
     agent: uwf-core-acceptance
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: acceptance
@@ -312,6 +325,7 @@ stages:
   - name: snapshot
     agent: uwf-core-snapshot
     max_retries: 2
+    max_turns: 20
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: snapshot
@@ -343,6 +357,7 @@ stages:
   - name: retro
     agent: uwf-core-retro
     max_retries: 1
+    max_turns: 20
     on_gate_failure: skip
     run_as_subagent: true
     advances_phase_to: closed

@@ -80,6 +80,18 @@ function loadProfiles() {
 /** retry_mode: resume = a retry continues the previous attempt's adapter session; fresh = new session. */
 const RETRY_MODES = ["resume", "fresh"];
 
+/** max_turns: per-stage cap on agent turns (adapter `--max-turns`). Default 20; implementation 30. */
+const DEFAULT_MAX_TURNS = 20;
+const STAGE_MAX_TURNS = { implementation: 30, review: 20 };
+function resolveMaxTurns(stageDef) {
+  const v = stageDef.max_turns;
+  if (v === undefined || v === null) return STAGE_MAX_TURNS[stageDef.name] ?? DEFAULT_MAX_TURNS;
+  if (!Number.isInteger(v) || v <= 0) {
+    fail(`Stage "${stageDef.name}": max_turns must be a positive integer, got ${JSON.stringify(v)}.`);
+  }
+  return v;
+}
+
 const QUESTION_POLICY_ORDER = ["minimal", "standard", "aggressive"];
 const EVIDENCE_THRESHOLD_ORDER = ["low", "standard", "high"];
 
@@ -334,6 +346,7 @@ function cmdListStages(db) {
       name,
       maxRetries: max_retries ?? 2,
       retryMode: retry_mode,
+      maxTurns: resolveMaxTurns(stageDef),
       onGateFailure: on_gate_failure ?? "retry",
       gated: gated !== false,
       conditional: conditional === true,
@@ -387,6 +400,7 @@ function cmdGatePrescriptions() {
     on_gate_failure: s.on_gate_failure ?? "retry",
     max_retries: s.max_retries ?? 2,
     retry_mode: s.retry_mode ?? "resume",
+    max_turns: resolveMaxTurns(s),
     checks: (s.gate?.checks ?? []).map((c) => ({ type: c.type, label: c.label ?? null, prescription: prescribeCheck(c, null) })),
   }));
   process.stdout.write(JSON.stringify({ workflow, stages: out }, null, 2) + "\n");

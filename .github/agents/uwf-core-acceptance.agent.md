@@ -11,4 +11,4 @@ Read `.github/skills/uwf-review/SKILL.md`. Use `reviews.mjs start --role {role} 
 
 Unlike the review stage, acceptance MAY use `execute` tools to run verification commands (tests, linters, build checks). Log the outcome of each check as a finding — failures as `critical`, warnings as `minor`.
 
-Also write the structured result `{output_path}/{prefix}-acceptance.result.json` (schema: `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json`; see step 7 of `uwf-review/SKILL.md`) alongside the markdown. The gate requires both.
+Also write the structured result `{output_path}/{prefix}-acceptance.result.json` (schema: `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json`; see step 6 of `uwf-review/SKILL.md`) alongside the markdown. The gate requires both.
