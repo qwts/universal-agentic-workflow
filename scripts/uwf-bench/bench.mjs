@@ -16,7 +16,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hasRun, insertRating, insertRun, openDb, tableCsv } from "./db.mjs";
 import { openSqlite } from "./sqlite.mjs";
@@ -203,6 +203,7 @@ export function executeRun(matrix, entry, ctx) {
       notes: "no-CLI protocol is not implemented (later issue); run skipped" }, outcomes: [] };
   }
   const dir = join(ctx.work, cell.name, fixture.name, String(run_index));
+  if (!(dir + sep).startsWith(resolve(ctx.work) + sep)) throw new Error(`run directory escapes the work dir: ${dir}`);
   const repo = join(dir, "repo");
   const dataDir = join(dir, "data");
   const t0 = Date.now();

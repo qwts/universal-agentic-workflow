@@ -46,6 +46,9 @@ const query = (dbPath, sql) => {
   let msg = "";
   try { loadMatrix("cells:\n  - name: a\n    adapter: fake\n    state_location: maybe\n"); } catch (e) { msg = e.message; }
   check("validation rejects bad matrix", /fixtures: at least one/.test(msg) && /state_location/.test(msg), msg);
+  let dots = "";
+  try { loadMatrix("fixtures:\n  - name: ..\n    repo: r\n    goal: g\ncells:\n  - name: .\n    adapter: fake\n    state_location: cli\n"); } catch (e) { dots = e.message; }
+  check("validation rejects . and .. as names", /fixture name must be/.test(dots) && /cell name must be/.test(dots), dots);
   const u = extractUsage({ stdout: JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 7, cache_creation_input_tokens: 3 }, total_cost_usd: 0.25, modelUsage: { "claude-x": {} } }) });
   check("claude transcript usage incl. cache and cost", u.tokens_input === 10 && u.tokens_output === 5 && u.tokens_cache_read === 7 && u.tokens_cache_write === 3 && u.cost_usd === 0.25 && u.model === "claude-x", JSON.stringify(u));
   check("fake transcript usage is all null", Object.values(extractUsage({ stdout: "intake: done" })).every((v) => v === null));

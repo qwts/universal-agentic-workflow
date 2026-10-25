@@ -55,6 +55,9 @@ export function parseYamlSubset(text) {
  *   timeout_ms:number, seed:number|null, block_randomize:boolean}} Matrix
  */
 
+/** Names become run-directory components: one plain segment, never `.`/`..`, no separators. */
+export const safeName = (n) => typeof n === "string" && /^[A-Za-z0-9][\w.-]*$/.test(n) && n !== "." && n !== "..";
+
 /** Validate a parsed matrix and apply defaults. @returns {Matrix} */
 export function validateMatrix(doc) {
   const errs = [];
@@ -65,12 +68,12 @@ export function validateMatrix(doc) {
   const fixtures = Array.isArray(doc.fixtures) ? doc.fixtures : [];
   const cells = Array.isArray(doc.cells) ? doc.cells : [];
   for (const f of fixtures) {
-    need(typeof f.name === "string" && /^[\w.-]+$/.test(f.name), `fixture name must match [\\w.-]+: ${f.name}`);
+    need(safeName(f.name), `fixture name must be a plain path segment [A-Za-z0-9][\\w.-]*, not . or ..: ${f.name}`);
     need(typeof f.repo === "string" && f.repo, `fixture ${f.name}: repo required`);
     need(typeof f.goal === "string" && f.goal, `fixture ${f.name}: goal required`);
   }
   for (const c of cells) {
-    need(typeof c.name === "string" && /^[\w.-]+$/.test(c.name), `cell name must match [\\w.-]+: ${c.name}`);
+    need(safeName(c.name), `cell name must be a plain path segment [A-Za-z0-9][\\w.-]*, not . or ..: ${c.name}`);
     need(typeof c.adapter === "string" && c.adapter, `cell ${c.name}: adapter required`);
     need(STATE_LOCATIONS.includes(c.state_location), `cell ${c.name}: state_location must be ${STATE_LOCATIONS.join("|")}`);
   }
