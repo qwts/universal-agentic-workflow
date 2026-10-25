@@ -1,0 +1,20 @@
+Run the retro stage for the sw_dev workflow.
+
+Context:
+{
+  "workflow": "sw_dev",
+  "role": "issues",
+  "phase": "closed",
+  "outputPath": "/OUT",
+  "statePath": "/DATA/uwf-state.json",
+  "inputs": [],
+  "outputs": [
+    "/OUT/issues-retro.md"
+  ]
+}
+
+## Inputs
+(none)
+
+## Required outputs
+- /OUT/issues-retro.md
