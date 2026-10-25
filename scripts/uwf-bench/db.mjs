@@ -1,11 +1,11 @@
 /**
- * results.db schema and inserts for uwf-bench (node:sqlite, no dependencies).
+ * results.db schema and inserts for uwf-bench (better-sqlite3 via the engine skill, see sqlite.mjs).
  * Fields follow docs/research/cli-offload-design.md section 11. Anything a run cannot fill is NULL.
  */
 
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { openSqlite } from "./sqlite.mjs";
 
 export const SCHEMA_VERSION = 1;
 export const DIMENSIONS = ["plan_completeness", "review_accuracy", "acceptance_correctness"];
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS ratings (
 /** Open (creating) the database and ensure the schema; safe to call repeatedly. @param {string} path */
 export function openDb(path) {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-  const db = new DatabaseSync(path);
+  const db = openSqlite(path);
   db.exec(DDL);
   if (!db.prepare("SELECT 1 FROM schema_version").get()) db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(SCHEMA_VERSION);
   return db;

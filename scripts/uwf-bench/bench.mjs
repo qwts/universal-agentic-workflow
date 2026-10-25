@@ -18,8 +18,8 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, write
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
 import { hasRun, insertRating, insertRun, openDb, tableCsv } from "./db.mjs";
+import { openSqlite } from "./sqlite.mjs";
 import { loadMatrix, planRuns } from "./matrix.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -56,6 +56,13 @@ const git = (cwd, args) => {
 };
 const sha256 = (path) => { try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; } };
 const isGitDir = (p) => existsSync(join(p, ".git"));
+const isRemote = (repo) => /^[a-z][a-z0-9+.-]*:\/\/|^git@/i.test(repo);
+/** Paths with uncommitted changes (NUL-delimited porcelain, untrimmed so a leading-space status survives). */
+function changedPaths(cwd) {
+  const r = spawnSync("git", ["status", "--porcelain", "-z"], { cwd, encoding: "utf8" });
+  if (r.status !== 0) return [];
+  return r.stdout.split("\0").filter(Boolean).map((e) => e.slice(3));
+}
 
 const cliVersions = new Map();
 /** `claude --version` output for claude-code, else the adapter name (cached per adapter). */
@@ -74,9 +81,10 @@ function cliVersion(adapter) {
 
 /** Fresh copy of the fixture at `dest`: git clone (+ checkout ref) for repos and URLs, plain copy otherwise. */
 export function prepareRepo(fixture, dest, baseDir, workflow) {
-  const src = /^[a-z][a-z0-9+.-]*:\/\/|^git@/i.test(fixture.repo) ? fixture.repo : resolve(baseDir, fixture.repo);
+  const remote = isRemote(fixture.repo);
+  const src = remote ? fixture.repo : resolve(baseDir, fixture.repo);
   mkdirSync(dirname(dest), { recursive: true });
-  if (src === fixture.repo || isGitDir(src)) {
+  if (remote || isGitDir(src)) {
     const c = spawnSync("git", ["clone", "--quiet", src, dest], { encoding: "utf8" });
     if (c.status !== 0) throw new Error(`git clone failed: ${c.stderr.trim()}`);
     if (fixture.ref) {
@@ -129,7 +137,7 @@ export function readTranscripts(dataDir) {
 export function readStageRuns(dataDir, workflow) {
   const path = join(dataDir, "uwf-stages.db");
   if (!existsSync(path)) return [];
-  const db = new DatabaseSync(path, { readOnly: true });
+  const db = openSqlite(path, { readOnly: true });
   try { return db.prepare("SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id").all(workflow).map((r) => ({ ...r })); } finally { db.close(); }
 }
 
@@ -218,7 +226,7 @@ export function executeRun(matrix, entry, ctx) {
     const first = outcomes.filter((o) => o.gated && !o.skipped && o.attempt === 1);
     const attempts = transcripts.map((t) => t.usage);
     const status = code === null ? "ambiguous" : FAILURE[code] ?? "harness_error";
-    const changed = isGitDir(repo) ? (git(repo, ["status", "--porcelain"]) ?? "").split("\n").map((l) => l.slice(3)) : null;
+    const changed = isGitDir(repo) ? changedPaths(repo) : null;
     run = {
       ...base, model: attempts.find((a) => a.model)?.model ?? base.model, exit_code: code, stderr_tail: r.stderr.slice(-2000),
       tokens_input: sum(attempts, "tokens_input"), tokens_output: sum(attempts, "tokens_output"),

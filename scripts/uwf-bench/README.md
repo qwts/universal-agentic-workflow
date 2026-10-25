@@ -2,7 +2,7 @@
 
 Benchmark harness around `scripts/uwf-runner/runner.mjs` (issue #101). It runs a matrix of
 cells x fixtures x run indexes unattended, records usage and gate outcomes in `results.db`
-(SQLite via `node:sqlite`, no dependencies) and exports CSV for analysis. Field list:
+(SQLite via `better-sqlite3`, the engine skill's own driver, so it runs on Node 20) and exports CSV for analysis. Field list:
 `docs/research/cli-offload-design.md` section 11.
 
 ```sh

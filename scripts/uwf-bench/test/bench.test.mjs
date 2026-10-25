@@ -10,9 +10,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { DatabaseSync } from "node:sqlite";
 import { extractUsage, buildOutcomes } from "../bench.mjs";
 import { parseYamlSubset, planRuns, loadMatrix } from "../matrix.mjs";
+import { openSqlite } from "../sqlite.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..", "..", "..");
@@ -31,7 +31,7 @@ const bench = (args) => {
   return { code: r.status, out: r.stdout, err: r.stderr };
 };
 const query = (dbPath, sql) => {
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = openSqlite(dbPath, { readOnly: true });
   try { return db.prepare(sql).all().map((r) => ({ ...r })); } finally { db.close(); }
 };
 
