@@ -79,13 +79,13 @@ the turn or time cap, or exhausts the budget cap.
 
 ## 4. Fixtures
 
-The three seeded issues in the toy repo `qwts/uwf-toy-app` (an inventory service):
+The three seeded issues in the toy repo `qwts/uwf-toy-app` (an inventory service), one each of feature, bug and refactor:
 
 | Fixture | Issue | Summary |
 | --- | --- | --- |
-| F1 | toy issue 1 | seeded defect 1 (summary to be copied from the toy repo issue before the first run) |
-| F2 | toy issue 2 | "qty cannot go below zero", in `adjust()` |
-| F3 | toy issue 3 | seeded defect 3 (summary to be copied from the toy repo issue before the first run) |
+| F1 | toy issue 1 | feature: `DELETE /items/:id` backed by a new `Inventory.remove(id)`; 204 on success, 404 when unknown, later GET must 404 |
+| F2 | toy issue 2 | bug: `Inventory.adjust()` lets quantity go negative; must throw `RangeError` and leave qty unchanged |
+| F3 | toy issue 3 | refactor: add `Inventory.toJSON()` and have `GET /items` serialize the inventory directly; route behaviour unchanged |
 
 The fixtures are held fixed: same repo commit before each run, same issue text,
 same `--goal` string. Each run starts from a fresh clone at that commit with an
