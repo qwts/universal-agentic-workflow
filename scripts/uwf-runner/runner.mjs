@@ -107,7 +107,8 @@ export function parseQuestions(text) {
 async function main(argv) {
   const { flags, positional } = parseArgs(argv);
   const command = positional[0];
-  if (command !== "run" && command !== "resume") throw new UsageError("Usage: runner.mjs run|resume --workflow <w> [--goal <file|text>] [options]");
+  if (command === "gates") return gatesAudit(flags);
+  if (command !== "run" && command !== "resume") throw new UsageError("Usage: runner.mjs run|resume|gates --workflow <w> [--goal <file|text>] [options]");
   if (!flags.workflow) throw new UsageError("--workflow is required");
   if (command === "run" && !flags.goal) throw new UsageError("--goal is required");
   if (command === "resume") {
@@ -337,8 +338,10 @@ async function stageLoop(ctx) {
 
       // 6. gate
       let failures;
+      let prescriptions;
       if (!res.ok) {
         failures = [`adapter error: ${res.error ?? "unknown"}`];
+        prescriptions = [`Resolve the adapter error (${res.error ?? "unknown"}) and complete the stage outputs.`];
         log(`${tag} gate: NOT RUN (${failures[0]})`);
       } else {
         const g = cli(runScript, ["--check-gate", st.name], withOut);
@@ -351,9 +354,14 @@ async function stageLoop(ctx) {
           break;
         }
         failures = g.data?.failures ?? [g.error];
+        prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
         log(`${tag} gate: FAIL — ${failures.join("; ")}`);
       }
+      log(`${tag}   attempt ${attempt}/${maxAttempts}; to fix: ${prescriptions[0]}`);
 
+      if (st.onGateFailure === "skip" || st.onGateFailure === "abort") {
+        log(gateSummary(st, failures, prescriptions, st.onGateFailure === "skip" ? "marked the stage skipped and continued" : "marked the stage failed and stopped the run"));
+      }
       if (st.onGateFailure === "skip") {
         cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`], withOut);
         row.result = "skipped (gate failed)";
@@ -367,7 +375,7 @@ async function stageLoop(ctx) {
         row.result = st.onGateFailure === "abort" ? "failed (abort)" : "failed";
         return finish(EXIT.GATE, rows, `${tag}: gate blocked after ${attempt} attempt(s): ${failures.join("; ")}`, note);
       }
-      prompt = `${basePrompt}\n\nGate failure (retry ${attempt} of ${st.maxRetries}): ${failures.join("; ")}`;
+      prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
     }
   }
   return finish(EXIT.OK, rows, "workflow complete", note);
@@ -380,6 +388,47 @@ async function stageLoop(ctx) {
     log(`[runner] phase "${target}" not applied after ${stageName}: ${a.error}`);
     return `phase ${target} not applied`;
   }
+}
+
+/** `gates --workflow <w>`: print every stage's gate checks with the prescription each would give if it failed. */
+function gatesAudit(flags) {
+  if (!flags.workflow) throw new UsageError("--workflow is required");
+  const repoRoot = resolve(flags["repo-root"] ?? OWN_ROOT);
+  const dataDir = mkdtempSync(join(tmpdir(), "uwf-gates-"));
+  try {
+    const r = runCli(TRACKER, ["gate-prescriptions", "--workflow", flags.workflow, "--output-path", "<output_path>", "--data-dir", dataDir],
+      { cwd: repoRoot, env: { UWF_DATA_DIR: dataDir } });
+    if (!r.ok || !Array.isArray(r.data?.stages)) throw new UsageError(`Cannot read gates: ${r.error}`);
+    const out = [`workflow: ${flags.workflow} (placeholders: <output_path> = --output-path, <repo> = repo root)`];
+    for (const s of r.data.stages) {
+      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
+      out.push("", `${s.stage}  (${flagsTxt})`);
+      if (!s.checks.length) out.push("  (no checks)");
+      for (const c of s.checks) out.push(`  - ${c.type}: ${c.prescription.split(repoRoot).join("<repo>")}`);
+    }
+    process.stdout.write(out.join("\n") + "\n");
+    return EXIT.OK;
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+/** The gate failure doubles as the retry prompt, so it says exactly what to produce and what happens next. */
+export function retryPrompt({ basePrompt, stage, retry, maxRetries, prescriptions, transcript }) {
+  const left = maxRetries - retry;
+  const next = left <= 0 ? "this is the final attempt; if the gate still fails, the stage will be marked failed and the run stops"
+    : left === 1 ? "if the gate fails again you get one more attempt"
+    : `if the gate fails again you get ${left} more attempts`;
+  const tail = String(transcript ?? "").split(/\r?\n/).slice(-40).join("\n");
+  return `${basePrompt}\n\n## Gate failure (retry ${retry} of ${maxRetries})\nThe gate for stage ${stage} did not pass.\n` +
+    `${prescriptions.map((p) => `- ${p}`).join("\n")}\n\nWhat happens next: ${next}.\n\n` +
+    `## Your previous attempt (last 40 lines)\n${tail}`;
+}
+
+/** One-paragraph human-readable summary for on_gate_failure abort|skip. */
+function gateSummary(st, failures, prescriptions, did) {
+  return `[runner] Stage ${st.name} gate failed (on_gate_failure: ${st.onGateFailure}). Failures: ${failures.join("; ")}. ` +
+    `What would have fixed it: ${prescriptions.join(" ")} The runner ${did}.`;
 }
 
 function transcriptText(path) {

@@ -6,7 +6,7 @@
  * purpose: they are conditional and the happy path asserts they are skipped, not invoked.
  */
 
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -165,6 +165,12 @@ function transcripts(s) {
     check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
     check("gate FAIL on attempt 1 names the missing file", /\[11\/15\] review gate: FAIL — .*issues-review\.md/.test(r.err));
     check("retry prompt carries the gate failure", transcripts(s).some((t) => t.prompt.includes("Gate failure (retry 1 of 3)")));
+    const retry = transcripts(s).map((t) => t.prompt).find((p) => p?.includes("## Gate failure (retry 1 of 3)")) ?? "";
+    check("retry prompt has the heading, a prescription naming issues-review.md, and the previous attempt",
+      retry.includes("## Gate failure (retry 1 of 3)") && /^- .*issues-review\.md/m.test(retry) && retry.includes("## Your previous attempt")
+      && retry.includes("review: first pass, output not written") && retry.includes("What happens next:"), retry.slice(-500));
+    check("base prompt comes first", retry.indexOf("## Gate failure") > 200, String(retry.indexOf("## Gate failure")));
+    check("trace shows attempts and the first prescription", /review → fake \(attempt 2\/4\)/.test(r.err) && /attempt 1\/4; to fix: .*issues-review\.md/.test(r.err), r.err.slice(-800));
     check("review row shows attempts=2 and passed", /^review\s+2\s+passed/m.test(r.out), r.out.split("\n").find((l) => l.startsWith("review")) ?? "(no row)");
     check("review gate PASS on attempt 2", r.err.includes("[11/15] review gate: PASS"));
     const tracked = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
@@ -369,6 +375,47 @@ function setFixtureExit(s, stage, exitCode) {
     check("unknown adapter exits 2", badAdapter.status === 2);
     const badStage = run(s, ["--from-stage", "nope"]);
     check("unknown --from-stage exits 2", badStage.code === 2);
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+// 6. Prescriptions: every check type, plus the gates audit ----------------------
+{
+  console.log("# prescriptions");
+  const s = scratch();
+  try {
+    const skillDir = join(s.repo, ".github", "skills", "uwf-rx");
+    mkdirSync(skillDir, { recursive: true });
+    const out = "{{output_path}}";
+    const checks = [
+      { type: "require_non_empty", path: `${out}/missing.md`, label: "missing.md" },
+      { type: "require_contains", path: `${out}/present.md`, text: "needle", label: "present.md" },
+      { type: "require_files_with_prefix", dir: `${out}/nodir`, prefix: "ADR-" },
+      { type: "require_file_matching_pattern", dir: `${out}/nodir`, pattern: "\\.spec\\.mjs$" },
+      { type: "run_script", cmd: process.execPath, args: ["-e", "console.error('boom line'); process.exit(3)"], label: "boom" },
+      { type: "require_json_field", path: `${out}/r.json`, pointer: "/verdict", equals: "approved", schema: "stage-result" },
+      { type: "require_json_field", path: `${out}/r.json`, pointer: "/verdict", in: ["approved", "x"] },
+      { type: "require_json_field", path: `${out}/r.json`, pointer: "/a", exists: true },
+    ];
+    const yamlText = "stages:\n  - name: s1\n    max_retries: 4\n    on_gate_failure: skip\n    gated: true\n    gate:\n      checks:\n" +
+      checks.map((c) => `        - ${JSON.stringify(c)}`).join("\n") + "\n";
+    writeFileSync(join(skillDir, "stages.yaml"), yamlText);
+    mkdirSync(join(s.repo, "out"), { recursive: true });
+    writeFileSync(join(s.repo, "out", "present.md"), "no match here");
+    mkdirSync(s.data, { recursive: true });
+    const r = spawnSync(process.execPath, [join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"), "check-gate", "--workflow", "rx",
+      "--stage", "s1", "--output-path", join(s.repo, "out"), "--data-dir", s.data], { encoding: "utf8", cwd: s.repo });
+    let g = null;
+    try { g = JSON.parse(r.stdout); } catch { /* reported below */ }
+    check("gate fails with JSON", r.status === 1 && g?.passed === false, r.stdout + r.stderr);
+    check("prescriptions parallel failures, none empty", Array.isArray(g?.prescriptions) && g.prescriptions.length === checks.length
+      && g.failures.length === checks.length && g.prescriptions.every((p) => typeof p === "string" && p.trim().length > 10), JSON.stringify(g?.prescriptions));
+    check("policy exposed", g?.on_gate_failure === "skip" && g?.max_retries === 4);
+    check("run_script prescription carries the output tail", /exit 0; it currently fails with: .*boom line/.test(g?.prescriptions?.[4] ?? ""), g?.prescriptions?.[4]);
+    check("require_json_field variants", /\/verdict equal to "approved" \(schema: stage-result\)/.test(g?.prescriptions?.[5] ?? "")
+      && /equal to one of/.test(g?.prescriptions?.[6] ?? "") && /\/a present/.test(g?.prescriptions?.[7] ?? ""), JSON.stringify(g?.prescriptions?.slice(5)));
+
+    const a = spawnSync(process.execPath, [RUNNER, "gates", "--workflow", "sw_dev"], { encoding: "utf8" });
+    check("gates audit lists review prescription", a.status === 0 && /^review /m.test(a.stdout) && /issues-review\.md/.test(a.stdout), a.stderr);
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
