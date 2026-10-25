@@ -276,8 +276,8 @@ export async function materializePrompt({ workflow, stage, repoRoot, outputPath,
     JSON.stringify(ctx, null, 2),
     "",
     "## Reading rules",
-    "Read only the files listed under Inputs (the excerpts below are previews; open the file for the rest) plus the files you need to change. " +
-      "Do not list or read the whole artifacts directory or the whole repository, and do not search for files the inputs do not name. " +
+    "Read the files listed under Inputs (the excerpts below are previews; open the file for the rest) plus only the repository files your task requires you to inspect or change. " +
+      "Do not list or read the whole artifacts directory, and do not dump the whole repository into context. " +
       "Write the required outputs directly once you have what you need.",
     "",
     "## Inputs",
