@@ -386,7 +386,15 @@ stages:
           dir: "{{cwd}}/tmp/state"
           pattern: "/open/.*\\.md$"
           label: "open issue files"
+        - type: require_json_field   # structured verdict; exactly one of equals | in | exists
+          path: "{{output_path}}/prefix-review.result.json"
+          pointer: /verdict          # RFC 6901 JSON pointer
+          equals: approved
+          schema: stage-result       # optional; validates against schemas/stage-result.schema.json
+          label: "prefix-review.result.json"
 ```
+
+`require_json_field` fails with `<label> (<path>) pointer <pointer>: observed <value>, expected ...`, or `file missing` / `invalid JSON` / `does not match stage-result schema: ...`. Review and acceptance stages write `<prefix>-<stage>.result.json` (`{ verdict: approved|changes_requested|blocked, findings: [{severity: high|medium|low, summary, location?}], notes? }`) beside their markdown.
 
 **Template variables** available in any `path` or `dir` value:
 

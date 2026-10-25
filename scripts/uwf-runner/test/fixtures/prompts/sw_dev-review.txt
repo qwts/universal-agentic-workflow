@@ -11,7 +11,8 @@ Context:
     "/OUT/issues-plan.md"
   ],
   "outputs": [
-    "/OUT/issues-review.md"
+    "/OUT/issues-review.md",
+    "/OUT/issues-review.result.json"
   ]
 }
 
@@ -21,3 +22,4 @@ Context:
 
 ## Required outputs
 - /OUT/issues-review.md
+- /OUT/issues-review.result.json

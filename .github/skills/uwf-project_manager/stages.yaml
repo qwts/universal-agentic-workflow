@@ -242,6 +242,7 @@ stages:
       - "{{output_path}}/project-roadmap.md"
     outputs:
       - "{{output_path}}/project-review.md"
+      - "{{output_path}}/project-review.result.json"
     gated: true
     gate:
       checks:
@@ -252,6 +253,12 @@ stages:
           path: "{{output_path}}/project-review.md"
           text: "verdict: approved"
           label: "project-review.md"
+        - type: require_json_field
+          path: "{{output_path}}/project-review.result.json"
+          pointer: /verdict
+          equals: approved
+          schema: stage-result
+          label: "project-review.result.json"
 
   - name: issue-state-population
     agent: uwf-core-project-tracking
@@ -278,6 +285,7 @@ stages:
       - "{{output_path}}/project-review.md"
     outputs:
       - "{{output_path}}/project-acceptance.md"
+      - "{{output_path}}/project-acceptance.result.json"
     gated: true
     gate:
       checks:
@@ -288,6 +296,12 @@ stages:
           path: "{{output_path}}/project-acceptance.md"
           text: "verdict: approved"
           label: "project-acceptance.md"
+        - type: require_json_field
+          path: "{{output_path}}/project-acceptance.result.json"
+          pointer: /verdict
+          equals: approved
+          schema: stage-result
+          label: "project-acceptance.result.json"
 
   - name: snapshot
     agent: uwf-core-snapshot

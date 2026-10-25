@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "stage-result.schema.json",
+  "title": "UWF stage result",
+  "description": "Machine-readable verdict written by review and acceptance stages as <prefix>-<stage>.result.json. Checked by the require_json_field gate check (schema: stage-result).",
+  "type": "object",
+  "required": ["verdict", "findings"],
+  "additionalProperties": true,
+  "properties": {
+    "verdict": { "enum": ["approved", "changes_requested", "blocked"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "summary"],
+        "properties": {
+          "severity": { "enum": ["high", "medium", "low"] },
+          "summary": { "type": "string" },
+          "location": { "type": "string" }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

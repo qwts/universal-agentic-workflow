@@ -253,6 +253,7 @@ stages:
       - "{{output_path}}/issues-plan.md"
     outputs:
       - "{{output_path}}/issues-review.md"
+      - "{{output_path}}/issues-review.result.json"
     gated: true
     gate:
       checks:
@@ -263,6 +264,12 @@ stages:
           path: "{{output_path}}/issues-review.md"
           text: "verdict: approved"
           label: "issues-review.md"
+        - type: require_json_field
+          path: "{{output_path}}/issues-review.result.json"
+          pointer: /verdict
+          equals: approved
+          schema: stage-result
+          label: "issues-review.result.json"
 
   - name: technical-writing
     agent: uwf-core-technical-writer
@@ -284,6 +291,7 @@ stages:
       - "{{output_path}}/issues-review.md"
     outputs:
       - "{{output_path}}/issues-acceptance.md"
+      - "{{output_path}}/issues-acceptance.result.json"
     gated: true
     gate:
       checks:
@@ -294,6 +302,12 @@ stages:
           path: "{{output_path}}/issues-acceptance.md"
           text: "verdict: approved"
           label: "issues-acceptance.md"
+        - type: require_json_field
+          path: "{{output_path}}/issues-acceptance.result.json"
+          pointer: /verdict
+          equals: approved
+          schema: stage-result
+          label: "issues-acceptance.result.json"
 
   - name: snapshot
     agent: uwf-core-snapshot
