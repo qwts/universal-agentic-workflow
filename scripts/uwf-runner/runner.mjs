@@ -33,7 +33,7 @@ const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (used to roll the phase back on --from-stage).
-const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "closed"];
+const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
 
 const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3 };

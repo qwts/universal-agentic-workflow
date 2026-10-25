@@ -302,9 +302,8 @@ function setFixtureExit(s, stage, exitCode) {
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
-// Phase changes the runner logged as rejected. The "snapshot" phase is ignored until the state
-// manager learns it (#115): sw_dev's snapshot stage already advances to it.
-const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not applied/.test(l) && !/"snapshot"/.test(l));
+// Phase changes the runner logged as rejected.
+const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not applied/.test(l));
 
 {
   console.log("# resume reconciles a phase left ahead by a crash between reset-from and rollback");
