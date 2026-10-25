@@ -162,6 +162,14 @@ jobs:
             node "$test_file"
           done
 
+      - name: Run bench tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in scripts/uwf-bench/test/*.test.mjs; do
+            node "$test_file"
+          done
+
   companion:
     name: UWF Companion
     needs: policy
