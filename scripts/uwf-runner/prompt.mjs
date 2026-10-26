@@ -338,6 +338,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     prompt,
     permissions: mapPermissions(frontmatter.tools),
     model: stageDef.model ?? null,
+    inputs,
     inputsMissing,
     outputsRequired: outputs,
   };

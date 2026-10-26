@@ -143,11 +143,11 @@ if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
   const root = mkdtempSync(join(tmpdir(), "uwf-adapter-grokbot-"));
   const cwd = join(root, "work"); const dataDir = join(root, "data"); mkdirSync(cwd);
   const env = { UWF_GROKBOT_POLL_MS: "20" };
-  const respond = (body) => setTimeout(() => {
+  const respond = (body, delayMs = 100) => setTimeout(() => {
     const p = JSON.parse(readFileSync(join(dataDir, "grokbot", "pending.json"), "utf8"));
     writeFileSync(join(cwd, "out.md"), "done");
     writeFileSync(p.responsePath, JSON.stringify(body));
-  }, 100);
+  }, delayMs);
   respond({ ok: true, summary: "OK" });
   const r1 = await g.invokeStage({ prompt: "Run the intake stage", cwd, dataDir, env, outputs: ["out.md"] });
   check("ok is true", r1.ok === true, r1.error ?? "");
@@ -161,12 +161,15 @@ if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
   check("agent failure -> ok:false with error", r2.ok === false && /nope/.test(r2.error));
   const r3 = await g.invokeStage({ prompt: "x", cwd, dataDir, env, timeoutMs: 50 });
   check("timeout -> ok:false", r3.ok === false && /timeout/.test(r3.error));
-  // A response that lands after the deadline (but before the next slow poll) is not accepted.
-  respond({ ok: true, summary: "late" });
+  // A response that lands after the deadline but before the next (slow) poll is not accepted: with a 400 ms poll
+  // and a 60 ms timeout the loop sleeps only the remaining 60 ms, then fails on the deadline although the
+  // response (written at 30 ms) is on disk. The responder fires before invokeStage returns, so nothing outlives the test.
+  respond({ ok: true, summary: "late" }, 30);
   const t0 = Date.now();
   const r4 = await g.invokeStage({ prompt: "x", cwd, dataDir, env: { UWF_GROKBOT_POLL_MS: "400" }, timeoutMs: 60 });
-  check("late response after timeout -> ok:false", r4.ok === false && /timeout/.test(r4.error));
+  check("response after the deadline -> ok:false", r4.ok === false && /timeout/.test(r4.error));
   check("sleep is capped at the remaining timeout", Date.now() - t0 < 300, `${Date.now() - t0}ms`);
+  check("the late response was on disk when the loop woke", existsSync(join(dataDir, "grokbot", "responses", "0004-stage.json")));
   rmSync(root, { recursive: true, force: true });
 }
 

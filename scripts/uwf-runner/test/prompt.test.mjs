@@ -40,6 +40,15 @@ await test("missing input is reported with its path", async () => {
   assert.deepEqual(r.outputsRequired, ["/OUT/issues-discovery.md"]);
 });
 
+await test("materialized inputs are returned with templates substituted (what the runner hands adapters)", async () => {
+  const r = await materializePrompt({ workflow: "sw_dev", stage: "discovery", ...opts });
+  assert.ok(Array.isArray(r.inputs) && r.inputs.length > 0, "inputs returned");
+  assert.ok(r.inputs.includes("/OUT/issues-intake.md"), `declared input substituted: ${r.inputs}`);
+  assert.ok(r.inputs.every((p) => !/\{\{/.test(p)), `no unresolved templates: ${r.inputs}`);
+  const e = await materializePrompt({ workflow: "sw_dev", stage: "discovery", ...opts, extraInputs: ["{{output_path}}/review-findings.md"] });
+  assert.ok(e.inputs.includes("/OUT/review-findings.md"), `extra inputs substituted too: ${e.inputs}`);
+});
+
 await test("existing input is excerpted to 12 lines and not reported missing", async () => {
   const out = mkdtempSync(join(tmpdir(), "uwf-prompt-"));
   writeFileSync(join(out, "issues-intake.md"), Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n"));
