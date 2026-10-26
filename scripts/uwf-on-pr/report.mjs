@@ -62,18 +62,32 @@ export function parseLog(text) {
     }
     if (block.length) rows = block;
   }
-  let gate = null;
-  let prescription = null;
+  // Gate outcomes per stage in log order: a later PASS clears a recovered failure, and the blocking
+  // stage is the last one whose most recent outcome is not a pass (FAIL, or NOT RUN after an adapter
+  // error or turn cap).
+  const outcomes = new Map(); // stage -> { state: "pass" | "fail" | "notrun", failures, fix }
+  const touch = (stage, rec) => { outcomes.delete(stage); outcomes.set(stage, { ...(outcomes.get(stage) ?? {}), ...rec }); };
   let message = null;
   for (const line of lines) {
-    let m = line.match(/^\[\d+\/\d+\] (\S+) gate: FAIL — (.*)$/);
-    if (m) { gate = { stage: m[1], failures: m[2] }; continue; }
+    let m = line.match(/^\[\d+\/\d+\] (\S+) gate: PASS\s*$/);
+    if (m) { touch(m[1], { state: "pass", failures: null, fix: null }); continue; }
+    m = line.match(/^\[\d+\/\d+\] (\S+) gate: FAIL — (.*)$/);
+    if (m) { touch(m[1], { state: "fail", failures: m[2], fix: null }); continue; }
+    m = line.match(/^\[\d+\/\d+\] (\S+) gate: NOT RUN \((.*)\)\s*$/);
+    if (m) { touch(m[1], { state: "notrun", failures: m[2], fix: null }); continue; }
     m = line.match(/^\[\d+\/\d+\] (\S+)\s+attempt \d+\/\d+; to fix: (.*)$/);
-    if (m) { prescription = { stage: m[1], text: m[2] }; continue; }
+    if (m) { const o = outcomes.get(m[1]); if (o && o.state !== "pass") o.fix = m[2]; continue; }
     m = line.match(/^\[runner\] Stage (\S+) gate failed \(on_gate_failure: \w+\)\. Failures: (.*?)\. What would have fixed it: (.*) The runner (?:marked|did)/);
-    if (m) { gate = { stage: m[1], failures: m[2] }; prescription = { stage: m[1], text: m[3] }; continue; }
+    if (m) { const o = outcomes.get(m[1]); touch(m[1], { state: o?.state === "notrun" ? "notrun" : "fail", failures: m[2], fix: m[3] }); continue; }
     m = line.match(/^\[runner\] (\[\d+\/\d+\] .*)$/);
     if (m) message = m[1];
+  }
+  let gate = null;
+  let prescription = null;
+  for (const [stage, o] of outcomes) {
+    if (o.state === "pass") continue;
+    gate = { stage, failures: o.failures ?? "", notRun: o.state === "notrun" };
+    prescription = o.fix ? { stage, text: o.fix } : null;
   }
   return { rows, gate, prescription, message };
 }
@@ -110,7 +124,7 @@ export function buildBody({ log, exitCode, runUrl, workflow = "sw_dev", maxCostU
   out.push("");
   if (exit === "1") {
     out.push("**Gate blocked**");
-    if (gate) out.push(`- Gate: ${inline(gate.stage + " gate", 120)}`, `- Failures: ${inline(gate.failures, 600)}`);
+    if (gate) out.push(`- Blocked at: ${inline(gate.stage, 120)} (${gate.notRun ? "gate not run" : "gate failed"})`, `- Gate: ${inline(gate.stage + " gate", 120)}`, `- ${gate.notRun ? "Reason" : "Failures"}: ${inline(gate.failures, 600)}`);
     if (prescription) out.push(`- To fix: ${inline(prescription.text, 800)}`);
     if (!gate && message) out.push(`- ${inline(message, 600)}`);
     out.push("");

@@ -58,6 +58,30 @@ assert.match(b, /\| `implementation` \| 2 \| `failed` \|/);
 assert.match(b, /No commits were pushed/);
 assert.ok(!/@octocat/.test(b), "no review request without a push");
 
+// recovered failure, then a later stage whose gate did not run (turn cap): the report names the later stage
+const RECOVERED = [
+  "[1/3] requirements gate: FAIL — missing section",
+  "[1/3] requirements   attempt 1/2; to fix: add the section",
+  "[1/3] requirements gate: PASS",
+  "[2/3] implementation → claude-code (attempt 1/1)",
+  "[2/3] implementation gate: NOT RUN (stage hit the turn cap (max_turns 30))",
+  "[2/3] implementation   attempt 1/1; to fix: The stage stopped after 30 turns; write the outputs directly.",
+  "[runner] [2/3] implementation: gate blocked after 1 attempt(s): stage hit the turn cap (max_turns 30)",
+  "  requirements: passed (attempts 2)",
+  "  implementation: failed (attempts 1)",
+].join("\n");
+p = parseLog(RECOVERED);
+assert.equal(p.gate.stage, "implementation");
+assert.equal(p.gate.notRun, true);
+assert.match(p.gate.failures, /turn cap/);
+assert.match(p.prescription.text, /write the outputs directly/);
+b = buildBody({ log: RECOVERED, exitCode: "1", runUrl: RUN });
+assert.match(b, /Blocked at: `implementation` \(gate not run\)/);
+assert.match(b, /Reason: `stage hit the turn cap/);
+assert.ok(!b.includes("missing section") && !b.includes("add the section"), "recovered failure is not reported");
+// an earlier stage that failed and never recovered is still reported when no later gate ran
+assert.equal(parseLog("[1/2] a gate: FAIL — x\n[1/2] a   attempt 1/1; to fix: y").gate.stage, "a");
+
 // exit 3
 b = buildBody({ log: Q, exitCode: "3", runUrl: RUN });
 assert.match(b, /Questions pending/);

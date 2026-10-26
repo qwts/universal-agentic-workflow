@@ -144,8 +144,10 @@ that started the run, so add it before the run starts.
 
 ## Concurrency and clean starts
 
-The job uses `concurrency: uwf-pr-<PR number>` with `cancel-in-progress: true`. A second push to the PR cancels the
-run in flight. The new run has a new `run_id`, so its data dir (`$RUNNER_TEMP/uwf-<run_id>`) is new: the stage tracker,
+Both the `guard` job and the `uwf` job use `concurrency: uwf-pr-<PR number>` with `cancel-in-progress: true`. A second
+push to the PR cancels the run in flight. The guard needs the same single self-hosted runner as `uwf`, so it shares the
+group: the newer run's guard cancels the older in-flight `uwf` job as soon as it is queued, instead of waiting behind it
+for up to 180 minutes. Within one run the guard finishes before `uwf` starts. The new run has a new `run_id`, so its data dir (`$RUNNER_TEMP/uwf-<run_id>`) is new: the stage tracker,
 state and transcripts of the cancelled run are not shared. The cancelled run's data dir is removed by its cleanup step
 (or left until the runner's temp directory is cleaned, if the cancel killed the cleanup).
 

@@ -51,6 +51,12 @@ jobs:
     name: Skip runs started by the run's own commit
     runs-on: [self-hosted, uwf]
     timeout-minutes: 5
+    # Same group as `uwf`: the self-hosted runner is shared, so a newer push's guard would otherwise queue
+    # behind the older in-flight `uwf` job (up to 180 min). Sharing the group lets it cancel that job as soon
+    # as it is queued; within one run guard finishes before `uwf` starts, so they run in sequence.
+    concurrency:
+      group: uwf-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     outputs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
