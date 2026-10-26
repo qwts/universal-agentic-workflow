@@ -775,15 +775,40 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
     check("invalid --resume-max-context exits 2", bad.code === 2, bad.err.slice(-200));
   } finally { rmSync(d.base, { recursive: true, force: true }); }
 
+  const e = setup();
+  try {
+    // 2. gate passes on the attempt that crosses the cap: stage is recorded passed, then the run stops with 4
+    const good = JSON.parse(readFileSync(join(e.fixtures, "review.json"), "utf8"));
+    writeFileSync(join(e.fixtures, "review.json"), JSON.stringify({ ...good, claudeResult: claudeResult(1000, 2) }));
+    const r = run(e, ["--max-cost-usd", "1"]);
+    check("gate-passing attempt over the cap: exit 4, stage recorded passed, message names the status", r.code === 4 && byStage(trackerRows(e)).review?.status === "passed" && /review passed; cost cap exceeded/.test(r.err), `${r.code} ${r.err.slice(-400)}`);
+    check("no further stage starts after the cap", !r.err.includes("] technical-writing") && byStage(trackerRows(e)).implementation?.status === "passed" && !trackerRows(e).some((x) => x.stage === "retro" && x.status === "passed"), r.err.slice(-300));
+  } finally { rmSync(e.base, { recursive: true, force: true }); }
+
+  const f = setup();
+  try {
+    // 1. stale transcripts from an earlier run in a reused data dir do not count toward a fresh run
+    mkdirSync(join(f.data, "transcripts"), { recursive: true });
+    const stale = JSON.stringify({ prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 1000 }, total_cost_usd: 5 }) });
+    writeFileSync(join(f.data, "transcripts", "stale.json"), stale);
+    const r = run(f, ["--max-cost-usd", "0.5"]);
+    check("fresh run ignores stale transcripts in the data dir", r.code === 0, `${r.code} ${r.err.slice(-300)}`);
+    // run --from-stage continues the same run: what is already in the data dir counts
+    const again = run(f, ["--from-stage", "retro", "--max-cost-usd", "0.5"]);
+    check("run --from-stage counts the transcripts already present (exit 4)", again.code === 4 && /run cost \$5\.000 exceeds --max-cost-usd \$0\.5/.test(again.err), `${again.code} ${again.err.slice(-300)}`);
+  } finally { rmSync(f.base, { recursive: true, force: true }); }
+
   const miss = transcriptRow("t.json", { prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200000 }, total_cost_usd: 0.5 }) });
   const hit = transcriptRow("t.json", { prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 200000, cache_creation_input_tokens: 1000 }, total_cost_usd: 0.1 }) });
-  check("transcriptRow flags !MISS when cache_write exceeds cache_read", miss?.flags.includes("!MISS") && !hit?.flags.includes("!MISS"), JSON.stringify([miss?.flags, hit?.flags]));
+  const first = transcriptRow("t.json", { prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 9000 }, total_cost_usd: 0.05 }) });
+  check("a small first write (write > read but under 50K) is not flagged !MISS", first && !first.flags.includes("!MISS"), JSON.stringify(first?.flags));
+  check("transcriptRow flags !MISS when cache_write exceeds cache_read and 50K", miss?.flags.includes("!MISS") && !hit?.flags.includes("!MISS"), JSON.stringify([miss?.flags, hit?.flags]));
   const m = scratch();
   try {
     mkdirSync(join(m.data, "transcripts"), { recursive: true });
     writeFileSync(join(m.data, "transcripts", "a.json"), JSON.stringify({ prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200000 }, total_cost_usd: 0.5 }) }));
     const cr = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", m.data], { encoding: "utf8" });
-    check("cost report shows !MISS and explains it in the footer", cr.status === 0 && /^review .*!MISS/m.test(cr.stdout) && /!MISS = cache_write above cache_read/.test(cr.stdout), cr.stdout + cr.stderr);
+    check("cost report shows !MISS and explains it in the footer", cr.status === 0 && /^review .*!MISS/m.test(cr.stdout) && /!MISS = cache_write above both cache_read and 50K/.test(cr.stdout), cr.stdout + cr.stderr);
   } finally { rmSync(m.base, { recursive: true, force: true }); }
 }
 // reuse a scratch (fresh data dir, same fixtures/repo) for a second run

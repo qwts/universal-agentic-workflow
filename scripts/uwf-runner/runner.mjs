@@ -38,7 +38,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
-import { attemptUsage, costReport, totalCost } from "./cost.mjs";
+import { attemptUsage, costReport, listTranscripts } from "./cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -314,7 +314,7 @@ async function main(argv) {
 
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
-    return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
+    return await stageLoop({ command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
       repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
@@ -326,9 +326,13 @@ async function main(argv) {
  * returns an exit code. ctx carries everything resolved by main().
  */
 async function stageLoop(ctx) {
-  const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
+  const { command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
     outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext } = ctx;
   let first = true;
+  // Run-total cost covers this run's transcripts only. A fresh `run` leaves older transcripts in the data dir untouched
+  // but does not count them; `resume` and `run --from-stage` continue the same run, so what is already there counts.
+  const runTranscripts = new Set(command === "resume" || flags["from-stage"] ? listTranscripts(dataDir) : []);
+  const runCostSoFar = () => [...runTranscripts].reduce((a, f) => a + attemptUsage(f).cost, 0);
   for (let i = start; i < stages.length; i++) {
     const st = stages[i];
     const tag = `[${i + 1}/${stages.length}] ${st.name}`;
@@ -405,13 +409,15 @@ async function stageLoop(ctx) {
       const used = attemptUsage(res.transcriptPath);
       lastCtx = used.ctx;
       stageCost += used.cost;
-      const runCost = totalCost(dataDir);
+      if (res.transcriptPath) runTranscripts.add(res.transcriptPath);
+      const runCost = runCostSoFar();
       const over = maxCostUsd !== undefined && runCost > maxCostUsd ? `run cost $${runCost.toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}`
         : st.maxCostUsd && stageCost > st.maxCostUsd ? `stage ${st.name} cost $${stageCost.toFixed(3)} exceeds max_cost_usd $${st.maxCostUsd}` : null;
-      if (over) {
-        row.result = "stopped: cost cap";
-        return finish(EXIT.COST, rows, `${tag}: cost cap exceeded after attempt ${attempt}: ${over}; raise the cap and use "resume" to continue`, note);
-      }
+      // The attempt is recorded first (gate verdict, stage status); only then does an exceeded cap stop the run.
+      const capStop = (status) => {
+        row.result = `${row.result || status}; cost cap exceeded`;
+        return finish(EXIT.COST, rows, `${tag}: ${status}; cost cap exceeded after attempt ${attempt}: ${over}; raise the cap and use "resume" to continue`, note);
+      };
 
       // 5. questions
       const text = res.stdout || transcriptText(res.transcriptPath);
@@ -456,6 +462,7 @@ async function stageLoop(ctx) {
           row.result = "passed";
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
           if (adv) row.result += ` (${adv})`;
+          if (over) return capStop(`${st.name} passed`);
           break;
         }
         failures = g.data?.failures ?? [g.error];
@@ -473,13 +480,16 @@ async function stageLoop(ctx) {
         // A skipped stage still moves the workflow forward, as stage-tracker does.
         const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
         if (adv) row.result += ` (${adv})`;
+        if (over) return capStop(`${st.name} skipped (gate failed)`);
         break;
       }
       if (st.onGateFailure === "abort" || attempt >= maxAttempts) {
         cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; "), ...sessionArgs(sessionId)], withOut);
         row.result = st.onGateFailure === "abort" ? "failed (abort)" : "failed";
+        if (over) return capStop(`${st.name} failed`);
         return finish(EXIT.GATE, rows, `${tag}: gate blocked after ${attempt} attempt(s): ${failures.join("; ")}`, note);
       }
+      if (over) { row.result = "gate failed"; return capStop(`${st.name} gate failed, retry ${attempt} of ${st.maxRetries} not started`); }
       if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
       prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
       if (keepSession && sessionId && lastCtx > resumeMaxContext) {
