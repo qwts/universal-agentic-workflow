@@ -41,6 +41,7 @@ const TRACKER = join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs");
 const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
+const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings, so `resume` keeps them
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (used to roll the phase back on --from-stage).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
@@ -278,6 +279,7 @@ async function main(argv) {
         }
       }
       if (!flags["from-stage"]) {
+        rmSync(join(dataDir, ROUTING_FILE), { force: true });
         for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init"]]]) {
           const r = cli(script, args, withOut);
           if (!r.ok) throw new UsageError(`Store init failed (${args[0]}): ${r.error}`);
@@ -298,7 +300,7 @@ async function main(argv) {
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase });
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase, resuming: command === "resume" });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
@@ -310,10 +312,23 @@ async function main(argv) {
  */
 async function stageLoop(ctx) {
   const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase } = ctx;
+    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase, resuming } = ctx;
   let first = true;
-  const trips = new Map();     // "<stage>|<verdict>" -> round trips used (in-memory: a `resume` starts the budget over)
-  const findings = new Map();  // stage -> { files, note } review findings to pass as extra input on a re-run
+  const trips = new Map();     // "<stage>|<verdict>" -> round trips used
+  const findings = new Map();  // stage -> { files, note, from } review findings to pass as extra input on a re-run
+  // Persisted in the data dir so an interrupted run keeps its budget and findings on `resume` / `--from-stage`.
+  const routingPath = join(dataDir, ROUTING_FILE);
+  const saveRouting = () => {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(routingPath, JSON.stringify({ trips: Object.fromEntries(trips), findings: Object.fromEntries(findings) }, null, 2) + "\n");
+  };
+  if (resuming || flags["from-stage"]) {
+    try {
+      const saved = JSON.parse(readFileSync(routingPath, "utf8"));
+      for (const [k, v] of Object.entries(saved.trips ?? {})) trips.set(k, v);
+      for (const [k, v] of Object.entries(saved.findings ?? {})) findings.set(k, v);
+    } catch { /* nothing recorded */ }
+  }
   const visited = new Set();   // stages already invoked in this process (only the first visit may continue a recorded session)
   for (let i = start; i < stages.length; i++) {
     const st = stages[i];
@@ -435,6 +450,9 @@ async function stageLoop(ctx) {
           log(`${tag} gate: PASS`);
           cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
           row.result = "passed";
+          // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
+          const had = [...findings].filter(([, v]) => v.from === st.name);
+          if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
           if (adv) row.result += ` (${adv})`;
           break;
@@ -475,7 +493,8 @@ async function stageLoop(ctx) {
           const noteText = `The ${st.name} stage returned verdict "${verdict}" (round trip ${used + 1} of ${rule.maxRoundTrips}). ` +
             `${reviewFile ?? "Its output"} lists review findings to address: read it, fix what it raises, and do not edit the review file itself. ` +
             `The workflow then re-runs forward to ${st.name}.`;
-          for (const x of stages.slice(target, i)) findings.set(x.name, { files: reviewFile ? [reviewFile] : [], note: noteText });
+          for (const x of stages.slice(target, i)) findings.set(x.name, { files: reviewFile ? [reviewFile] : [], note: noteText, from: st.name });
+          saveRouting();
           log(`${tag}: verdict "${verdict}" → routing back to ${rule.routeTo} (round trip ${used + 1}/${rule.maxRoundTrips}); not retrying ${st.name}`);
           row.result = `${verdict} → ${rule.routeTo} (round trip ${used + 1}/${rule.maxRoundTrips})`;
           rollbackPhase(target);
@@ -508,6 +527,7 @@ async function stageLoop(ctx) {
     const doneTrips = [...trips].filter(([k]) => k.startsWith(`${st.name}|`)).reduce((n, [, v]) => n + v, 0);
     if (doneTrips && row.result.startsWith("passed")) row.result += ` after ${doneTrips} round trip(s)`;
   }
+  rmSync(routingPath, { force: true });
   return finish(EXIT.OK, rows, "workflow complete", note);
 
   function advancePhase(target, stageName) {

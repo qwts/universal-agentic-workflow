@@ -858,5 +858,33 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
+{
+  console.log("# on_verdict: routing context survives an interrupted run (resume)");
+  const s = setup();
+  try {
+    const good = reviewPass(s);
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [changesRequested(), changesRequested()] }));
+    const impl = JSON.parse(readFileSync(join(s.fixtures, "implementation.json"), "utf8"));
+    // 1st implementation ok; every later one fails (adapter error) so the routed re-run exhausts its attempts.
+    writeFileSync(join(s.fixtures, "implementation.json"), JSON.stringify({ attempts: [impl, { ...impl, exitCode: 1 }] }));
+    const r1 = run(s);
+    check("first run exits 1 (routed implementation failed)", r1.code === 1 && r1.err.includes("routing back to implementation (round trip 1/2)"), `${r1.code} ${r1.err.slice(-500)}`);
+    const saved = (() => { try { return JSON.parse(readFileSync(join(s.data, "runner-routing.json"), "utf8")); } catch { return null; } })();
+    check("routing state is persisted", saved?.trips?.["review|changes_requested"] === 1 && !!saved?.findings?.implementation, JSON.stringify(saved));
+    // Repair the fixtures: implementation works, the reviewer keeps asking for changes.
+    writeFileSync(join(s.fixtures, "implementation.json"), JSON.stringify(impl));
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify(changesRequested()));
+    const dir = join(s.data, "transcripts");
+    const before = new Set(readdirSync(dir));
+    const r2 = spawnSync(process.execPath, [RUNNER, "resume", "--workflow", "sw_dev", "--repo-root", s.repo, "--data-dir", s.data], {
+      encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: s.fixtures, UWF_DATA_DIR: "" } });
+    const fresh = readdirSync(dir).filter((f) => !before.has(f)).map((f) => JSON.parse(readFileSync(join(dir, f), "utf8")));
+    const firstImpl = fresh.find((t) => t.prompt.includes("Run the implementation stage"));
+    check("resumed implementation prompt carries the review findings", !!firstImpl && firstImpl.prompt.includes("## Review findings to address") && firstImpl.prompt.includes("issues-review.md"), firstImpl?.prompt.slice(-500));
+    check("budget carried over: resume routes as round trip 2/2, never 1/2", r2.stderr.includes("(round trip 2/2)") && !r2.stderr.includes("(round trip 1/2)"), r2.stderr.slice(-700));
+    check("then exhausts at 2/2 and exits 1", r2.status === 1 && /budget to implementation is exhausted \(2\/2\)/.test(r2.stderr), `${r2.status} ${r2.stderr.slice(-500)}`);
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
