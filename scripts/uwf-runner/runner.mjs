@@ -13,7 +13,7 @@
  *   node scripts/uwf-runner/runner.mjs cost --data-dir <d> [--workflow <w> [--repo-root <r>]]
  *     per-stage turns, context per turn, tokens and cost from <d>/transcripts (see cost.mjs)
  *
- * Exit codes: 0 complete | 1 gate blocked / abort | 2 usage or config error | 3 questions pending
+ * Exit codes: 0 complete | 1 gate blocked / abort / on_verdict round trips exhausted | 2 usage or config error | 3 questions pending (incl. a review needing a user decision)
  *
  * Two roots: --repo-root is where the agent works (cwd, artifacts, {{cwd}} gate paths); --skills-root
  * (env UWF_SKILLS_ROOT) is where workflow definitions, agents and skill docs are read. Default: this
@@ -41,6 +41,7 @@ const TRACKER = join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs");
 const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
+const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings, so `resume` keeps them
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (used to roll the phase back on --from-stage).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
@@ -278,6 +279,7 @@ async function main(argv) {
         }
       }
       if (!flags["from-stage"]) {
+        rmSync(join(dataDir, ROUTING_FILE), { force: true });
         for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init"]]]) {
           const r = cli(script, args, withOut);
           if (!r.ok) throw new UsageError(`Store init failed (${args[0]}): ${r.error}`);
@@ -298,7 +300,7 @@ async function main(argv) {
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut });
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase, resuming: command === "resume" });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
@@ -310,13 +312,33 @@ async function main(argv) {
  */
 async function stageLoop(ctx) {
   const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut } = ctx;
+    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase, resuming } = ctx;
   let first = true;
+  const trips = new Map();     // "<stage>|<verdict>" -> round trips used
+  const findings = new Map();  // stage -> { files, note, from } review findings to pass as extra input on a re-run
+  // Persisted in the data dir so an interrupted run keeps its budget and findings on `resume` / `--from-stage`.
+  const routingPath = join(dataDir, ROUTING_FILE);
+  const saveRouting = () => {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(routingPath, JSON.stringify({ trips: Object.fromEntries(trips), findings: Object.fromEntries(findings) }, null, 2) + "\n");
+  };
+  if (resuming || flags["from-stage"]) {
+    try {
+      const saved = JSON.parse(readFileSync(routingPath, "utf8"));
+      for (const [k, v] of Object.entries(saved.trips ?? {})) trips.set(k, v);
+      for (const [k, v] of Object.entries(saved.findings ?? {})) findings.set(k, v);
+    } catch { /* nothing recorded */ }
+  }
+  const visited = new Set();   // stages already invoked in this process (only the first visit may continue a recorded session)
   for (let i = start; i < stages.length; i++) {
     const st = stages[i];
     const tag = `[${i + 1}/${stages.length}] ${st.name}`;
-    const row = { stage: st.name, attempts: 0, result: "" };
-    rows.push(row);
+    // A stage re-run after a verdict round trip keeps its row; attempts accumulate across visits.
+    let row = rows.find((r) => r.stage === st.name);
+    if (row) row.result = "";
+    else { row = { stage: st.name, attempts: 0, result: "" }; rows.push(row); }
+    const priorAttempts = Number(row.attempts) || 0;
+    let routedTo = null;
 
     // 1. pending required questions block the stage
     const q = cli(QUESTIONS, ["check", "--stage", st.name]);
@@ -352,7 +374,9 @@ async function stageLoop(ctx) {
     // 3. materialize the prompt (goal goes first on the first stage of this run)
     const answered = cli(QUESTIONS, ["list", "--stage", st.name, "--status", "answered"]);
     const extraContext = { goal, answeredQuestions: answered.ok ? (answered.data?.questions ?? answered.data?.items ?? []) : [] };
-    const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, skillsRoot, outputPath, dataDir, extraContext });
+    const fnd = findings.get(st.name);
+    const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, skillsRoot, outputPath, dataDir, extraContext,
+      extraInputs: fnd?.files, extraNote: fnd?.note });
     if (mp.inputsMissing?.length) log(`${tag}: inputs not found: ${mp.inputsMissing.join(", ")}`);
     const basePrompt = first ? `Goal:\n${goal}\n\n${mp.prompt}` : mp.prompt;
     first = false;
@@ -363,10 +387,11 @@ async function stageLoop(ctx) {
     // "fresh": never pass one, so every attempt starts a new session. The first attempt of a stage
     // starts fresh too, except when `resume` continues a stage whose tracker row holds a session id.
     const keepSession = st.retryMode !== "fresh";
-    let sessionId = i === start && keepSession ? resumeSessionId : undefined;
+    let sessionId = i === start && keepSession && !visited.has(st.name) ? resumeSessionId : undefined;
+    visited.add(st.name);
     let prompt = basePrompt;
     for (let attempt = 1; ; attempt++) {
-      row.attempts = attempt;
+      row.attempts = priorAttempts + attempt;
       log(`${tag} → ${adapterName} (attempt ${attempt}/${maxAttempts})`);
       if (attempt > 1) cli(STATE, ["set-agent", "--agent", AGENT_ID, "--force"], withOut);
 
@@ -408,6 +433,8 @@ async function stageLoop(ctx) {
       // 6. gate
       let failures;
       let prescriptions;
+      let verdict = null; // observed verdict when the gate failed on a review outcome
+      let gateRan = false;
       if (hitMaxTurns(res)) {
         // The cap is a gate failure: the agent stopped before finishing, so name the cause and the fix.
         failures = [`stage hit the turn cap (max_turns ${st.maxTurns})`];
@@ -423,15 +450,59 @@ async function stageLoop(ctx) {
           log(`${tag} gate: PASS`);
           cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
           row.result = "passed";
+          // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
+          const had = [...findings].filter(([, v]) => v.from === st.name);
+          if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
           if (adv) row.result += ` (${adv})`;
           break;
         }
         failures = g.data?.failures ?? [g.error];
+        verdict = typeof g.data?.verdict === "string" ? g.data.verdict : null;
+        gateRan = true;
         prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
         log(`${tag} gate: FAIL — ${failures.join("; ")}`);
       }
       log(`${tag}   attempt ${attempt}/${maxAttempts}; to fix: ${prescriptions[0]}`);
+
+      if (st.onVerdict && gateRan) {
+        // A finding that needs the user's call: neither routing back nor retrying can resolve it.
+        const decisions = userDecisions(mp.outputsRequired, repoRoot);
+        if (decisions.length) {
+          const ids = [];
+          for (const d of decisions) {
+            const l = cli(QUESTIONS, ["log", "--stage", st.name, "--question", d, "--required", "true"]);
+            if (l.ok) ids.push(l.data.question_id);
+          }
+          row.result = "blocked: user decision needed";
+          return finish(EXIT.QUESTIONS, rows, `${tag}: review needs a user decision (${decisions.length} item(s) logged as questions ${ids.join(",")}: ${decisions.join(" | ")}); answer them, then rerun with --from-stage ${st.name}`, note);
+        }
+        const rule = verdict !== null && Object.hasOwn(st.onVerdict, verdict) ? st.onVerdict[verdict] : null;
+        if (rule) {
+          const key = `${st.name}|${verdict}`;
+          const used = trips.get(key) ?? 0;
+          const target = stages.findIndex((x) => x.name === rule.routeTo);
+          if (target < 0 || target >= i) throw new UsageError(`on_verdict route_to "${rule.routeTo}" is not an earlier stage than ${st.name}`);
+          if (used >= rule.maxRoundTrips) {
+            cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", `verdict ${verdict}: round-trip budget exhausted`, ...sessionArgs(sessionId)], withOut);
+            row.result = `failed (verdict ${verdict}, ${used} round trip(s) used)`;
+            return finish(EXIT.GATE, rows, `${tag}: verdict "${verdict}" and the round-trip budget to ${rule.routeTo} is exhausted (${used}/${rule.maxRoundTrips}); stopping. Address the findings in ${mp.outputsRequired[0] ?? "the review output"} and rerun with --from-stage ${rule.routeTo}`, note);
+          }
+          trips.set(key, used + 1);
+          const reviewFile = mp.outputsRequired[0];
+          const noteText = `The ${st.name} stage returned verdict "${verdict}" (round trip ${used + 1} of ${rule.maxRoundTrips}). ` +
+            `${reviewFile ?? "Its output"} lists review findings to address: read it, fix what it raises, and do not edit the review file itself. ` +
+            `The workflow then re-runs forward to ${st.name}.`;
+          for (const x of stages.slice(target, i)) findings.set(x.name, { files: reviewFile ? [reviewFile] : [], note: noteText, from: st.name });
+          saveRouting();
+          log(`${tag}: verdict "${verdict}" → routing back to ${rule.routeTo} (round trip ${used + 1}/${rule.maxRoundTrips}); not retrying ${st.name}`);
+          row.result = `${verdict} → ${rule.routeTo} (round trip ${used + 1}/${rule.maxRoundTrips})`;
+          rollbackPhase(target);
+          resetFrom(target);
+          routedTo = target;
+          break;
+        }
+      }
 
       if (st.onGateFailure === "skip" || st.onGateFailure === "abort") {
         log(gateSummary(st, failures, prescriptions, st.onGateFailure === "skip" ? "marked the stage skipped and continued" : "marked the stage failed and stopped the run"));
@@ -452,7 +523,11 @@ async function stageLoop(ctx) {
       if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
       prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
     }
+    if (routedTo !== null) { i = routedTo - 1; continue; } // the loop's i++ lands on the routed-to stage
+    const doneTrips = [...trips].filter(([k]) => k.startsWith(`${st.name}|`)).reduce((n, [, v]) => n + v, 0);
+    if (doneTrips && row.result.startsWith("passed")) row.result += ` after ${doneTrips} round trip(s)`;
   }
+  rmSync(routingPath, { force: true });
   return finish(EXIT.OK, rows, "workflow complete", note);
 
   function advancePhase(target, stageName) {
@@ -463,6 +538,27 @@ async function stageLoop(ctx) {
     log(`[runner] phase "${target}" not applied after ${stageName}: ${a.error}`);
     return `phase ${target} not applied`;
   }
+}
+
+/**
+ * Review findings that depend on a user decision. Contract: a non-empty `questions` array in a stage's
+ * .json output, or a line `needs-user-decision: <text>` (or "needs user decision:") in a text/markdown output.
+ */
+export function userDecisions(outputs, repoRoot) {
+  const found = [];
+  for (const o of outputs) {
+    let text;
+    try { text = readFileSync(resolve(repoRoot, o), "utf8"); } catch { continue; }
+    if (o.endsWith(".json")) {
+      try {
+        const qs = JSON.parse(text)?.questions;
+        if (Array.isArray(qs)) for (const q of qs) found.push(typeof q === "string" ? q : (q?.question ?? JSON.stringify(q)));
+      } catch { /* not JSON: the schema check reports it */ }
+    } else {
+      for (const m of text.matchAll(/^[ \t]*needs[- ]user[- ]decision:[ \t]*(.*)$/gim)) found.push(m[1].trim() || "(user decision needed; see the review output)");
+    }
+  }
+  return found.filter((q) => q);
 }
 
 /** True when the adapter stopped the stage at its turn cap (fake: error text; claude: result subtype). */
@@ -497,7 +593,7 @@ function gatesAudit(flags) {
     if (!r.ok || !Array.isArray(r.data?.stages)) throw new UsageError(`Cannot read gates: ${r.error}`);
     const out = [`workflow: ${flags.workflow} (placeholders: <output_path> = --output-path, <repo> = repo root)`];
     for (const s of r.data.stages) {
-      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, `retry_mode: ${s.retry_mode}`, `max_turns: ${s.max_turns}`, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
+      const flagsTxt = [`on_gate_failure: ${s.on_gate_failure}`, `max_retries: ${s.max_retries}`, `retry_mode: ${s.retry_mode}`, `max_turns: ${s.max_turns}`, s.on_verdict ? `on_verdict: ${Object.entries(s.on_verdict).map(([v, r]) => `${v} -> ${r.routeTo} x${r.maxRoundTrips}`).join(", ")}` : null, s.gated ? null : "ungated", s.conditional ? "conditional" : null].filter(Boolean).join(", ");
       out.push("", `${s.stage}  (${flagsTxt})`);
       if (!s.checks.length) out.push("  (no checks)");
       for (const c of s.checks) out.push(`  - ${c.type}: ${c.prescription.split(repoRoot).join("<repo>")}`);
@@ -568,6 +664,7 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRo
     out.push(`[${start + j + 1}/${total}] ${st.name}  (agent: ${mp.agentName})`);
     out.push(`  permissions: ${mp.permissions}   model: ${flags.model ?? mp.model ?? "(adapter default)"}`);
     out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   max_turns: ${st.maxTurns}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
+    if (st.onVerdict) out.push(`  on_verdict: ${Object.entries(st.onVerdict).map(([v, r]) => `${v} -> ${r.routeTo} (max_round_trips ${r.maxRoundTrips})`).join(", ")}`);
     out.push(`  required outputs: ${mp.outputsRequired.length ? mp.outputsRequired.join(", ") : "(none)"}`);
     if (mp.inputsMissing.length) out.push(`  inputs not present yet: ${mp.inputsMissing.join(", ")}`);
     const checks = gateChecks[st.name] ?? [];

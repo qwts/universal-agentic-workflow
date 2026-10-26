@@ -706,5 +706,201 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
   check("ctx/turn includes uncached input tokens", row?.perTurn === 60000 && row.flags.includes("!50K"), JSON.stringify(row));
 }
 
+// 12. on_verdict: route a wrong verdict back instead of retrying the reviewer ---------
+const RV_MD = "tmp/workflow-artifacts/issues-review.md";
+const RV_JSON = "tmp/workflow-artifacts/issues-review.result.json";
+const reviewPass = (s) => JSON.parse(readFileSync(join(s.fixtures, "review.json"), "utf8"));
+const changesRequested = (extra = {}) => ({
+  files: {
+    [RV_MD]: "# Review\n\nverdict: changes_requested\n\n- high: the widget is never registered\n",
+    [RV_JSON]: JSON.stringify({ verdict: "changes_requested", findings: [{ severity: "high", summary: "widget is never registered" }], ...extra }) + "\n",
+  },
+  transcript: "review: changes requested",
+});
+const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.includes(`Run the ${stage} stage`));
+
+{
+  console.log("# on_verdict: changes_requested routes to implementation, then passes");
+  const s = setup();
+  try {
+    const good = reviewPass(s);
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [changesRequested(), { files: good.files, transcript: good.transcript }] }));
+    const r = run(s);
+    check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
+    check("routing line names the verdict, the target and the round trip",
+      /\[11\/15\] review: verdict "changes_requested" → routing back to implementation \(round trip 1\/2\)/.test(r.err), r.err.slice(-800));
+    const impl = countInvocations(s, "implementation");
+    const rev = countInvocations(s, "review");
+    check("implementation ran twice, review twice, work-plan once", impl.length === 2 && rev.length === 2 && countInvocations(s, "work-plan").length === 1, `${impl.length}/${rev.length}`);
+    check("the review stage was not retried (no Gate failure prompt)", !rev.some((t) => t.prompt.includes("## Gate failure")));
+    check("first implementation prompt has no findings; the second has the review file and the note",
+      !impl[0].prompt.includes("Review findings to address") && impl[1].prompt.includes("## Review findings to address")
+      && impl[1].prompt.includes("issues-review.md") && /review findings to address/.test(impl[1].prompt) && impl[1].prompt.includes("verdict: changes_requested"), impl[1]?.prompt.slice(-900));
+    check("the reviewer itself is not given its own output as an extra input", !rev[1].prompt.includes("## Review findings to address"));
+    check("table shows the extra attempts", /^implementation\s+2\s+passed/m.test(r.out) && /^review\s+2\s+passed.*1 round trip/m.test(r.out), r.out);
+    const state = skillJson("uwf-state-manager/state.mjs", ["read"], s);
+    check("phase ends closed after the round trip", state?.state?.phase === "closed", JSON.stringify(state?.state?.phase));
+    check("phase was rolled back to planning when routing", (state?.state?.history ?? []).some((h) => h.to_phase === "planning" && /reset from implementation/.test(h.note ?? "")));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# on_verdict: round-trip budget exhausted");
+  const s = setup();
+  try {
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify(changesRequested()));
+    const r = run(s);
+    check("exits 1", r.code === 1, `${r.code} ${r.err.slice(-600)}`);
+    check("log line says the budget is exhausted", /round-trip budget to implementation is exhausted \(2\/2\)/.test(r.err), r.err.slice(-600));
+    check("implementation ran 3 times and review 3 times (1 + 2 round trips)", countInvocations(s, "implementation").length === 3 && countInvocations(s, "review").length === 3);
+    check("later stages never ran", !r.err.includes("[12/15]"));
+    check("no table on non-zero exit", !r.out.includes("attempts"));
+    const tracked = skillJson("uwf-orchestration-engine/stage-tracker.mjs", ["read", "--workflow", "sw_dev"], s);
+    check("review marked failed", (tracked?.state ?? []).find((x) => x.stage === "review")?.status === "failed");
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# on_verdict: a finding that needs a user decision stops with exit 3");
+  const variants = {
+    "questions array in result.json": (fx) => { const c = changesRequested({ questions: ["Should the widget be public API?"] }); return c; },
+    "needs-user-decision line in markdown": () => {
+      const c = changesRequested();
+      c.files[RV_MD] += "\nneeds-user-decision: Should the widget be public API?\n";
+      return c;
+    },
+  };
+  for (const [label, make] of Object.entries(variants)) {
+    const s = setup();
+    try {
+      writeFileSync(join(s.fixtures, "review.json"), JSON.stringify(make()));
+      const r = run(s);
+      check(`${label}: exits 3`, r.code === 3, `${r.code} ${r.err.slice(-500)}`);
+      check(`${label}: names the decision and the rerun hint`, r.err.includes("review needs a user decision") && r.err.includes("Should the widget be public API?") && r.err.includes("--from-stage review"), r.err.slice(-500));
+      check(`${label}: no routing and no retry`, countInvocations(s, "implementation").length === 1 && countInvocations(s, "review").length === 1);
+      const q = skillJson("uwf-question-protocol/questions.mjs", ["list", "--stage", "review", "--status", "pending"], s);
+      check(`${label}: the question is logged`, JSON.stringify(q).includes("Should the widget be public API?"), JSON.stringify(q).slice(0, 300));
+    } finally { rmSync(s.base, { recursive: true, force: true }); }
+  }
+}
+
+{
+  console.log("# on_verdict: stages.yaml validation");
+  const f = setup();
+  try {
+    const yamlPath = join(f.repo, ".github", "skills", "uwf-sw_dev", "stages.yaml");
+    const text = readFileSync(yamlPath, "utf8");
+    const line = "      changes_requested: { route_to: implementation, max_round_trips: 2 }";
+    check("test setup: stages.yaml declares on_verdict on review", text.includes(line));
+    const list = skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], f);
+    check("--list-stages exposes onVerdict for review and null elsewhere",
+      JSON.stringify(list?.find((x) => x.name === "review")?.onVerdict) === JSON.stringify({ changes_requested: { routeTo: "implementation", maxRoundTrips: 2 } })
+      && list?.find((x) => x.name === "intake")?.onVerdict === null, JSON.stringify(list?.find((x) => x.name === "review")?.onVerdict));
+    writeFileSync(yamlPath, text.replace(line, "      changes_requested: { route_to: implementation }"));
+    check("max_round_trips defaults to 2", skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], f)?.find((x) => x.name === "review")?.onVerdict?.changes_requested?.maxRoundTrips === 2);
+    const bad = {
+      "unknown route_to": ["{ route_to: nowhere, max_round_trips: 2 }", /route_to \\"nowhere\\" is not a stage/],
+      "later route_to": ["{ route_to: acceptance, max_round_trips: 2 }", /must name an earlier stage/],
+      "self route_to": ["{ route_to: review, max_round_trips: 2 }", /must name an earlier stage/],
+      "max_round_trips 0": ["{ route_to: implementation, max_round_trips: 0 }", /max_round_trips must be a positive integer/],
+      "rule not a map": ["implementation", /must be a map with route_to/],
+    };
+    for (const [label, [rule, re]] of Object.entries(bad)) {
+      writeFileSync(yamlPath, text.replace(line, `      changes_requested: ${rule}`));
+      const r = spawnSync(process.execPath, [join(SKILLS, "uwf-sw_dev", "run.mjs"), "--list-stages", "--data-dir", f.data], { encoding: "utf8", cwd: f.repo });
+      check(`${label} is rejected`, r.status !== 0 && re.test(r.stdout), r.stdout.slice(0, 300));
+    }
+  } finally { rmSync(f.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# prescriptions: a wrong verdict is an outcome, a missing one is asked for");
+  const s = setup();
+  try {
+    const art = join(s.repo, "tmp", "workflow-artifacts");
+    mkdirSync(art, { recursive: true });
+    const gate = () => {
+      const r = spawnSync(process.execPath, [join(SKILLS, "uwf-sw_dev", "run.mjs"), "--check-gate", "review", "--data-dir", s.data], { encoding: "utf8", cwd: s.repo });
+      try { return JSON.parse(r.stdout); } catch { return { failures: [], prescriptions: [r.stdout + r.stderr] }; }
+    };
+    const cr = changesRequested();
+    writeFileSync(join(art, "issues-review.md"), cr.files[RV_MD]);
+    writeFileSync(join(art, "issues-review.result.json"), cr.files[RV_JSON]);
+    const wrong = gate();
+    const pres = (wrong.prescriptions ?? []).join("\n");
+    check("wrong verdict: gate fails and reports the observed verdict", wrong.passed === false && wrong.verdict === "changes_requested", JSON.stringify(wrong).slice(0, 300));
+    check("wrong verdict: prescriptions state the observed verdict and call it a review outcome",
+      pres.includes('records verdict "changes_requested"') && pres.includes("review outcome") && pres.includes("not something to rewrite"), pres);
+    check("wrong verdict: no 'Include the text verdict: approved' prescription", !/Include the text "verdict: approved"/.test(pres) && !/equal to "approved"/.test(pres), pres);
+    writeFileSync(join(art, "issues-review.md"), "# Review\n\nNo verdict line here.\n");
+    writeFileSync(join(art, "issues-review.result.json"), JSON.stringify({ findings: [] }));
+    const missing = gate();
+    check("missing verdict: still asks for the text", (missing.prescriptions ?? []).some((p) => /Include the text "verdict: approved" in /.test(p)), JSON.stringify(missing.prescriptions));
+    check("missing verdict: carries no routable verdict", missing.verdict === undefined);
+    const audit = spawnSync(process.execPath, [RUNNER, "gates", "--workflow", "sw_dev", "--repo-root", s.repo], { encoding: "utf8" });
+    check("gates audit keeps the generic prescription and lists on_verdict", /Include the text "verdict: approved"/.test(audit.stdout) && /on_verdict: changes_requested -> implementation x2/.test(audit.stdout), audit.stdout.slice(0, 200));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# on_verdict: a schema-invalid changes_requested result is retried, not routed");
+  const s = setup();
+  try {
+    const bad = changesRequested();
+    bad.files[RV_JSON] = JSON.stringify({ verdict: "changes_requested" }) + "\n"; // findings missing
+    const good = reviewPass(s);
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [bad, { files: good.files, transcript: good.transcript }] }));
+    const r = run(s);
+    check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
+    check("no routing happened", !r.err.includes("routing back") && countInvocations(s, "implementation").length === 1, r.err.slice(-600));
+    const rev = countInvocations(s, "review");
+    check("review was retried with the schema prescription", rev.length === 2 && rev[1].prompt.includes("## Gate failure (retry 1 of 3)") && /\/findings is required/.test(rev[1].prompt), rev[1]?.prompt.slice(-700));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# on_verdict: routing context survives an interrupted run (resume)");
+  const s = setup();
+  try {
+    const good = reviewPass(s);
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [changesRequested(), changesRequested()] }));
+    const impl = JSON.parse(readFileSync(join(s.fixtures, "implementation.json"), "utf8"));
+    // 1st implementation ok; every later one fails (adapter error) so the routed re-run exhausts its attempts.
+    writeFileSync(join(s.fixtures, "implementation.json"), JSON.stringify({ attempts: [impl, { ...impl, exitCode: 1 }] }));
+    const r1 = run(s);
+    check("first run exits 1 (routed implementation failed)", r1.code === 1 && r1.err.includes("routing back to implementation (round trip 1/2)"), `${r1.code} ${r1.err.slice(-500)}`);
+    const saved = (() => { try { return JSON.parse(readFileSync(join(s.data, "runner-routing.json"), "utf8")); } catch { return null; } })();
+    check("routing state is persisted", saved?.trips?.["review|changes_requested"] === 1 && !!saved?.findings?.implementation, JSON.stringify(saved));
+    // Repair the fixtures: implementation works, the reviewer keeps asking for changes.
+    writeFileSync(join(s.fixtures, "implementation.json"), JSON.stringify(impl));
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify(changesRequested()));
+    const dir = join(s.data, "transcripts");
+    const before = new Set(readdirSync(dir));
+    const r2 = spawnSync(process.execPath, [RUNNER, "resume", "--workflow", "sw_dev", "--repo-root", s.repo, "--data-dir", s.data], {
+      encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: s.fixtures, UWF_DATA_DIR: "" } });
+    const fresh = readdirSync(dir).filter((f) => !before.has(f)).map((f) => JSON.parse(readFileSync(join(dir, f), "utf8")));
+    const firstImpl = fresh.find((t) => t.prompt.includes("Run the implementation stage"));
+    check("resumed implementation prompt carries the review findings", !!firstImpl && firstImpl.prompt.includes("## Review findings to address") && firstImpl.prompt.includes("issues-review.md"), firstImpl?.prompt.slice(-500));
+    check("budget carried over: resume routes as round trip 2/2, never 1/2", r2.stderr.includes("(round trip 2/2)") && !r2.stderr.includes("(round trip 1/2)"), r2.stderr.slice(-700));
+    check("then exhausts at 2/2 and exits 1", r2.status === 1 && /budget to implementation is exhausted \(2\/2\)/.test(r2.stderr), `${r2.status} ${r2.stderr.slice(-500)}`);
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# on_verdict: changes_requested JSON but markdown without a verdict line is retried, not routed");
+  const s = setup();
+  try {
+    const bad = changesRequested();
+    bad.files[RV_MD] = "# Review\n\nFindings below, no verdict line.\n";
+    const good = reviewPass(s);
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [bad, { files: good.files, transcript: good.transcript }] }));
+    const r = run(s);
+    check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
+    const rev = countInvocations(s, "review");
+    check("no routing; implementation ran once", !r.err.includes("routing back") && countInvocations(s, "implementation").length === 1, r.err.slice(-600));
+    check("review retried with the include-the-text prescription", rev.length === 2 && rev[1].prompt.includes("## Gate failure (retry 1 of 3)") && rev[1].prompt.includes('Include the text "verdict: approved"'), rev[1]?.prompt.slice(-700));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

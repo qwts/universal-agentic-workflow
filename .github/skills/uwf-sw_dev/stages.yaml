@@ -259,6 +259,8 @@ stages:
     max_retries: 3
     max_turns: 20
     on_gate_failure: retry
+    on_verdict:
+      changes_requested: { route_to: implementation, max_round_trips: 2 }
     run_as_subagent: true
     inputs:
       - "{{output_path}}/issues-plan.md"
