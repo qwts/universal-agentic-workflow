@@ -30,8 +30,9 @@ jobs:
           && (contains(github.event.pull_request.labels.*.name, 'uwf:run')
               || contains(github.event.pull_request.body, '/uwf run')))
         || (github.event.action == 'edited'
+            && github.event.changes.body.from != null
             && contains(github.event.pull_request.body, '/uwf run')
-            && !contains(github.event.changes.body.from || '', '/uwf run'))
+            && !contains(github.event.changes.body.from, '/uwf run'))
       }}
     uses: qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml@main
     with:
@@ -47,7 +48,7 @@ Then create the label `uwf:run` in the consumer repo (`gh label create uwf:run`)
 actions and reusable workflows may run, allow `qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml`.
 
 A PR starts a run when it carries the label `uwf:run` or its description contains `/uwf run`. Adding the label to an
-already open PR starts a run through the `labeled` event; a push to a PR that already qualifies starts a new one, and so does editing the description to add `/uwf run` (the `edited` event). Other edits of a qualifying PR do not restart the run; the caller's condition checks that `/uwf run` was not already in the previous description, because every run spends model budget.
+already open PR starts a run through the `labeled` event; a push to a PR that already qualifies starts a new one, and so does editing the description to add `/uwf run` (the `edited` event). Other edits of a qualifying PR do not restart the run: the caller's condition requires the description to have changed (`changes.body.from` present; a title-only edit has none) and `/uwf run` to be absent from the previous description, because every run spends model budget.
 PRs from forks never run: the job is skipped, because it would execute untrusted code on a self-hosted machine.
 
 ## Inputs
