@@ -58,7 +58,7 @@ node scripts/uwf-runner/runner.mjs gates --workflow sw_dev
 
 `--max-cost-usd` is read only from the command line; the runner does not store it, so `resume` without it has no cap. The cap counts cumulative cost of the run's transcripts, including those from before the resume.
 
-`--non-interactive` answers no questions. Each pending or newly asked question is marked skipped and the stage continues. Without the flag, a pending required question stops the run with exit 3.
+`--non-interactive` answers no questions. Each pending or newly asked question is marked skipped and the stage continues. Without the flag, a pending required question stops the run with exit 3. On a pull request, [uwf-on-pr](docs/guide/uwf-on-pr.md#questions-and-answers) turns that exit 3 into a PR comment and resumes the run after `/uwf answer` replies.
 
 `--goal` takes a file path or inline text. `--from-stage <s>` re-runs from a stage and rolls the state back. `--force` re-initializes a completed data dir.
 

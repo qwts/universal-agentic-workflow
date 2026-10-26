@@ -85,7 +85,7 @@ assert.equal(parseLog("[1/2] a gate: FAIL — x\n[1/2] a   attempt 1/1; to fix: 
 // exit 3
 b = buildBody({ log: Q, exitCode: "3", runUrl: RUN });
 assert.match(b, /Questions pending/);
-assert.match(b, /#96/);
+assert.match(b, /UWF needs your input/);
 assert.match(b, /needs input/);
 
 // exit 4

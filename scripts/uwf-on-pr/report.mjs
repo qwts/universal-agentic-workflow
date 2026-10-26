@@ -131,7 +131,7 @@ export function buildBody({ log, exitCode, runUrl, workflow = "sw_dev", maxCostU
   } else if (exit === "3") {
     out.push("**Questions pending.** The run needs a user decision before it can continue." +
       (message ? ` Runner message: ${inline(message, 500)}.` : "") +
-      " Posting the questions to this PR is tracked in #96; until then read them in the run's artifact.", "");
+      " With `on_questions: pause` they are in the PR comment \"UWF needs your input\": reply with `/uwf answer <id> <text>` or `/uwf skip <id>` and the run resumes.", "");
   } else if (exit === "4") {
     out.push(`**Cost cap hit.** The run stopped at the cap of $${flatten(maxCostUsd ?? "?")} (\`max_cost_usd\`).` +
       (message ? ` Runner message: ${inline(message, 500)}.` : "") + " Raise the cap and re-run to continue.", "");
