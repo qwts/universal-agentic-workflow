@@ -775,6 +775,37 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
     check("invalid --resume-max-context exits 2", bad.code === 2, bad.err.slice(-200));
   } finally { rmSync(d.base, { recursive: true, force: true }); }
 
+  const g = setup();
+  try {
+    // resume after a cost-cap stop with the same cap must not spend again
+    reviewFixture(g, { claudeResult: claudeResult(1000, 0.6) }, {});
+    const r1 = run(g, ["--max-cost-usd", "1"]);
+    const before = reviewT(g).length;
+    const r2 = resume(g, ["--max-cost-usd", "1"]);
+    check("resume with an already-exceeded cap exits 4 without invoking the adapter", r1.code === 4 && r2.code === 4 && reviewT(g).length === before && /cost cap exceeded before attempt 1/.test(r2.err), `${r1.code} ${r2.code} ${r2.err.slice(-300)}`);
+    const n = transcripts(g).length;
+    const r3 = resume(g, ["--max-cost-usd", "50"]);
+    check("resume with a raised cap continues", r3.code === 0 && transcripts(g).length > n, `${r3.code} ${r3.err.slice(-300)}`);
+  } finally { rmSync(g.base, { recursive: true, force: true }); }
+
+  const h = setup();
+  try {
+    // a recorded session whose last turn was 150K is not resumed by `resume`
+    reviewFixture(h, { claudeResult: claudeResult(150000, 0.01) }, { claudeResult: claudeResult(150000, 0.01) });
+    const fx = JSON.parse(readFileSync(join(h.fixtures, "review.json"), "utf8"));
+    const never = { files: { "tmp/workflow-artifacts/issues-review.md": "# Review\n\nline-one-of-the-first-attempt\n" }, transcript: "x", claudeResult: claudeResult(150000, 0.01) };
+    writeFileSync(join(h.fixtures, "review.json"), JSON.stringify({ attempts: [never] }));
+    const r1 = run(h);
+    const recorded = byStage(trackerRows(h)).review?.session_id;
+    const n = reviewT(h).length;
+    writeFileSync(join(h.fixtures, "review.json"), JSON.stringify(fx.attempts[2]));
+    const r2 = resume(h);
+    const added = reviewT(h).slice(n);
+    check("setup: review failed with a recorded session", r1.code === 1 && !!recorded, `${r1.code} ${recorded}`);
+    check("resume starts the oversized stage in a fresh session", r2.code === 0 && added.length === 1 && added[0].sessionId !== recorded && /the recorded session ended with a 150000-token context/.test(r2.err), `${r2.code} ${added.map((t) => t.sessionId)} ${recorded} ${r2.err.slice(-400)}`);
+    check("the fresh start carries the previous-output excerpt", /## Previous output \(fresh session\)[\s\S]*line-one-of-the-first-attempt/.test(added[0]?.prompt ?? ""), (added[0]?.prompt ?? "").slice(-300));
+  } finally { rmSync(h.base, { recursive: true, force: true }); }
+
   const e = setup();
   try {
     // 2. gate passes on the attempt that crosses the cap: stage is recorded passed, then the run stops with 4

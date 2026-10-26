@@ -59,6 +59,17 @@ export function listTranscripts(dataDir) {
   return existsSync(dir) ? readdirSync(dir).filter((x) => x.endsWith(".json")).map((f) => join(dir, f)) : [];
 }
 
+/** Context size of the last turn of the newest transcript whose prompt names this stage (0 when none). */
+export function lastStageContext(dataDir, stage) {
+  for (const f of listTranscripts(dataDir).sort().reverse()) {
+    try {
+      const row = transcriptRow(f, JSON.parse(readFileSync(f, "utf8")));
+      if (row?.stage === stage) return row.lastCtx || row.perTurn;
+    } catch { /* unreadable transcript */ }
+  }
+  return 0;
+}
+
 /** Files the agent body tells the stage to read (`.github/...` paths in backticks), with their sizes. */
 function referencedChars(skillsRoot, systemPrompt) {
   let total = 0;

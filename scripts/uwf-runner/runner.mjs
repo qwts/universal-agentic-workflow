@@ -38,7 +38,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
-import { attemptUsage, costReport, listTranscripts } from "./cost.mjs";
+import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -388,7 +388,19 @@ async function stageLoop(ctx) {
     let prompt = basePrompt;
     let stageCost = 0;
     let lastCtx = 0; // context size of the previous attempt's last turn
+    // A recorded session being continued (resume / --from-stage): judge it by the newest transcript of this stage.
+    if (sessionId) lastCtx = lastStageContext(dataDir, st.name);
     for (let attempt = 1; ; attempt++) {
+      // An already-exhausted cap must not buy another attempt (e.g. `resume` after a cost-cap stop with the same cap).
+      if (maxCostUsd !== undefined && runCostSoFar() > maxCostUsd) {
+        row.result = "stopped: cost cap exceeded";
+        return finish(EXIT.COST, rows, `${tag}: cost cap exceeded before attempt ${attempt}: run cost $${runCostSoFar().toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}; raise the cap and use "resume" to continue`, note);
+      }
+      if (sessionId && lastCtx > resumeMaxContext) {
+        log(`${tag}: ${attempt === 1 ? "the recorded session" : `attempt ${attempt - 1}`} ended with a ${Math.round(lastCtx)}-token context (> --resume-max-context ${resumeMaxContext}); ${attempt === 1 ? "starting" : "retrying"} in a fresh session instead of resuming`);
+        sessionId = undefined;
+        prompt = `${prompt}\n\n## Previous output (fresh session)\nThis is a new session, so you do not remember the previous attempt. Its primary output file ${mp.outputsRequired[0] ?? "(none)"} ends with (last 40 lines):\n${outputExcerpt(mp.outputsRequired[0], repoRoot)}`;
+      }
       row.attempts = attempt;
       log(`${tag} → ${adapterName} (attempt ${attempt}/${maxAttempts})`);
       if (attempt > 1) cli(STATE, ["set-agent", "--agent", AGENT_ID, "--force"], withOut);
@@ -492,12 +504,6 @@ async function stageLoop(ctx) {
       if (over) { row.result = "gate failed"; return capStop(`${st.name} gate failed, retry ${attempt} of ${st.maxRetries} not started`); }
       if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
       prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
-      if (keepSession && sessionId && lastCtx > resumeMaxContext) {
-        // A resumed retry re-bills the whole conversation (cache misses re-write it at cache-write price): start fresh instead.
-        log(`${tag}: attempt ${attempt} ended with a ${Math.round(lastCtx)}-token context (> --resume-max-context ${resumeMaxContext}); retrying in a fresh session instead of resuming`);
-        sessionId = undefined;
-        prompt = `${prompt}\n\n## Previous output (fresh session)\nThis retry is a new session, so you do not remember the previous attempt. Its primary output file ${mp.outputsRequired[0] ?? "(none)"} ends with (last 40 lines):\n${outputExcerpt(mp.outputsRequired[0], repoRoot)}`;
-      }
     }
   }
   return finish(EXIT.OK, rows, "workflow complete", note);
