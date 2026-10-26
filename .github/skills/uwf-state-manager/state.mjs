@@ -13,7 +13,7 @@
  *   read                                   Read state; print JSON
  *   init [--mode <mode>]                   Initialize fresh DB (clears all data)
  *   advance  --to <phase> --agent <id>     Advance to the next phase
- *            [--note <text>] [--force]
+ *            [--note <text>] [--phases <a,b,c>] [--force]
  *   rollback --to <phase> --agent <id>     Roll back to an earlier phase
  *            [--note <text>]
  *   set-agent --agent <id> [--force]       Claim the agent token
@@ -243,12 +243,15 @@ function cmdAdvance(db) {
   const fromPhase = state.phase ?? "idea";
 
   if (!force) {
+    // The legal next phase is the first phase of the workflow's own sequence (--phases) that comes after
+    // the current one; without --phases it is the next phase of the canonical chain.
+    const sequence = parsePhaseSequence(flags["phases"]) ?? VALID_PHASES;
     const fromIdx = PHASE_ORDER[fromPhase] ?? -1;
-    const toIdx = PHASE_ORDER[toPhase];
-    if (toIdx !== fromIdx + 1) {
+    const expected = sequence.find((p) => PHASE_ORDER[p] > fromIdx);
+    if (toPhase !== expected) {
       fail(
         `Illegal phase advance: "${fromPhase}" → "${toPhase}". ` +
-        `Expected: "${VALID_PHASES[fromIdx + 1] ?? "(none)"}". Use --force to override.`
+        `Expected: "${expected ?? "(none)"}". Use --force to override.`
       );
     }
   }
@@ -462,6 +465,26 @@ function artifactsForPhase(toPhase, artPath) {
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Parse `--phases a,b,c`: the phases a workflow visits, in canonical order (duplicates ignored).
+ * Returns null when the flag is absent; exits with a usage error on unknown or out-of-order phases.
+ */
+function parsePhaseSequence(raw) {
+  if (raw === undefined) return null;
+  if (typeof raw !== "string" || !raw) usageError("--phases requires a comma-separated list of phases.");
+  const seq = [];
+  for (const p of raw.split(",").map((x) => x.trim()).filter(Boolean)) {
+    validatePhase(p);
+    if (seq.includes(p)) continue;
+    if (seq.length && PHASE_ORDER[p] < PHASE_ORDER[seq[seq.length - 1]]) {
+      usageError(`--phases must be in lifecycle order: "${p}" comes before "${seq[seq.length - 1]}".`);
+    }
+    seq.push(p);
+  }
+  if (!seq.length) usageError("--phases requires at least one phase.");
+  return seq;
+}
 
 function validatePhase(phase) {
   if (!VALID_PHASES.includes(phase)) {
