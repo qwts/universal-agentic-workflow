@@ -253,6 +253,10 @@ stages:
         - type: require_non_empty
           path: "{{output_path}}/issues-plan.md"
           label: "issues-plan.md"
+        - type: run_script
+          cmd: node
+          args: [".github/skills/uwf-orchestration-engine/verify.mjs"]
+          label: "build and tests pass (verify.mjs)"
 
   - name: review
     agent: uwf-sw_dev-reviewer

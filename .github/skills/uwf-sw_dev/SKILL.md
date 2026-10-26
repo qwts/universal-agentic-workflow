@@ -57,7 +57,7 @@ Execute stages **in this exact order** for each active issue. Do not advance pas
 | 9 | `planning` | `uwf-core-test-planner` | Produce test plan and stubs for all testable behaviour. |
 | 10 | `planning` | `uwf-core-blueprint` | Synthesize all First-phase outputs into uwf-cbs (Canonical Build Spec) and initialize uwf-br (Build Record) strata 0–4. |
 | 11 | `planning` → `execution` | `uwf-sw_dev-work-planner` | Produce work plan with implementation steps and associated tests. |
-| 12 | `execution` | `uwf-issue-implementer` | Execute the work plan. |
+| 12 | `execution` | `uwf-issue-implementer` | Execute the work plan. The stage gate runs the target repo's build and tests (`verify.mjs`; configure via `.uwf.json` `verify` or `UWF_VERIFY_CMDS`, see [verify gate](../../../docs/guide/verify-gate.md)); the commands use the target repo's own toolchain, so native modules without a prebuilt binary for the runner's Node version (e.g. better-sqlite3 12.11.1 on Node 20) fail the gate. |
 | 13 | `execution` | `uwf-sw_dev-reviewer` | Review implementation; produce fix list or recommend acceptance. *(fix-loop — see engine skill)* |
 | 14 | `execution` → `acceptance` | `uwf-core-technical-writer` | Review and update the workflow artifacts documentation from new or changed artifacts. |
 | 15 | `acceptance` | `uwf-core-acceptance` | Run acceptance gate checklist; produce `issues-acceptance.md`. |
