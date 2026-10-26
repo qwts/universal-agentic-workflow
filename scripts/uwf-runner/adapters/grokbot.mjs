@@ -69,15 +69,17 @@ export async function invokeStage(opts) {
   const start = Date.now();
   let resp = null;
   while (!resp) {
+    // Deadline first: a response that lands after the timeout is not accepted.
+    const remaining = timeoutMs ? timeoutMs - (Date.now() - start) : Infinity;
+    if (remaining <= 0) {
+      rmSync(join(root, "pending.json"), { force: true });
+      return fail(`timeout after ${timeoutMs}ms waiting for ${responsePath}`);
+    }
     if (existsSync(responsePath)) {
       try { resp = JSON.parse(readFileSync(responsePath, "utf8")); } catch { /* partially written; retry */ }
     }
     if (resp) break;
-    if (timeoutMs && Date.now() - start > timeoutMs) {
-      rmSync(join(root, "pending.json"), { force: true });
-      return fail(`timeout after ${timeoutMs}ms waiting for ${responsePath}`);
-    }
-    await new Promise((r) => setTimeout(r, poll));
+    await new Promise((r) => setTimeout(r, Math.min(poll, remaining)));
   }
   rmSync(join(root, "pending.json"), { force: true });
   const ok = resp.ok !== false;

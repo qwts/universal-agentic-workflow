@@ -161,6 +161,12 @@ if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
   check("agent failure -> ok:false with error", r2.ok === false && /nope/.test(r2.error));
   const r3 = await g.invokeStage({ prompt: "x", cwd, dataDir, env, timeoutMs: 50 });
   check("timeout -> ok:false", r3.ok === false && /timeout/.test(r3.error));
+  // A response that lands after the deadline (but before the next slow poll) is not accepted.
+  respond({ ok: true, summary: "late" });
+  const t0 = Date.now();
+  const r4 = await g.invokeStage({ prompt: "x", cwd, dataDir, env: { UWF_GROKBOT_POLL_MS: "400" }, timeoutMs: 60 });
+  check("late response after timeout -> ok:false", r4.ok === false && /timeout/.test(r4.error));
+  check("sleep is capped at the remaining timeout", Date.now() - t0 < 300, `${Date.now() - t0}ms`);
   rmSync(root, { recursive: true, force: true });
 }
 
