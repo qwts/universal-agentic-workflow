@@ -1106,5 +1106,34 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
+// Model selection: --model > stage model > adapter default (claude-code only) ------------------
+{
+  console.log("# model selection");
+  const s = setup();
+  try {
+    const dflt = run(s, ["--adapter", "claude-code", "--dry-run"]);
+    check("claude-code dry-run shows the Sonnet default", dflt.code === 0 && dflt.out.includes("model: claude-sonnet-5-5 (default for claude-code; pass --model to override)"), dflt.out.slice(0, 600));
+    check("claude-code dry-run never says (adapter default)", !dflt.out.includes("(adapter default)"));
+    const over = run(s, ["--adapter", "claude-code", "--model", "claude-test-x", "--dry-run"]);
+    check("--model wins over the default", over.out.includes("model: claude-test-x (--model)") && !over.out.includes("claude-sonnet-5-5"), over.out.slice(0, 600));
+    const fake = run(s, ["--dry-run"]);
+    check("fake adapter keeps the adapter default", fake.out.includes("model: (adapter default)") && !fake.out.includes("claude-sonnet-5-5"));
+    const cap = run(s, ["--dry-run", "--max-cost-usd", "5"]);
+    check("dry-run banner states the cap is a stop-after check", /stop-after check/.test(cap.out) && /single attempt can exceed it/.test(cap.out), cap.out.slice(0, 400));
+    check("no cap, no cap note", !fake.out.includes("stop-after"));
+
+    // A real claude-code run with a fake `claude` on PATH: the run log names the resolved model.
+    const bin = join(s.base, "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "claude"), `#!${process.execPath}\nprocess.stderr.write("fake claude\\n"); process.exit(1);\n`, { mode: 0o755 });
+    const env = { UWF_FAKE_FIXTURE_DIR: "", PATH: `${bin}:${process.env.PATH ?? ""}` };
+    const live = run(s, ["--adapter", "claude-code", "--timeout-ms", "20000"], env);
+    check("claude-code run logs the Sonnet default once", live.err.includes("model: claude-sonnet-5-5 (default for claude-code; pass --model to override)"), live.err.slice(0, 600));
+    rmSync(s.data, { recursive: true, force: true });
+    const live2 = run(s, ["--adapter", "claude-code", "--model", "claude-test-x", "--timeout-ms", "20000"], env);
+    check("claude-code run with --model logs that model", live2.err.includes("model: claude-test-x (--model)") && !live2.err.includes("claude-sonnet-5-5"), live2.err.slice(0, 600));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
