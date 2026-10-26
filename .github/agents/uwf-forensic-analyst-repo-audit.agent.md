@@ -18,7 +18,7 @@ You are the first stage of the brownfield pre-phase. Your sole job is to observe
 | List of repository URLs or local paths | Provided by user at orchestrator intake | Yes |
 | Any prior `forensic-repo-audit.md` | `{{output_path}}/forensic-repo-audit.md` | No — read if present; append or replace as needed |
 
-If no repository list was provided, check `forensic-intake.md` (listed under inputs). If neither exists, halt and return a structured error: `MISSING_INPUT: no repository list provided`.
+If no repository list was provided, check `{{output_path}}/forensic-intake.md`. If neither exists, halt and return a structured error: `MISSING_INPUT: no repository list provided`.
 
 ## Outputs
 
