@@ -77,7 +77,7 @@ echo '{}' >"$RUNNER/.runner"; echo uwf >"$RUNNER/.service"
 printf '#!/bin/sh\necho "active (running)"\n' >"$RUNNER/svc.sh"; chmod +x "$RUNNER/svc.sh"
 
 make_path "$TMP/good"
-OUT="$(env -i HOME="$TMP" PATH="$TMP/good" GH_TOKEN=ghp_FAKEBOTTOKEN0001 ANTHROPIC_API_KEY=sk-ant-FAKEKEY0002 OPENAI_API_KEY=sk-FAKEOPENAI0003 UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=ghp_FAKEBOTTOKEN0001 ANTHROPIC_API_KEY=sk-ant-FAKEKEY0002 OPENAI_API_KEY=sk-FAKEOPENAI0003 UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && pass "all-good exits 0" || { bad "all-good exits 0 (got $rc)"; echo "$OUT"; }
 assert_has "$OUT" "all checks passed" "all-good verdict"
 for secret in ghp_FAKEBOTTOKEN0001 sk-ant-FAKEKEY0002 sk-FAKEOPENAI0003; do
@@ -85,27 +85,32 @@ for secret in ghp_FAKEBOTTOKEN0001 sk-ant-FAKEKEY0002 sk-FAKEOPENAI0003; do
 done
 
 make_path "$TMP/nocodex" codex
-OUT="$(env -i HOME="$TMP" PATH="$TMP/nocodex" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/nocodex" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && pass "missing codex exits 1" || bad "missing codex exits 1 (got $rc)"
 assert_has "$OUT" "missing: codex - run: npm i -g @openai/codex" "named fix for codex"
 
 make_path "$TMP/old"; printf '#!/bin/sh\necho v20.11.0\n' >"$TMP/old/node"
-OUT="$(env -i HOME="$TMP" PATH="$TMP/old" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/old" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && pass "node 20 exits 1" || bad "node 20 exits 1 (got $rc)"
 assert_has "$OUT" "outdated: node v20.11.0" "named fix for old node"
 
-OUT="$(env -i HOME="$TMP" PATH="$TMP/good" GH_TOKEN=x UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && pass "missing API keys exits 1" || bad "missing API keys exits 1 (got $rc)"
 assert_has "$OUT" "missing: ANTHROPIC_API_KEY" "named fix for anthropic key"
 
-OUT="$(env -i HOME="$TMP" PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=999999999 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=999999999 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && pass "low disk exits 1" || bad "low disk exits 1 (got $rc)"
 assert_has "$OUT" "low disk" "low disk named"
 
 printf '#!/bin/sh\necho "inactive (dead)"\n' >"$RUNNER/svc.sh"
-OUT="$(env -i HOME="$TMP" PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && pass "stopped service exits 1" || bad "stopped service exits 1 (got $rc)"
 assert_has "$OUT" "svc.sh start" "named fix for stopped service"
+
+printf '#!/bin/sh\necho "$@" >"%s/sudo.log"; exec "$@"\n' "$TMP" >"$TMP/good/sudo"; chmod +x "$TMP/good/sudo"
+printf '#!/bin/sh\necho "active (running)"\n' >"$RUNNER/svc.sh"
+env -i HOME="$TMP" UWF_DOCTOR_SUDO=sudo PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && grep -q "svc.sh status" "$TMP/sudo.log" && pass "service status goes through the sudo prefix" || bad "service status goes through the sudo prefix (rc $rc)"
 
 echo
 echo "runner-host tests: $PASS passed, $FAIL failed"

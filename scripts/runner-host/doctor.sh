@@ -99,10 +99,12 @@ if [ -f "$DIR/.runner" ]; then ok "runner registered ($DIR/.runner)"; else
   fail "missing: runner registration in $DIR - run: scripts/runner-host/provision.sh --repo <owner/name> --name <name>"
 fi
 
-if [ "$(id -u)" -eq 0 ] || [ "$(uname -s)" = Darwin ]; then pre=""; else pre="sudo "; fi
+# The Linux systemd svc.sh refuses every command (status included) unless run as root.
+# UWF_DOCTOR_SUDO overrides the prefix (set it empty to disable; used by the tests).
+if [ -n "${UWF_DOCTOR_SUDO+x}" ]; then pre="${UWF_DOCTOR_SUDO:+$UWF_DOCTOR_SUDO }"
+elif [ "$(id -u)" -eq 0 ] || [ "$(uname -s)" = Darwin ]; then pre=""; else pre="sudo "; fi
 if [ -f "$DIR/.service" ] && [ -x "$DIR/svc.sh" ]; then
-  # status needs no root (systemctl status / launchctl list)
-  status_out="$(cd "$DIR" && ./svc.sh status 2>&1 || true)"
+  status_out="$(cd "$DIR" && ${pre}./svc.sh status 2>&1 || true)"
   if printf '%s' "$status_out" | grep -Eiq 'not started|inactive|stopped|not installed|failed'; then
     fail "stopped: runner service - run: cd $DIR && ${pre}./svc.sh start"
   elif printf '%s' "$status_out" | grep -Eiq 'active \(running\)|started|running'; then
