@@ -18,7 +18,7 @@
  * Never throws, never evaluates gates, never writes workflow state.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { resolveDataDir, writeTranscript, buildSystemPrompt } from "./index.mjs";
 
@@ -68,17 +68,18 @@ export async function invokeStage(opts) {
   const poll = Number(env?.UWF_GROKBOT_POLL_MS ?? process.env.UWF_GROKBOT_POLL_MS ?? 2000);
   const start = Date.now();
   let resp = null;
+  const deadline = timeoutMs ? start + timeoutMs : Infinity;
+  const timedOut = () => { rmSync(join(root, "pending.json"), { force: true }); return fail(`timeout after ${timeoutMs}ms waiting for ${responsePath}`); };
   while (!resp) {
-    // Deadline first: a response that lands after the timeout is not accepted.
-    const remaining = timeoutMs ? timeoutMs - (Date.now() - start) : Infinity;
-    if (remaining <= 0) {
-      rmSync(join(root, "pending.json"), { force: true });
-      return fail(`timeout after ${timeoutMs}ms waiting for ${responsePath}`);
-    }
     if (existsSync(responsePath)) {
       try { resp = JSON.parse(readFileSync(responsePath, "utf8")); } catch { /* partially written; retry */ }
+      // The deadline applies to when the agent finished (the file's mtime), not to when this loop
+      // happened to look: a response completed in time is accepted even if observed at the final wake-up.
+      if (resp && statSync(responsePath).mtimeMs > deadline) return timedOut();
     }
     if (resp) break;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return timedOut();
     await new Promise((r) => setTimeout(r, Math.min(poll, remaining)));
   }
   rmSync(join(root, "pending.json"), { force: true });
