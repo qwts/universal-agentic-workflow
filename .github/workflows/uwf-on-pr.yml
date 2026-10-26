@@ -37,17 +37,21 @@ on:
       OPENAI_API_KEY:
         description: Optional. Normally the self-hosted machine's service environment supplies it
         required: false
+      UWF_BOT_TOKEN:
+        description: Optional. Bot token used only to push the run's commit to the PR branch as the bot; without it nothing is pushed
+        required: false
 
 permissions:
   contents: read
   issues: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   uwf:
     name: UWF ${{ inputs.workflow }} on PR
     # Fork PRs would run untrusted code on a self-hosted machine; only same-repo PRs run.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    # A push by a bot (the run's own commit, made with a GitHub App token) must not start another run.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.sender.type != 'Bot' }}
     runs-on: [self-hosted, uwf]
     timeout-minutes: 180
     concurrency:
@@ -55,6 +59,8 @@ jobs:
       cancel-in-progress: true
     env:
       UWF_DATA_DIR: ${{ runner.temp }}/uwf-${{ github.run_id }}
+      # The `uwf:keep` label keeps the whole data dir in the artifact and skips its removal.
+      UWF_KEEP: ${{ contains(github.event.pull_request.labels.*.name, 'uwf:keep') }}
     steps:
       - name: Check out the PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -259,20 +265,89 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload workflow artifacts and transcripts
+      - name: Push the run's commit as the bot
+        id: push
+        if: ${{ always() && steps.run.outputs.exit_code == '0' }}
+        shell: bash
+        env:
+          # Only this step sees the bot token; it is read by push-as-bot.mjs and never printed or stored.
+          UWF_BOT_TOKEN: ${{ secrets.UWF_BOT_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          RUN_ID: ${{ github.run_id }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          WORKFLOW: ${{ inputs.workflow }}
+          RESULT_FILE: ${{ runner.temp }}/push-result.json
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: |
+          set -uo pipefail
+          node uwf/scripts/uwf-on-pr/push-as-bot.mjs
+
+      - name: Report to the PR
         if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUNNER_EXIT: ${{ steps.run.outputs.exit_code }}
+          RUNNER_LOG: ${{ runner.temp }}/runner.log
+          PUSH_RESULT: ${{ runner.temp }}/push-result.json
+          COST_FILE: ${{ runner.temp }}/cost.txt
+          INPUT_WORKFLOW: ${{ inputs.workflow }}
+          INPUT_MAX_COST_USD: ${{ inputs.max_cost_usd }}
+        run: |
+          set -uo pipefail
+          UWF_KEPT="$UWF_KEEP"
+          export UWF_KEPT
+          node uwf/scripts/uwf-runner/runner.mjs cost \
+            --data-dir "$UWF_DATA_DIR" \
+            --workflow "$INPUT_WORKFLOW" \
+            --repo-root "$GITHUB_WORKSPACE/target" > "$COST_FILE" 2>&1 || rm -r "$COST_FILE"
+          node uwf/scripts/uwf-on-pr/report.mjs
+
+      - name: Scrub secrets from transcripts
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          node uwf/scripts/uwf-on-pr/scrub.mjs \
+            "$UWF_DATA_DIR" \
+            "$RUNNER_TEMP/runner.log" \
+            "$GITHUB_WORKSPACE/target/tmp/workflow-artifacts"
+
+      - name: Upload workflow artifacts and transcripts
+        if: ${{ always() && env.UWF_KEEP != 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: uwf-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
           path: |
             target/tmp/workflow-artifacts
             ${{ runner.temp }}/uwf-${{ github.run_id }}/transcripts
+            ${{ runner.temp }}/uwf-${{ github.run_id }}/workflow-artifacts
+            ${{ runner.temp }}/runner.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the whole data directory (uwf:keep)
+        if: ${{ always() && env.UWF_KEEP == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uwf-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: |
+            target/tmp/workflow-artifacts
+            ${{ runner.temp }}/uwf-${{ github.run_id }}
             ${{ runner.temp }}/runner.log
           if-no-files-found: warn
           retention-days: 14
 
       - name: Remove the per-run data directory
-        if: ${{ always() }}
+        if: ${{ always() && env.UWF_KEEP != 'true' }}
         shell: bash
         run: |
           if test -e "$UWF_DATA_DIR"; then rm -r "$UWF_DATA_DIR"; fi
