@@ -66,6 +66,11 @@ function setup() {
     // This scratch repo ships its own definitions (a consumer repo that overrides them); the
     // "bare target" cases below use setupBare() instead.
     cpSync(join(SKILLS, "uwf-sw_dev"), join(s.repo, ".github", "skills", "uwf-sw_dev"), { recursive: true });
+    // The implementation gate runs verify.mjs from the skills root, which here is this repo's own copy.
+    mkdirSync(join(s.repo, ".github", "skills", "uwf-orchestration-engine"), { recursive: true });
+    cpSync(join(SKILLS, "uwf-orchestration-engine", "verify.mjs"), join(s.repo, ".github", "skills", "uwf-orchestration-engine", "verify.mjs"));
+    // Nothing to build or test in this scratch repo: an explicit empty list says so.
+    writeFileSync(join(s.repo, ".uwf.json"), JSON.stringify({ verify: [] }));
   } catch (e) {
     rmSync(s.base, { recursive: true, force: true });
     throw e;
