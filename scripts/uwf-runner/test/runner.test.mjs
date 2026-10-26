@@ -783,6 +783,7 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
     const before = reviewT(g).length;
     const r2 = resume(g, ["--max-cost-usd", "1"]);
     check("resume with an already-exceeded cap exits 4 without invoking the adapter", r1.code === 4 && r2.code === 4 && reviewT(g).length === before && /cost cap exceeded before attempt 1/.test(r2.err), `${r1.code} ${r2.code} ${r2.err.slice(-300)}`);
+    check("the early cap exit releases the agent token", skillJson("uwf-state-manager/state.mjs", ["read"], g)?.state?.current_agent === null, JSON.stringify(skillJson("uwf-state-manager/state.mjs", ["read"], g)?.state?.current_agent));
     const n = transcripts(g).length;
     const r3 = resume(g, ["--max-cost-usd", "50"]);
     check("resume with a raised cap continues", r3.code === 0 && transcripts(g).length > n, `${r3.code} ${r3.err.slice(-300)}`);

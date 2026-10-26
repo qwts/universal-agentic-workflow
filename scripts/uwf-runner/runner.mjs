@@ -394,6 +394,7 @@ async function stageLoop(ctx) {
       // An already-exhausted cap must not buy another attempt (e.g. `resume` after a cost-cap stop with the same cap).
       if (maxCostUsd !== undefined && runCostSoFar() > maxCostUsd) {
         row.result = "stopped: cost cap exceeded";
+        cli(STATE, ["release-agent"], withOut); // the stage setup above claimed the token
         return finish(EXIT.COST, rows, `${tag}: cost cap exceeded before attempt ${attempt}: run cost $${runCostSoFar().toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}; raise the cap and use "resume" to continue`, note);
       }
       if (sessionId && lastCtx > resumeMaxContext) {
