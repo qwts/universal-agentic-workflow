@@ -661,7 +661,7 @@ function evaluateGate(stageDef, stageName) {
     const failure = evaluateCheck(check);
     if (failure) {
       failures.push(failure); prescriptions.push(prescribeCheck(check, failure));
-      const seen = verdictOfCheck(check);
+      const seen = verdictOfCheck(check, failure);
       if (seen !== null) verdict = seen;
       else if (!(check.type === "require_contains" && /^verdict:/i.test(check.text ?? ""))) otherFailure = true;
     }
@@ -683,7 +683,9 @@ function evaluateGate(stageDef, stageName) {
  * The observed string value of /verdict for a require_json_field equals/in check on that pointer,
  * or null when the check is something else or the field is absent/invalid (a missing verdict is not an outcome).
  */
-function verdictOfCheck(check) {
+function verdictOfCheck(check, failure) {
+  // A result that fails the stage-result schema is malformed output to repair, not a review outcome.
+  if (failure && /does not match stage-result schema/.test(failure)) return null;
   if (check.type !== "require_json_field" || check.pointer !== "/verdict" || !("equals" in check || "in" in check)) return null;
   try {
     const { found, value } = resolvePointer(JSON.parse(readFileSync(resolveTemplates(check.path), "utf8")), "/verdict");
@@ -732,7 +734,7 @@ function prescribeCheck(check, failure) {
       else if ("equals" in check) want = `${ptr} equal to ${q(check.equals)}`;
       else want = `${ptr} set as the gate requires`;
       if (failure && check.pointer === "/verdict" && ("equals" in check || "in" in check)) {
-        const seen = verdictOfCheck(check);
+        const seen = verdictOfCheck(check, failure);
         if (seen !== null) return verdictOutcome(p, seen, "equals" in check ? check.equals : check.in);
       }
       const detail = failure?.match(/does not match stage-result schema: ([\s\S]*)$/)?.[1];

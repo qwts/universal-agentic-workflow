@@ -842,5 +842,21 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
+{
+  console.log("# on_verdict: a schema-invalid changes_requested result is retried, not routed");
+  const s = setup();
+  try {
+    const bad = changesRequested();
+    bad.files[RV_JSON] = JSON.stringify({ verdict: "changes_requested" }) + "\n"; // findings missing
+    const good = reviewPass(s);
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [bad, { files: good.files, transcript: good.transcript }] }));
+    const r = run(s);
+    check("exits 0", r.code === 0, `${r.code} ${r.err.slice(-600)}`);
+    check("no routing happened", !r.err.includes("routing back") && countInvocations(s, "implementation").length === 1, r.err.slice(-600));
+    const rev = countInvocations(s, "review");
+    check("review was retried with the schema prescription", rev.length === 2 && rev[1].prompt.includes("## Gate failure (retry 1 of 3)") && /\/findings is required/.test(rev[1].prompt), rev[1]?.prompt.slice(-700));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
