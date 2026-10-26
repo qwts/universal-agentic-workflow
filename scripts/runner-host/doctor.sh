@@ -78,7 +78,7 @@ env_has() { # env_has KEY : set in environment or in the runner's .env
 for key in ANTHROPIC_API_KEY OPENAI_API_KEY CODEX_API_KEY; do
   if env_has "$key"; then ok "$key present (value not shown)"; else
     if [ "$key" = CODEX_API_KEY ]; then
-      fail "missing: CODEX_API_KEY (what `codex exec` reads) - run: export OPENAI_API_KEY=<key> and re-run scripts/runner-host/provision.sh (writes CODEX_API_KEY to $DIR/.env)"
+      fail "missing: CODEX_API_KEY (the key codex exec reads) - run: export OPENAI_API_KEY=<key> and re-run scripts/runner-host/provision.sh (writes CODEX_API_KEY to $DIR/.env)"
     else
       fail "missing: $key - run: export $key=<key> and re-run scripts/runner-host/provision.sh (writes it to $DIR/.env)"
     fi

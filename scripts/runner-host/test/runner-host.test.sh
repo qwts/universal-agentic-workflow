@@ -113,6 +113,7 @@ env -i HOME="$TMP" UWF_DOCTOR_SUDO=sudo PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_AP
 [ "$rc" -eq 0 ] && grep -q "svc.sh status" "$TMP/sudo.log" && pass "service status goes through the sudo prefix" || bad "service status goes through the sudo prefix (rc $rc)"
 
 # service PATH in .env must resolve the CLIs
+printf '#!/bin/sh\ncase "$1" in --version) echo codex 1.2.3 ;; *) : >"%s/codex-exec-ran" ;; esac\n' "$TMP" >"$TMP/good/codex"
 make_path "$TMP/svc" codex
 printf 'PATH=%s\n' "$TMP/svc" >"$RUNNER/.env"
 printf '#!/bin/sh\necho "     Active: active (running)"\n' >"$RUNNER/svc.sh"
@@ -124,6 +125,8 @@ env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KE
 [ "$rc" -eq 0 ] && pass "complete service PATH exits 0" || bad "complete service PATH (got $rc)"
 OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"
 assert_has "$OUT" "missing: CODEX_API_KEY" "named fix for CODEX_API_KEY"
+assert_has "$OUT" "the key codex exec reads" "diagnostic renders literally"
+[ ! -e "$TMP/codex-exec-ran" ] && pass "diagnostic did not execute codex" || bad "diagnostic executed codex"
 assert_has "$PLAN" "CODEX_API_KEY" "plan writes CODEX_API_KEY"
 
 echo
