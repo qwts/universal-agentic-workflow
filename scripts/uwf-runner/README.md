@@ -141,6 +141,8 @@ Resolution rule for the skills root, first match wins:
 
 The runner passes the resolved root to every CLI it spawns (`UWF_SKILLS_ROOT`) and to prompt materialization, which rewrites the `.github/skills/...` and `.github/agents/...` paths inside agent text to absolute paths under the skills root, so a stage never looks for them in the target. `run`, `resume`, `--dry-run`, `gates` and `cost` all use the same rule.
 
+Gate commands (`run_script` checks in a `stages.yaml`) resolve skill paths the same way prompts do: the stage tracker reads the root from `--skills-root` or `UWF_SKILLS_ROOT`, and every `.github/skills/...` or `.github/agents/...` path in a check's `cmd` or `args` is replaced by the target repo's own copy when one exists, otherwise by the same path under the skills root. The command still runs with cwd = the repo root, so relative output paths and `{{cwd}}` keep meaning the target; `{{skills_root}}` is also available. Without a skills root the command is left as written.
+
 What the target needs: a git repo and the output path (created on demand). No `.github/`, no skills, no agents.
 
 ```
