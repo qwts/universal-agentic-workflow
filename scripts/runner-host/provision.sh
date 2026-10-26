@@ -237,10 +237,12 @@ else
   SVC_PREFIX=""; SVC_INSTALL_ARGS="install"
 fi
 svc_running() {
+  # Judge by the state line only: systemd status output also carries journal lines that can
+  # contain words like "failed" while the unit is healthy.
   local out
   out="$(cd "$DIR" && ${SVC_PREFIX}./svc.sh status 2>&1 || true)"
-  printf '%s' "$out" | grep -Eiq 'not started|inactive|stopped|not installed' && return 1
-  printf '%s' "$out" | grep -Eiq 'active \(running\)|started'
+  if printf '%s\n' "$out" | grep -Ei '^[[:space:]]*Active:' | head -n 1 | grep -Eiq 'active \(running\)'; then return 0; fi
+  printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*Started'
 }
 if [ "$DRY" -eq 0 ] && [ -f "$DIR/.service" ]; then
   echo "ok: service already installed"

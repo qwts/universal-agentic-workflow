@@ -99,15 +99,28 @@ if [ -f "$DIR/.runner" ]; then ok "runner registered ($DIR/.runner)"; else
   fail "missing: runner registration in $DIR - run: scripts/runner-host/provision.sh --repo <owner/name> --name <name>"
 fi
 
+# Classify `svc.sh status` output by its state line only (journal lines in a systemd
+# status may contain words like "failed" even when the unit is healthy).
+svc_state() {
+  local out="$1" active
+  active="$(printf '%s\n' "$out" | grep -Ei '^[[:space:]]*Active:' | head -n 1)"
+  if [ -n "$active" ]; then
+    if printf '%s' "$active" | grep -Eiq 'active \(running\)'; then echo running; else echo stopped; fi
+  elif printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*Not started'; then echo stopped
+  elif printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*Started'; then echo running
+  else echo unknown; fi
+}
+
 # The Linux systemd svc.sh refuses every command (status included) unless run as root.
 # UWF_DOCTOR_SUDO overrides the prefix (set it empty to disable; used by the tests).
 if [ -n "${UWF_DOCTOR_SUDO+x}" ]; then pre="${UWF_DOCTOR_SUDO:+$UWF_DOCTOR_SUDO }"
 elif [ "$(id -u)" -eq 0 ] || [ "$(uname -s)" = Darwin ]; then pre=""; else pre="sudo "; fi
 if [ -f "$DIR/.service" ] && [ -x "$DIR/svc.sh" ]; then
   status_out="$(cd "$DIR" && ${pre}./svc.sh status 2>&1 || true)"
-  if printf '%s' "$status_out" | grep -Eiq 'not started|inactive|stopped|not installed|failed'; then
+  state="$(svc_state "$status_out")"
+  if [ "$state" = stopped ]; then
     fail "stopped: runner service - run: cd $DIR && ${pre}./svc.sh start"
-  elif printf '%s' "$status_out" | grep -Eiq 'active \(running\)|started|running'; then
+  elif [ "$state" = running ]; then
     ok "runner service running"
   else
     fail "unknown: runner service state - run: cd $DIR && ${pre}./svc.sh status"

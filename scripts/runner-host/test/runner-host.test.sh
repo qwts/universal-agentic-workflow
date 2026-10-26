@@ -74,7 +74,7 @@ make_path() { # make_path DIR [omit-cli]
 RUNNER="$TMP/runner"
 mkdir -p "$RUNNER"
 echo '{}' >"$RUNNER/.runner"; echo uwf >"$RUNNER/.service"
-printf '#!/bin/sh\necho "active (running)"\n' >"$RUNNER/svc.sh"; chmod +x "$RUNNER/svc.sh"
+printf '#!/bin/sh\necho "* runner.service - GitHub Actions Runner"\necho "     Active: active (running) since Mon"\necho "Oct 25 job step failed: exit 1"\n' >"$RUNNER/svc.sh"; chmod +x "$RUNNER/svc.sh"
 
 make_path "$TMP/good"
 OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=ghp_FAKEBOTTOKEN0001 ANTHROPIC_API_KEY=sk-ant-FAKEKEY0002 OPENAI_API_KEY=sk-FAKEOPENAI0003 UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
@@ -102,13 +102,13 @@ OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC
 [ "$rc" -eq 1 ] && pass "low disk exits 1" || bad "low disk exits 1 (got $rc)"
 assert_has "$OUT" "low disk" "low disk named"
 
-printf '#!/bin/sh\necho "inactive (dead)"\n' >"$RUNNER/svc.sh"
+printf '#!/bin/sh\necho "     Active: inactive (dead)"\n' >"$RUNNER/svc.sh"
 OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && pass "stopped service exits 1" || bad "stopped service exits 1 (got $rc)"
 assert_has "$OUT" "svc.sh start" "named fix for stopped service"
 
 printf '#!/bin/sh\necho "$@" >"%s/sudo.log"; exec "$@"\n' "$TMP" >"$TMP/good/sudo"; chmod +x "$TMP/good/sudo"
-printf '#!/bin/sh\necho "active (running)"\n' >"$RUNNER/svc.sh"
+printf '#!/bin/sh\necho "     Active: active (running)"\n' >"$RUNNER/svc.sh"
 env -i HOME="$TMP" UWF_DOCTOR_SUDO=sudo PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && grep -q "svc.sh status" "$TMP/sudo.log" && pass "service status goes through the sudo prefix" || bad "service status goes through the sudo prefix (rc $rc)"
 
