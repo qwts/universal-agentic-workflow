@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -54,33 +54,61 @@ const PHASES = ["idea", "intake", "discovery", "planning", "execution", "accepta
 const isDone = (status) => status === "passed" || status === "skipped";
 
 const LOCK_FILE = "run.lock";
+const LOCK_WAIT_MS = 3_000;      // how long to wait on a lock whose metadata is still being written
+const LOCK_UNREADABLE_STALE_MS = 10_000; // an unreadable lock older than this has no live writer
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
  * One run per data dir: parallel fronts share skill SQLite DBs unless each has its own --data-dir.
- * Writes <dataDir>/run.lock ({runId, pid, ...}) with the exclusive `wx` flag. A lock whose pid is
- * dead (crashed run) is replaced; a live one throws a UsageError. Returns a release function.
+ * Creates <dataDir>/run.lock ({runId, pid, ...}) atomically with its contents already written
+ * (a temp file hard-linked into place: link fails with EEXIST when a lock exists, and no reader
+ * ever sees a half-written lock). A lock whose owner pid is dead is taken over; an unreadable lock
+ * is waited on while young and treated as stale only when old; a live owner throws a UsageError.
+ * Takeover renames the inspected file aside and checks it is still the same inode before
+ * discarding it, so a lock that another run created meanwhile is put back, never deleted.
+ * Returns a release function that removes only this run's own lock.
  */
 function acquireRunLock(dataDir, workflow) {
   mkdirSync(dataDir, { recursive: true });
   const lockPath = join(dataDir, LOCK_FILE);
   const info = { runId: `${workflow}-${process.pid}-${Date.now()}`, pid: process.pid, workflow, startedAt: new Date().toISOString() };
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      writeFileSync(lockPath, JSON.stringify(info), { flag: "wx" });
-      return () => {
-        try { if (JSON.parse(readFileSync(lockPath, "utf8")).runId === info.runId) rmSync(lockPath, { force: true }); } catch { /* already gone */ }
-      };
-    } catch (e) {
-      if (e.code !== "EEXIST") throw e;
+  const tmp = `${lockPath}.${process.pid}.tmp`;
+  const aside = `${lockPath}.stale.${process.pid}`;
+  const readLock = () => { try { return JSON.parse(readFileSync(lockPath, "utf8")); } catch { return null; } };
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  try {
+    writeFileSync(tmp, JSON.stringify(info));
+    while (true) {
+      try {
+        linkSync(tmp, lockPath);
+        return () => {
+          try { if (readLock()?.runId === info.runId) rmSync(lockPath, { force: true }); } catch { /* already gone */ }
+        };
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+      let st;
+      try { st = statSync(lockPath); } catch { continue; } // released between link and stat
+      const other = readLock();
+      if (other && Number.isInteger(other.pid) && pidAlive(other.pid)) {
+        throw new UsageError(`Data dir ${dataDir} is in use by run ${other.runId} (pid ${other.pid}). Parallel fronts must each pass a distinct --data-dir (and --output-path); two runs sharing one would collide on the skill SQLite DBs.`);
+      }
+      const stale = other ? true : Date.now() - st.mtimeMs > LOCK_UNREADABLE_STALE_MS;
+      if (!stale) {
+        if (Date.now() >= deadline) throw new UsageError(`Could not take ${lockPath}; another run is starting on the same --data-dir. Use a distinct --data-dir per parallel front.`);
+        sleepMs(50);
+        continue;
+      }
+      // Stale: move the inspected file aside; if the inode changed, someone replaced it meanwhile.
+      try { renameSync(lockPath, aside); } catch { continue; }
+      try {
+        if (statSync(aside).ino === st.ino) rmSync(aside, { force: true });
+        else renameSync(aside, lockPath); // not the file we inspected: give it back
+      } catch { /* vanished */ }
     }
-    let other = null;
-    try { other = JSON.parse(readFileSync(lockPath, "utf8")); } catch { /* unreadable: treat as stale */ }
-    if (other && Number.isInteger(other.pid) && pidAlive(other.pid)) {
-      throw new UsageError(`Data dir ${dataDir} is in use by run ${other.runId} (pid ${other.pid}). Parallel fronts must each pass a distinct --data-dir (and --output-path); two runs sharing one would collide on the skill SQLite DBs.`);
-    }
-    rmSync(lockPath, { force: true }); // stale: owner is gone
+  } finally {
+    rmSync(tmp, { force: true });
   }
-  throw new UsageError(`Could not take ${lockPath}; another run is starting on the same --data-dir. Use a distinct --data-dir per parallel front.`);
 }
 
 function pidAlive(pid) {

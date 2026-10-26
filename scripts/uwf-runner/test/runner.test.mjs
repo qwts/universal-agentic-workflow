@@ -6,7 +6,7 @@
  * purpose: they are conditional and the happy path asserts they are skipped, not invoked.
  */
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1060,6 +1060,17 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
     const r2 = run(s);
     check("stale lock: replaced and run completes", r2.code === 0, `${r2.code} ${r2.err.slice(-400)}`);
     check("lock removed on exit", !existsSync(lock));
+    // Unreadable metadata (an owner still writing, or garbage) is waited on while young, not reclaimed.
+    writeFileSync(lock, "");
+    const r3 = run(s);
+    check("young unreadable lock: exits 2 instead of taking over", r3.code === 2 && r3.err.includes("another run is starting"), `${r3.code} ${r3.err.slice(-400)}`);
+    check("young unreadable lock: left in place", existsSync(lock));
+    // The same file, old enough that no live writer can still be filling it in, is stale.
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(lock, old, old);
+    const r4 = run(s);
+    check("old unreadable lock: replaced and run completes", r4.code === 0, `${r4.code} ${r4.err.slice(-400)}`);
+    check("lock removed on exit (2)", !existsSync(lock));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
