@@ -27,15 +27,17 @@ UWF_FAKE_FIXTURE_DIR=scripts/uwf-runner/test/fixtures/sw_dev \
   node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add a DELETE route" \
   --adapter fake --dry-run --repo-root ../my-app
 
-# 2. Real run: one stage at a time through Claude Code, capped at $1.
+# 2. Real run: one stage at a time through Claude Code, capped at $1 for the run.
 node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md \
   --adapter claude-code --model <model-id> --repo-root ../my-app \
   --skills-root /path/to/universal-agentic-workflow \
-  --data-dir ./tmp/uwf-run --non-interactive --max-cost-usd 1
+  --data-dir ./tmp/uwf-run --max-cost-usd 1
 
 # 3. Resume after an interruption, a pending question, or a cost stop.
+#    The cap is not stored: pass --max-cost-usd again (raise it after exit 4).
 node scripts/uwf-runner/runner.mjs resume --workflow sw_dev --adapter claude-code --model <model-id> \
-  --repo-root ../my-app --skills-root /path/to/universal-agentic-workflow --data-dir ./tmp/uwf-run --non-interactive
+  --repo-root ../my-app --skills-root /path/to/universal-agentic-workflow --data-dir ./tmp/uwf-run \
+  --max-cost-usd 1
 
 # 4. Cost report for the run: turns, context per turn, tokens, cost, flags.
 node scripts/uwf-runner/runner.mjs cost --data-dir ./tmp/uwf-run --workflow sw_dev --repo-root ../my-app
@@ -53,6 +55,10 @@ node scripts/uwf-runner/runner.mjs gates --workflow sw_dev
 | 2 | Usage or config error |
 | 3 | Questions pending (answer with `.github/skills/uwf-question-protocol/questions.mjs answer`, then `--from-stage <stage>`) |
 | 4 | Cost cap exceeded (`--max-cost-usd` or a stage's `max_cost_usd`); raise it and `resume` |
+
+`--max-cost-usd` is read only from the command line; the runner does not store it, so `resume` without it has no cap. The cap counts cumulative cost of the run's transcripts, including those from before the resume.
+
+`--non-interactive` answers no questions. Each pending or newly asked question is marked skipped and the stage continues. Without the flag, a pending required question stops the run with exit 3.
 
 `--goal` takes a file path or inline text. `--from-stage <s>` re-runs from a stage and rolls the state back. `--force` re-initializes a completed data dir.
 
@@ -140,6 +146,7 @@ Skills are the swappable behavior modules. Each has a `SKILL.md` and agents oper
 | `uwf-snapshot` | Snapshot stage: Deterministic Reconstruction Spec (`uwf-drs`) and changelog closure |
 | `uwf-solutions_architect` | Solutions-architect persona: SDD, interface contracts, traceability |
 | `uwf-state-manager` | Workflow phase and state, the source of truth for transitions (`state.mjs`) |
+| `uwf-sw_dev` | Software-developer persona: one issue from intake through implementation, review, acceptance and retro (15 stages) |
 | `uwf-threat-model` | STRIDE threat models and mitigations for the security-plan stage |
 | `uwf-traits` | Behavior overlays (`project_manager`, `sw_dev`, `solutions_architect`, `forensic_analyst`) |
 
