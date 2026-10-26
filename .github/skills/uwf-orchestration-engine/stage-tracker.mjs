@@ -355,8 +355,23 @@ function resolveTemplates(str) {
   if (typeof str !== "string") return str;
   return str
     .replace(/\{\{output_path\}\}/g, outputPath)
-    .replace(/\{\{cwd\}\}/g,         process.cwd());
+    .replace(/\{\{cwd\}\}/g,         process.cwd())
+    .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? process.cwd());
 }
+
+/**
+ * Gate commands run with cwd = the target repo, but `.github/skills/...` and `.github/agents/...`
+ * paths in a stages.yaml mean the UWF tree. Without a skills root nothing changes. With one, each such
+ * relative path keeps meaning the target repo's own copy when it exists under cwd, otherwise it
+ * becomes the same path under the skills root (absolute). Applies to cmd and args alike.
+ */
+const SKILL_PATH_RE = /(^|[\s"'=(;|&<>`])(\.github\/(?:skills|agents)\/[^\s"'|;&)<>`]*)/g;
+function resolveGateSkillPaths(str) {
+  if (typeof str !== "string" || !SKILLS_ROOT) return str;
+  return str.replace(SKILL_PATH_RE, (whole, lead, rel) =>
+    existsSync(resolve(process.cwd(), rel)) ? whole : lead + join(SKILLS_ROOT, rel));
+}
+const gateTemplates = (str) => resolveGateSkillPaths(resolveTemplates(str));
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -731,7 +746,7 @@ function prescribeCheck(check, failure) {
     case "require_file_matching_pattern":
       return `Create a file under ${resolveTemplates(check.dir)} whose name matches ${check.pattern}.`;
     case "run_script": {
-      const cmd = [resolveTemplates(check.cmd), ...(Array.isArray(check.args) ? check.args.map((a) => resolveTemplates(String(a))) : [])].join(" ");
+      const cmd = [gateTemplates(check.cmd), ...(Array.isArray(check.args) ? check.args.map((a) => gateTemplates(String(a))) : [])].join(" ");
       const m = failure && failure.match(/ failed \(exit [^)]*\)(?:: ([\s\S]*))?$/);
       const tail = m?.[1] ? m[1].split(/\r?\n/).slice(-5).join(" | ").slice(-400) : "no output";
       return `Make ${q(cmd)} exit 0${failure ? `; it currently fails with: ${tail}` : ""}.`;
@@ -810,16 +825,16 @@ function evaluateCheck(check) {
       if (!Array.isArray(check.args) && rawCmd?.includes("{{")) {
         return `${check.label ?? "run_script"} cannot template a shell command; use args`;
       }
-      const cmd = resolveTemplates(rawCmd);
+      const cmd = gateTemplates(rawCmd);
       if (!cmd) return `${check.label ?? "run_script"} is missing cmd`;
       // Gate subprocesses read the same run's stores: forward the chosen data dir.
       const env = { ...process.env, ...(dataDirFlag ? { UWF_DATA_DIR: dataDirFlag } : {}) };
       try {
         if (Array.isArray(check.args)) {
-          const scriptArgs = check.args.map((arg) => resolveTemplates(String(arg)));
+          const scriptArgs = check.args.map((arg) => gateTemplates(String(arg)));
           execFileSync(cmd, scriptArgs, { stdio: "pipe", env });
         } else {
-          execSync(cmd, { stdio: "pipe", env });
+          execSync(cmd, { stdio: "pipe", env, cwd: process.cwd() });
         }
         return null;
       } catch (err) {
