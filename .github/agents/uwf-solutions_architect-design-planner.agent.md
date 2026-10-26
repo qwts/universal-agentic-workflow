@@ -287,7 +287,7 @@ Constraints:
 
 1. `{output_path}/design-sdd.md` exists and is non-empty.
 2. `design-sdd.md` contains all required top-level section headings defined in the SDD schema above.
-3. `design-sdd.md` contains `## Components`, `## Interface Contracts`, `## Non-Functional Requirements`, and `## Traceability`.
+3. `design-sdd.md` has a heading line for each of the eight sections, in the order shown in the SDD schema above (the gate accepts the numbered form `## 1. Overview` and the bare form `## Overview`).
 4. When any validation failures are detected, Section 1 (Overview) includes a `### Validation Warnings` subsection summarizing them.
 5. No section is empty.
 6. No component entry has an empty `Requirement refs` field without a documented explanation.

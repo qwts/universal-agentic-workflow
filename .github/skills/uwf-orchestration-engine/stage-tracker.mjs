@@ -750,6 +750,7 @@ function prescribeCheck(check, failure) {
       const want = failure && /^verdict:\s*(\S+)/i.exec(check.text ?? "")?.[1];
       const seen = want ? markdownVerdict(resolveTemplates(check.path)) : null;
       if (seen && seen.toLowerCase() !== want.toLowerCase()) return verdictOutcome(resolveTemplates(check.path), seen, want);
+      if (typeof check.heading === "string") return `Include a heading line ${q(check.heading)} (an optional number prefix such as "1." is fine) in ${resolveTemplates(check.path)}.`;
       return `Include the text ${q(check.text)} in ${resolveTemplates(check.path)}.`;
     }
     case "require_files_with_prefix":
@@ -798,6 +799,19 @@ function evaluateCondition(condition) {
   }
 }
 
+/**
+ * Line-anchored matcher for a markdown heading given as "## Title". An optional
+ * numeric prefix ("1.", "2)", "3.1.") before the title is tolerated, so both
+ * "## Overview" and "## 1. Overview" match. Level and title must otherwise match
+ * exactly (case-insensitive); trailing whitespace is ignored.
+ */
+function headingPattern(heading) {
+  const m = /^(#{1,6})\s+(.+?)\s*$/.exec(heading);
+  const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!m) return new RegExp(`^${esc(heading)}\\s*$`, "im");
+  return new RegExp(`^${m[1]}[ \\t]+(?:\\d+(?:\\.\\d+)*[.)]?[ \\t]+)?${esc(m[2])}[ \\t]*$`, "im");
+}
+
 function evaluateCheck(check) {
   switch (check.type) {
     case "require_non_empty": {
@@ -809,7 +823,14 @@ function evaluateCheck(check) {
     case "require_contains": {
       const p = resolveTemplates(check.path);
       if (!existsSync(p)) return null; // let require_non_empty catch it
-      if (!readFileSync(p, "utf8").includes(check.text)) {
+      const body = readFileSync(p, "utf8");
+      if (typeof check.heading === "string") {
+        if (!headingPattern(check.heading).test(body)) {
+          return `${check.label ?? p} does not contain a heading "${check.heading}" (optionally numbered, e.g. "## 1. ${check.heading.replace(/^#+\s*/, "")}")`;
+        }
+        return null;
+      }
+      if (!body.includes(check.text)) {
         return `${check.label ?? p} does not contain: "${check.text}"`;
       }
       return null;

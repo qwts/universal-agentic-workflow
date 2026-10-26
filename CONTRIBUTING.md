@@ -159,7 +159,7 @@ stages:
 | Type | Required fields | Passes when |
 |---|---|---|
 | `require_non_empty` | `path` | File exists and is non-empty |
-| `require_contains` | `path`, `text` | File contains the given string |
+| `require_contains` | `path`, `text` or `heading` | File contains the given string; `heading: "## Title"` instead matches a heading line with an optional number prefix (`## 1. Title`) |
 | `require_files_with_prefix` | `dir`, `prefix` | At least one file in `dir` starts with `prefix` |
 | `require_file_matching_pattern` | `dir`, `pattern` | At least one file in `dir` matches the regex |
 | `run_script` | `cmd` | Script exits 0 |
