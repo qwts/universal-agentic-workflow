@@ -20,9 +20,12 @@ Thank you for your interest in contributing. This guide covers everything you ne
 
 ## Prerequisites
 
-- **VS Code** with **GitHub Copilot** (custom agents / subagents must be enabled in settings — this feature is currently experimental)
-- **Node.js 20+** — required for the standalone skill scripts and repository
-  smoke suite
+- **Node.js 20+** — required for the runner, the bench harness, the skill scripts and the
+  repository smoke suite (CI runs Node 20)
+- **A harness CLI** — `claude` (Claude Code) or `codex`, logged in. Only live runs need it;
+  the tests use the offline `fake` adapter and never call a model
+- **VS Code with GitHub Copilot** — optional. Only the Copilot chat adapter needs it; custom
+  agents / subagents must be enabled in settings (currently experimental)
 - **Node.js 22.13+** and **VS Code 1.101+** — required for the UWF Companion;
   its database readers use the unflagged `node:sqlite` API available in the
   VS Code extension host from this release line
@@ -34,28 +37,49 @@ Thank you for your interest in contributing. This guide covers everything you ne
 
 ```
 .github/
-├── agents/          # Stage agents — uwf-{role}-{job}.agent.md
+├── agents/          # Stage agents — uwf-stage-*, uwf-core-*, uwf-{persona}-*
 ├── skills/          # Behavior modules — each has SKILL.md + Node.js scripts + SQLite DB
-├── prompts/         # Human-facing workflow entry points
+├── prompts/         # Copilot entry prompts
 └── instructions/    # Always-on workspace rules
-docs/                # Architecture spec, ADRs, artifact schemas
-scripts/             # Developer utilities (scaffold-skill.mjs, hooks)
+docs/                # ADRs, research, product docs, architecture spec, artifact schemas
+scripts/
+├── uwf-runner/      # Deterministic runner (runner.mjs), adapters, cost report, tests
+├── uwf-bench/       # Benchmark matrix harness, tests
+├── uwf-smoke/       # Repository smoke tests (CI)
+└── scaffold-skill.mjs
 uwf-companion/       # VS Code extension — live UWF dashboard
 ```
 
-The **single orchestrator** (`uwf-core-orchestrator`) drives all workflows. It reads a **persona skill** at startup to know which agents to invoke and in what order. Persona behavior is declared in `.github/skills/uwf-{name}/SKILL.md` and the authoritative stage/gate list lives in `.github/skills/uwf-{name}/stages.yaml`.
+The **runner** (`scripts/uwf-runner/runner.mjs`) is the primary runtime (see [ADR-0007](docs/adr/ADR-0007-runtime-owns-the-loop.md)). It owns the stage loop, gates and retries, and reads each persona's authoritative stage list from `.github/skills/uwf-{name}/stages.yaml`; persona behavior is declared in `.github/skills/uwf-{name}/SKILL.md`. The **Copilot orchestrator** (`uwf-core-orchestrator`) is a secondary runtime for chat surfaces and uses the same files.
 
 ---
 
 ## Development Setup
 
-Most skills are self-contained Node.js packages. Install dependencies for any skill you are working on:
+Most skills are self-contained Node.js packages. Install dependencies for every skill that ships a `package.json` (the same set CI installs):
 
 ```bash
-cd .github/skills/uwf-adr && npm install
-cd .github/skills/uwf-local-tracking && npm install
-# etc.
+for d in .github/skills/uwf-*/; do [ -f "$d/package.json" ] && (cd "$d" && npm ci); done
 ```
+
+### Running the tests
+
+These are the exact loops CI runs (`.github/workflows/ci.yml`). They run offline: the runner tests use the `fake` adapter and the bench tests never call a live model. Run them from the repository root after installing dependencies.
+
+```bash
+set -euo pipefail
+for test_file in scripts/uwf-smoke/*.mjs; do
+  node "$test_file"
+done
+for test_file in scripts/uwf-runner/test/*.test.mjs; do
+  node "$test_file"
+done
+for test_file in scripts/uwf-bench/test/*.test.mjs; do
+  node "$test_file"
+done
+```
+
+The adapter contract tests skip the live `claude` and `codex` checks unless `UWF_TEST_LIVE=1` is set and the CLI is on `PATH`. Leave `UWF_TEST_LIVE` unset for routine work. Do not run live tests unless you intend to spend model budget.
 
 The VS Code extension has its own setup:
 
@@ -208,9 +232,9 @@ tools:
 
 > **Important:** Subagents must end their response with `Current Stage/Phase` / `Recommended Next Stage/Phase` blocks. The orchestrator never emits these — only subagents do.
 
-### Step 5 — Register agents in the orchestrator
+### Step 5 — Register agents in the orchestrator (Copilot only)
 
-Add every new agent name to the `agents:` frontmatter list in `.github/agents/uwf-core-orchestrator.agent.md`. If an agent is not listed there, the orchestrator cannot invoke it.
+The runner needs no registration: it reads `stages.yaml` and the stage's `agent:` field. Only the Copilot orchestrator needs this step. Add every new agent name to the `agents:` frontmatter list in `.github/agents/uwf-core-orchestrator.agent.md`. If an agent is not listed there, the orchestrator cannot invoke it.
 
 ```yaml
 agents:
@@ -388,7 +412,7 @@ Each skill's primary script follows the same pattern — run with no arguments o
 
 1. **One concern per PR.** A PR that adds a new persona should not also refactor an existing skill.
 2. **Update SKILL.md and stages.yaml together.** If you change a stage name or gate condition, update both files.
-3. **Add your new agents to `uwf-core-orchestrator.agent.md`.** Forgetting this is the most common contribution error — the orchestrator silently cannot invoke unlisted agents.
+3. **Add your new agents to `uwf-core-orchestrator.agent.md`** if the Copilot path must run them. Forgetting this makes the Copilot orchestrator silently unable to invoke unlisted agents; the runner is unaffected.
 4. **Run the stage list check** before opening a PR:
    ```bash
    node .github/skills/uwf-<your-workflow>/run.mjs --list-stages
