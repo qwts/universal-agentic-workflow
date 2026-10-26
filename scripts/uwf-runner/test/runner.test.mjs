@@ -6,11 +6,11 @@
  * purpose: they are conditional and the happy path asserts they are skipped, not invoked.
  */
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { transcriptRow } from "../cost.mjs";
 
@@ -51,6 +51,20 @@ function run(s, extraArgs = [], extraEnv = {}) {
     env: { ...process.env, UWF_FAKE_FIXTURE_DIR: s.fixtures, UWF_DATA_DIR: "", ...extraEnv },
   });
   return { code: r.status, out: r.stdout, err: r.stderr };
+}
+
+/** Same as run(), but concurrent: resolves when the runner exits. */
+function runAsync(s, extraArgs = [], extraEnv = {}) {
+  return new Promise((res) => {
+    const p = spawn(process.execPath, [RUNNER, "run", "--workflow", "sw_dev", "--goal", "Add a widget",
+      "--repo-root", s.repo, "--data-dir", s.data, ...extraArgs], {
+      env: { ...process.env, UWF_FAKE_FIXTURE_DIR: s.fixtures, UWF_DATA_DIR: "", ...extraEnv },
+    });
+    let out = "", err = "";
+    p.stdout.on("data", (d) => { out += d; });
+    p.stderr.on("data", (d) => { err += d; });
+    p.on("close", (code) => res({ code, out, err }));
+  });
 }
 
 function skillJson(script, args, s) {
@@ -1047,6 +1061,48 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
     const rev = countInvocations(s, "review");
     check("no routing; implementation ran once", !r.err.includes("routing back") && countInvocations(s, "implementation").length === 1, r.err.slice(-600));
     check("review retried with the include-the-text prescription", rev.length === 2 && rev[1].prompt.includes("## Gate failure (retry 1 of 3)") && rev[1].prompt.includes('Include the text "verdict: approved"'), rev[1]?.prompt.slice(-700));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
+{
+  console.log("# run.lock: one run per data dir");
+  const s = setup();
+  try {
+    mkdirSync(s.data, { recursive: true });
+    const lock = join(s.data, "run.lock");
+    writeFileSync(lock, JSON.stringify({ runId: "other-run-1", pid: process.pid, workflow: "sw_dev" }));
+    const r = run(s);
+    check("live lock: exits 2", r.code === 2, `${r.code} ${r.err.slice(-400)}`);
+    check("live lock: names the other run and --data-dir", r.err.includes("other-run-1") && r.err.includes("distinct --data-dir"), r.err.slice(-400));
+    check("live lock: lock left untouched", JSON.parse(readFileSync(lock, "utf8")).runId === "other-run-1");
+    check("live lock: nothing ran", transcripts(s).length === 0);
+    // A dead pid: spawn a short-lived child and reuse its pid. The runner never takes a lock over by itself.
+    const dead = spawnSync(process.execPath, ["-e", "0"]);
+    writeFileSync(lock, JSON.stringify({ runId: "crashed-run", pid: dead.pid ?? 2147483646, workflow: "sw_dev" }));
+    const r2 = run(s);
+    check("crashed-run lock: exits 2 and names --unlock", r2.code === 2 && r2.err.includes("not running") && r2.err.includes("--unlock"), `${r2.code} ${r2.err.slice(-400)}`);
+    check("crashed-run lock: left in place", existsSync(lock));
+    const r2b = run(s, ["--unlock"]);
+    check("crashed-run lock + --unlock: replaced and run completes", r2b.code === 0, `${r2b.code} ${r2b.err.slice(-400)}`);
+    check("lock removed on exit", !existsSync(lock));
+    // Unreadable metadata (an owner still writing, or garbage) is waited on while young, never removed.
+    writeFileSync(lock, "");
+    const r3 = run(s, ["--unlock"]);
+    check("young unreadable lock: exits 2 even with --unlock", r3.code === 2 && r3.err.includes("another run is starting"), `${r3.code} ${r3.err.slice(-400)}`);
+    check("young unreadable lock: left in place", existsSync(lock));
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(lock, old, old);
+    const r4 = run(s);
+    check("old unreadable lock: exits 2 without --unlock", r4.code === 2 && r4.err.includes("--unlock"), `${r4.code} ${r4.err.slice(-400)}`);
+    const r4b = run(s, ["--unlock"]);
+    check("old unreadable lock + --unlock: replaced and run completes", r4b.code === 0, `${r4b.code} ${r4b.err.slice(-400)}`);
+    check("lock removed on exit (2)", !existsSync(lock));
+    // Contention over a crashed lock without --unlock: nobody takes it over, nothing is removed or left behind.
+    writeFileSync(lock, JSON.stringify({ runId: "crashed-run-2", pid: dead.pid ?? 2147483646, workflow: "sw_dev" }));
+    const outcomes = await Promise.all(Array.from({ length: 6 }, () => runAsync(s)));
+    check("contended crashed lock: all six refused with exit 2", outcomes.every((o) => o.code === 2 && o.err.includes("--unlock")), outcomes.map((o) => `${o.code}`).join(","));
+    check("contended crashed lock: lock untouched", JSON.parse(readFileSync(lock, "utf8")).runId === "crashed-run-2");
+    check("contended crashed lock: no temp files left behind", readdirSync(s.data).filter((f) => f.startsWith("run.lock")).length === 1, readdirSync(s.data).join(","));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 

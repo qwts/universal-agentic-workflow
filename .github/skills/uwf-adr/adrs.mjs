@@ -33,7 +33,7 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -123,14 +123,15 @@ function toSlug(title) {
 
 /** Return the next zero-padded ADR number across the DB and committed files. */
 function nextNumber(db, outputDir) {
-  const row = db
-    .prepare("SELECT MAX(CAST(number AS INTEGER)) AS max_number FROM adrs")
-    .get();
+  // `next-number` runs without a DB: optional chaining would short-circuit the whole chain, but say it plainly.
+  const row = db ? db.prepare("SELECT MAX(CAST(number AS INTEGER)) AS max_number FROM adrs").get() : null;
   let maxNumber = Number(row?.max_number ?? 0);
 
   if (existsSync(outputDir)) {
     for (const name of readdirSync(outputDir)) {
-      const match = name.match(/^ADR-(\d+)(?:-|\.md$)/i);
+      // A claim (`.adr-NNNN.claim`) counts as taken: a number another caller is reserving right now,
+      // or one left by a crashed caller, is simply skipped. Nothing is ever reclaimed.
+      const match = name.match(/^ADR-(\d+)(?:-|\.md$)/i) ?? name.match(/^\.adr-(\d+)\.claim$/);
       if (match) maxNumber = Math.max(maxNumber, Number(match[1]));
     }
   }
@@ -138,27 +139,62 @@ function nextNumber(db, outputDir) {
   return String(maxNumber + 1).padStart(4, "0");
 }
 
-/** Scaffold the markdown file from the template. */
-function scaffoldFile(outputDir, number, title, decision, today) {
-  const slug = toSlug(title);
-  const fileName = `ADR-${number}-${slug}.md`;
-  const filePath = join(outputDir, fileName);
-
-  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
-
+/** Render the markdown for one ADR from the template. */
+function renderAdr(number, title, decision, today) {
   const template = existsSync(TEMPLATE_PATH)
     ? readFileSync(TEMPLATE_PATH, "utf8")
     : DEFAULT_TEMPLATE;
 
-  const content = template
+  return template
     .replace(/ADR-####/g, `ADR-${number}`)
     .replace(/<Title>/g, title)
     .replace(/<YYYY-MM-DD>/g, today)
     .replace(/Status: Proposed \| Accepted \| Deprecated \| Superseded/g, "Status: Proposed")
     .replace(/- The decision, stated crisply\./g, `- ${decision}`);
+}
 
-  writeFileSync(filePath, content, "utf8");
-  return { filePath: join(outputDir, fileName).replace(/\\/g, "/"), slug };
+const RESERVE_TIMEOUT_MS = Number(process.env.UWF_ADR_RESERVE_TIMEOUT_MS) || 10_000; // env: test hook only
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const readClaim = (claim) => { try { return JSON.parse(readFileSync(claim, "utf8")); } catch { return null; } };
+
+/**
+ * Atomically reserve the next ADR number and write its scaffold. Concurrent callers (parallel
+ * fronts on one repo) never receive the same number: the next number is one past every ADR file
+ * AND every claim file, the claim `.adr-NNNN.claim` is created with the `wx` flag (two callers
+ * picking the same number: exactly one wins, the other rescans and moves past it), and the real
+ * file is then written with `wx` too. No claim is ever reclaimed or removed by anyone but its
+ * owner: a claim left by a crashed caller just leaves a gap in the numbering (delete the dotfile
+ * to reuse the number).
+ */
+function reserveAdr(db, outputDir, title, decision, today) {
+  const slug = toSlug(title);
+  mkdirSync(outputDir, { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const deadline = Date.now() + RESERVE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const number = nextNumber(db, outputDir);
+    const claim = join(outputDir, `.adr-${number}.claim`);
+    let fd;
+    try {
+      fd = openSync(claim, "wx");
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      sleepMs(1 + Math.random() * 5); // someone claimed it in the same instant: rescan past it
+      continue;
+    }
+    try {
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token, title, at: new Date().toISOString() }));
+    } finally { closeSync(fd); }
+    try {
+      if (process.env.UWF_ADR_TEST_DELAY_MS) sleepMs(Number(process.env.UWF_ADR_TEST_DELAY_MS)); // test hook: force contention
+      const filePath = join(outputDir, `ADR-${number}-${slug}.md`);
+      writeFileSync(filePath, renderAdr(number, title, decision, today), { encoding: "utf8", flag: "wx" });
+      return { number, slug, filePath: filePath.replace(/\\/g, "/") };
+    } finally {
+      try { if (readClaim(claim)?.token === token) unlinkSync(claim); } catch { /* already gone */ }
+    }
+  }
+  fail(`Could not reserve an ADR number within ${RESERVE_TIMEOUT_MS / 1000}s.`);
 }
 
 // Fallback if template file is missing
@@ -211,12 +247,10 @@ function cmdCreate(db) {
   }
 
   const outputDir = flags["output-path"] ?? "docs/adr";
-  const number = nextNumber(db, outputDir);
-  const slug = toSlug(flags["title"]);
   const today = new Date().toISOString().slice(0, 10);
   const now = new Date().toISOString();
 
-  const { filePath } = scaffoldFile(outputDir, number, flags["title"], flags["decision"], today);
+  const { number, slug, filePath } = reserveAdr(db, outputDir, flags["title"], flags["decision"], today);
 
   const info = db.prepare(
     `INSERT INTO adrs
@@ -237,6 +271,15 @@ function cmdCreate(db) {
     procedure: "create",
     adr: db.prepare("SELECT * FROM adrs WHERE id = ?").get(info.lastInsertRowid),
   });
+}
+
+/** Reserve the next number and scaffold the file only (no DB row); prints {number, path}. */
+function cmdNextNumber() {
+  requireFlag("title", "next-number");
+  const outputDir = flags["output-path"] ?? "docs/adr";
+  const today = new Date().toISOString().slice(0, 10);
+  const { number, filePath } = reserveAdr(null, outputDir, flags["title"], flags["decision"] ?? "TBD", today);
+  succeed({ procedure: "next-number", number, path: filePath });
 }
 
 function cmdUpdate(db) {
@@ -330,7 +373,9 @@ function cmdDeprecate(db) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-if (!command) usageError("No command given. Expected: create | update | get | list | supersede | deprecate");
+if (!command) usageError("No command given. Expected: create | next-number | update | get | list | supersede | deprecate");
+
+if (command === "next-number") cmdNextNumber();
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
@@ -353,5 +398,5 @@ switch (command) {
   case "deprecate": cmdDeprecate(db); break;
   case "reset":     cmdReset(db);     break;
   default:
-    usageError(`Unknown command: "${command}". Expected: create | update | get | list | supersede | deprecate | reset`);
+    usageError(`Unknown command: "${command}". Expected: create | next-number | update | get | list | supersede | deprecate | reset`);
 }

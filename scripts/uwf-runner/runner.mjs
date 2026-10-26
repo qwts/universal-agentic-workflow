@@ -5,11 +5,11 @@
  * Usage:
  *   node scripts/uwf-runner/runner.mjs run --workflow <w> --goal <file|text>
  *     [--adapter claude-code|codex|fake|grokbot] [--model <m>] [--data-dir <d>] [--output-path <p>]
- *     [--from-stage <s>] [--force] [--non-interactive] [--dry-run] [--timeout-ms <n>]
+ *     [--from-stage <s>] [--force] [--unlock] [--non-interactive] [--dry-run] [--timeout-ms <n>]
  *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
  *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
  *   node scripts/uwf-runner/runner.mjs resume --workflow <w>
- *     [--adapter] [--model] [--data-dir] [--output-path] [--non-interactive] [--timeout-ms]
+ *     [--adapter] [--model] [--data-dir] [--output-path] [--unlock] [--non-interactive] [--timeout-ms]
  *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
  *
  *   node scripts/uwf-runner/runner.mjs cost --data-dir <d> [--workflow <w> [--repo-root <r>]]
@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -52,6 +52,71 @@ const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (canonical order; each workflow visits a subsequence of it).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
+
+const LOCK_FILE = "run.lock";
+const LOCK_WAIT_MS = 3_000;              // how long to wait on a lock whose metadata is still being written
+const LOCK_UNREADABLE_STALE_MS = 10_000; // an unreadable lock older than this has no live writer
+
+/**
+ * One run per data dir: parallel fronts share skill SQLite DBs unless each has its own --data-dir.
+ * Creates <dataDir>/run.lock ({runId, pid, ...}) atomically with its contents already written
+ * (a temp file hard-linked into place: link fails with EEXIST when a lock exists, and no reader
+ * ever sees a half-written lock). The runner never takes a lock over on its own: a lock whose
+ * owner is alive, or left by a crashed run, makes it exit 2 with the remedy. Only `--unlock`, an
+ * explicit operator action for a single recovery run, removes a lock, and only one whose owner pid
+ * is dead or that has been unreadable for longer than LOCK_UNREADABLE_STALE_MS. Returns a release
+ * function that removes this run's own lock.
+ */
+function acquireRunLock(dataDir, workflow, { unlock = false } = {}) {
+  mkdirSync(dataDir, { recursive: true });
+  const lockPath = join(dataDir, LOCK_FILE);
+  const info = { runId: `${workflow}-${process.pid}-${Date.now()}`, pid: process.pid, workflow, startedAt: new Date().toISOString() };
+  const tmp = `${lockPath}.${process.pid}.tmp`;
+  const readLock = () => { try { return JSON.parse(readFileSync(lockPath, "utf8")); } catch { return null; } };
+  const remedy = `Parallel fronts must each pass a distinct --data-dir (and --output-path); two runs sharing one would collide on the skill SQLite DBs.`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  try {
+    writeFileSync(tmp, JSON.stringify(info));
+    while (true) {
+      try {
+        linkSync(tmp, lockPath);
+        return () => {
+          try { if (readLock()?.runId === info.runId) rmSync(lockPath, { force: true }); } catch { /* already gone */ }
+        };
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+      let st;
+      try { st = statSync(lockPath); } catch { continue; } // released between link and stat
+      const other = readLock();
+      if (other && Number.isInteger(other.pid) && pidAlive(other.pid)) {
+        throw new UsageError(`Data dir ${dataDir} is in use by run ${other.runId} (pid ${other.pid}). ${remedy}`);
+      }
+      const old = Date.now() - st.mtimeMs > LOCK_UNREADABLE_STALE_MS;
+      if (!other && !old) { // metadata still being written by a live starter: wait a little
+        if (Date.now() >= deadline) throw new UsageError(`Could not take ${lockPath}; another run is starting on the same --data-dir. ${remedy}`);
+        sleepMs(50);
+        continue;
+      }
+      const left = other ? `left by run ${other.runId} (pid ${other.pid}, not running)` : "unreadable and older than 10s";
+      if (!unlock) {
+        throw new UsageError(`Data dir ${dataDir} has a lock ${left}: ${lockPath}. If no run is using this data dir, rerun with --unlock (or remove the file). ${remedy}`);
+      }
+      // Operator-requested recovery: remove the inspected lock and go back to the atomic link.
+      log(`[runner] --unlock: removing lock ${left}: ${lockPath}`);
+      rmSync(lockPath, { force: true });
+      unlock = false; // one removal per invocation; anything created after this is someone else's
+    }
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3, COST: 4 };
 const DEFAULT_RESUME_MAX_CONTEXT = 100_000;
@@ -103,7 +168,7 @@ function pickRunScript(skillsRoot, workflow) {
 function parseArgs(argv) {
   const flags = {};
   const positional = [];
-  const bool = new Set(["non-interactive", "dry-run", "force"]);
+  const bool = new Set(["non-interactive", "dry-run", "force", "unlock"]);
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (!t.startsWith("--")) { positional.push(t); continue; }
@@ -196,6 +261,8 @@ async function main(argv) {
   if (command === "run") goal = existsSync(flags.goal) ? readFileSync(flags.goal, "utf8").trim() : flags.goal;
   else if (!existsSync(goalPath)) throw new UsageError(`No goal recorded at ${goalPath}; start with "runner.mjs run --goal ..." first`);
   else goal = readFileSync(goalPath, "utf8").trim();
+
+  const releaseLock = scratch ? () => {} : acquireRunLock(dataDir, flags.workflow, { unlock: flags.unlock === true });
 
   const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
@@ -326,6 +393,7 @@ async function main(argv) {
       repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
       resetFrom, rollbackPhase, phaseFlags, resuming: command === "resume" });
   } finally {
+    releaseLock();
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
 }
