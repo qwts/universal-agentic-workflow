@@ -4,7 +4,7 @@
  *
  * Usage:
  *   node scripts/uwf-runner/runner.mjs run --workflow <w> --goal <file|text>
- *     [--adapter claude-code|fake] [--model <m>] [--data-dir <d>] [--output-path <p>]
+ *     [--adapter claude-code|codex|fake|grokbot] [--model <m>] [--data-dir <d>] [--output-path <p>]
  *     [--from-stage <s>] [--force] [--non-interactive] [--dry-run] [--timeout-ms <n>]
  *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
  *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
@@ -435,7 +435,7 @@ async function stageLoop(ctx) {
       const env = { UWF_DATA_DIR: dataDir };
       if (fixtureDir) env.UWF_FAKE_FIXTURE = join(fixtureDir, `${st.name}.json`);
       const res = await adapter.invokeStage({
-        systemPrompt: mp.systemPrompt, prompt, cwd: repoRoot, inputs: st.inputs, outputs: mp.outputsRequired,
+        systemPrompt: mp.systemPrompt, prompt, cwd: repoRoot, inputs: mp.inputs, outputs: mp.outputsRequired,
         model, sessionId, timeoutMs, env, permissions: mp.permissions, dataDir,
         maxTurns: st.maxTurns,
       });

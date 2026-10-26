@@ -29,6 +29,7 @@ const r = await adapter.invokeStage({
 | `claude-code` | `claude -p` | `--append-system-prompt`, `--resume`, tool allowlist from `permissions`, reports cost |
 | `codex` | `codex exec` | see below |
 | `fake` | none | offline fixture replay for CI |
+| `grokbot` | none (file handoff) | external agent (e.g. Grok Bot) fulfils each stage; see below |
 
 ### What a stage inherits from the machine
 
@@ -58,6 +59,32 @@ Limitations:
 - `sessionId` is the `thread.started` thread id; if the CLI emits none, the passed-in id (or `null`) is returned.
 - The JSONL event names (`thread.started`, `item.completed`/`agent_message`, `turn.completed`) have not been verified against a live run; parsing is defensive and the final message prefers `--output-last-message`.
 
+### `grokbot` adapter
+
+File-based handoff for an agent that runs outside the runner process (no CLI to spawn). The runner keeps
+the stage loop, gates, retries, `on_verdict` routing, questions and state; the adapter only hands one attempt over and waits.
+
+Per attempt it writes `<dataDir>/grokbot/requests/<NNNN>-<stage>.{json,md}` (system prompt, stage prompt incl. gate
+failure prescriptions on retries, inputs, required outputs, cwd, permissions, session id) and `<dataDir>/grokbot/pending.json`,
+then polls (`UWF_GROKBOT_POLL_MS`, default 2000) for `<dataDir>/grokbot/responses/<NNNN>-<stage>.json`:
+
+```json
+{ "ok": true, "summary": "final message; may contain the standard questions block", "sessionId": "optional" }
+```
+
+`"ok": false, "error": "..."` reports a failed attempt (counts as a gate failure). `--timeout-ms` bounds the wait.
+The agent writes the stage outputs into the repo root itself; the runner then runs `--check-gate`.
+If the runner is killed while waiting, `runner.mjs resume` re-issues the active stage as a new request.
+
+```sh
+node scripts/uwf-runner/runner.mjs run --workflow project_manager --goal goal.md --adapter grokbot \
+  --repo-root ../my-app --data-dir ../my-app-uwf &
+cat ../my-app-uwf/grokbot/pending.json   # -> request .md + responsePath
+```
+
+Limitations: no usage/cost reporting (`usage: null`); `permissions` and `maxTurns` are advisory (written into the request,
+not enforced); one pending request at a time per data dir.
+
 ## Adding an adapter
 
 1. Create `adapters/<name>.mjs` exporting `name` and `invokeStage(opts)`.
@@ -73,7 +100,7 @@ Limitations:
 ## Runner (`runner.mjs`)
 
 ```sh
-node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapter claude-code|fake] \
+node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapter claude-code|codex|fake|grokbot] \
   [--model m] [--data-dir d] [--output-path p] [--from-stage s] [--non-interactive] [--dry-run] [--timeout-ms n] \
   [--max-cost-usd n] [--resume-max-context tokens]
 ```

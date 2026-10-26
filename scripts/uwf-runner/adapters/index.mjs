@@ -41,7 +41,7 @@ import { resolve, join } from "node:path";
  * @property {string} [error]
  */
 
-export const ADAPTERS = ["claude-code", "codex", "fake"];
+export const ADAPTERS = ["claude-code", "codex", "fake", "grokbot"];
 
 /** @param {string} name @returns {Promise<{name:string, invokeStage:Function}>} */
 export async function loadAdapter(name) {

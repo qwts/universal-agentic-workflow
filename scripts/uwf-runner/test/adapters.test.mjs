@@ -6,7 +6,7 @@
  * (live run uses model haiku and a tiny prompt).
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, chmodSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -134,6 +134,47 @@ if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
     model: process.env.UWF_TEST_CODEX_MODEL, // unset -> the CLI's configured default
     timeoutCase: { timeoutMs: 1 },
   });
+}
+
+// --- grokbot adapter (offline: an in-process responder plays the external agent) ---
+{
+  console.log("# adapter: grokbot");
+  const g = await loadAdapter("grokbot");
+  const root = mkdtempSync(join(tmpdir(), "uwf-adapter-grokbot-"));
+  const cwd = join(root, "work"); const dataDir = join(root, "data"); mkdirSync(cwd);
+  const env = { UWF_GROKBOT_POLL_MS: "20" };
+  const respond = (body, delayMs = 100, mtimeOffsetMs = 0) => setTimeout(() => {
+    const p = JSON.parse(readFileSync(join(dataDir, "grokbot", "pending.json"), "utf8"));
+    writeFileSync(join(cwd, "out.md"), "done");
+    writeFileSync(p.responsePath, JSON.stringify(body));
+    if (mtimeOffsetMs) { const t = new Date(Date.now() + mtimeOffsetMs); utimesSync(p.responsePath, t, t); }
+  }, delayMs);
+  respond({ ok: true, summary: "OK" });
+  const r1 = await g.invokeStage({ prompt: "Run the intake stage", cwd, dataDir, env, outputs: ["out.md"] });
+  check("ok is true", r1.ok === true, r1.error ?? "");
+  for (const k of ["ok", "sessionId", "transcriptPath", "stdout", "exitCode", "usage"]) check(`result has "${k}"`, k in r1);
+  check("stdout is the agent summary", r1.stdout === "OK");
+  check("transcript written", r1.transcriptPath && existsSync(r1.transcriptPath));
+  check("request file lists outputs", JSON.parse(readFileSync(join(dataDir, "grokbot", "requests", "0001-intake.json"), "utf8")).outputs[0] === "out.md");
+  respond({ ok: false, error: "nope" });
+  const r2 = await g.invokeStage({ prompt: "Run the intake stage", cwd, dataDir, env, sessionId: r1.sessionId });
+  check("sessionId in -> same out", r2.sessionId === r1.sessionId);
+  check("agent failure -> ok:false with error", r2.ok === false && /nope/.test(r2.error));
+  const r3 = await g.invokeStage({ prompt: "x", cwd, dataDir, env, timeoutMs: 50 });
+  check("timeout -> ok:false", r3.ok === false && /timeout/.test(r3.error));
+  // A response completed within the timeout is accepted even when the loop only sees it at the final
+  // wake-up: 400 ms poll, 60 ms timeout, response written at 30 ms -> the sleep is capped at the remaining
+  // time and the on-time file is accepted. (The responder fires before invokeStage returns.)
+  respond({ ok: true, summary: "on time" }, 30);
+  const t0 = Date.now();
+  const r4 = await g.invokeStage({ prompt: "x", cwd, dataDir, env: { UWF_GROKBOT_POLL_MS: "400" }, timeoutMs: 60 });
+  check("on-time response observed at the deadline -> ok:true", r4.ok === true && r4.stdout === "on time", r4.error ?? "");
+  check("sleep is capped at the remaining timeout", Date.now() - t0 < 300, `${Date.now() - t0}ms`);
+  // A response whose completion time is after the deadline is rejected even though it is on disk when the loop looks.
+  respond({ ok: true, summary: "late" }, 30, 5000);
+  const r5 = await g.invokeStage({ prompt: "x", cwd, dataDir, env: { UWF_GROKBOT_POLL_MS: "400" }, timeoutMs: 60 });
+  check("response completed after the deadline -> ok:false", r5.ok === false && /timeout/.test(r5.error));
+  rmSync(root, { recursive: true, force: true });
 }
 
 if (failures) { console.log(`\n${failures} check(s) FAILED`); process.exit(1); }
