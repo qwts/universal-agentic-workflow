@@ -4,7 +4,7 @@
  *
  * Usage:
  *   node scripts/uwf-runner/runner.mjs run --workflow <w> --goal <file|text>
- *     [--adapter claude-code|fake] [--model <m>] [--data-dir <d>] [--output-path <p>]
+ *     [--adapter claude-code|codex|fake|grokbot] [--model <m>] [--data-dir <d>] [--output-path <p>]
  *     [--from-stage <s>] [--force] [--non-interactive] [--dry-run] [--timeout-ms <n>]
  *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
  *     [--max-cost-usd <n>] [--resume-max-context <tokens>]

@@ -136,5 +136,33 @@ if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
   });
 }
 
+// --- grokbot adapter (offline: an in-process responder plays the external agent) ---
+{
+  console.log("# adapter: grokbot");
+  const g = await loadAdapter("grokbot");
+  const root = mkdtempSync(join(tmpdir(), "uwf-adapter-grokbot-"));
+  const cwd = join(root, "work"); const dataDir = join(root, "data"); mkdirSync(cwd);
+  const env = { UWF_GROKBOT_POLL_MS: "20" };
+  const respond = (body) => setTimeout(() => {
+    const p = JSON.parse(readFileSync(join(dataDir, "grokbot", "pending.json"), "utf8"));
+    writeFileSync(join(cwd, "out.md"), "done");
+    writeFileSync(p.responsePath, JSON.stringify(body));
+  }, 100);
+  respond({ ok: true, summary: "OK" });
+  const r1 = await g.invokeStage({ prompt: "Run the intake stage", cwd, dataDir, env, outputs: ["out.md"] });
+  check("ok is true", r1.ok === true, r1.error ?? "");
+  for (const k of ["ok", "sessionId", "transcriptPath", "stdout", "exitCode", "usage"]) check(`result has "${k}"`, k in r1);
+  check("stdout is the agent summary", r1.stdout === "OK");
+  check("transcript written", r1.transcriptPath && existsSync(r1.transcriptPath));
+  check("request file lists outputs", JSON.parse(readFileSync(join(dataDir, "grokbot", "requests", "0001-intake.json"), "utf8")).outputs[0] === "out.md");
+  respond({ ok: false, error: "nope" });
+  const r2 = await g.invokeStage({ prompt: "Run the intake stage", cwd, dataDir, env, sessionId: r1.sessionId });
+  check("sessionId in -> same out", r2.sessionId === r1.sessionId);
+  check("agent failure -> ok:false with error", r2.ok === false && /nope/.test(r2.error));
+  const r3 = await g.invokeStage({ prompt: "x", cwd, dataDir, env, timeoutMs: 50 });
+  check("timeout -> ok:false", r3.ok === false && /timeout/.test(r3.error));
+  rmSync(root, { recursive: true, force: true });
+}
+
 if (failures) { console.log(`\n${failures} check(s) FAILED`); process.exit(1); }
 console.log("\nAll adapter checks passed");
