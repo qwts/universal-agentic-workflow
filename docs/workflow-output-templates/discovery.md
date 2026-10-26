@@ -1,4 +1,5 @@
 # Discovery
+<!-- Budget: under 120 lines, one line per finding, do not restate the intake. -->
 
 ## Current state summary
 

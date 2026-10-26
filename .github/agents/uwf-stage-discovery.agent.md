@@ -7,28 +7,18 @@ user-invokable: false
 
 # Discovery Stage
 
-Read `.github/skills/uwf-discovery/SKILL.md`. All inspection rules, the mandatory 5-step sequence, script commands, and output document structure are defined there. Follow them exactly.
+Read `.github/skills/uwf-discovery/SKILL.md` and follow it (inspection rules, script commands, output structure).
 
-## Output path
+Write the discovery artifact to `outputs[0]` from the context; if it is missing, fail with `outputs[0] is required for the discovery stage but was not provided by the orchestrator.`
 
-Write the discovery artifact to `outputs[0]` from the resolved context passed by the orchestrator. Do not hardcode any filename.
+The context carries a `behavior_policy` and `steering_policy`:
+- `must_address` sections are required in the output; cover `priority_order` first; `risk_focus` lists the risks to emphasize.
+- `question_policy`: `standard` = blocking unknowns only, `aggressive` = all ambiguities. `evidence_threshold`: `high` = cite explicit sources.
+- `steering_policy` sets verbosity (`include_examples`, `step_expansion`, `schema_reminders`); with `self_check` true, check the output against `must_address` before finishing.
 
-If `outputs` is missing or empty, fail with a clear error: `outputs[0] is required for the discovery stage but was not provided by the orchestrator.`
+## Output budget
 
-## Structured Context
-
-When invoked by the orchestrator as a new-style stage (`stage_type: discovery`), the prompt includes a `behavior_policy` and `steering_policy`.
-
-**`behavior_policy`** — shapes what you investigate and document:
-- `priority_order`: address these focus areas first, in listed order
-- `must_address`: these sections are **required** in the output document
-- `question_policy`: `standard` = blocking unknowns only; `aggressive` = all ambiguities
-- `risk_focus`: risk categories to emphasize
-- `evidence_threshold`: `standard` = infer from available evidence; `high` = cite explicit sources
-
-**`steering_policy`** — shapes verbosity and explicitness:
-- `instruction_density`: `expanded`/`standard`/`compact`
-- `include_examples`: if `true`, include worked examples
-- `step_expansion`: if `true`, break procedural steps into numbered sub-steps
-- `schema_reminders`: `exhaustive`/`standard`/`concise`
-- `self_check`: if `true`, review output against `must_address` before emitting
+- Findings file: under 120 lines, concise bullets, one line per finding with its path or tool-result evidence.
+- Do not restate the intake or other inputs; cite them by name.
+- No exploratory narration: inspect, log, write. Read only files the intake goal touches.
+- Read each file once; prefer targeted `grep`/`list_dir` over whole-file reads of large files.
