@@ -125,6 +125,37 @@ function resolveMaxCostUsd(stageDef) {
   return v;
 }
 
+/**
+ * on_verdict: map of verdict value -> { route_to, max_round_trips }. When the stage's verdict check fails
+ * with an observed value that is a key here, the runner routes back to `route_to` (an EARLIER stage of the
+ * same workflow) instead of retrying this stage. max_round_trips defaults to 2. Returns null when absent.
+ */
+const DEFAULT_MAX_ROUND_TRIPS = 2;
+function resolveOnVerdict(stageDef, stages) {
+  const v = stageDef.on_verdict;
+  if (v === undefined || v === null) return null;
+  const name = stageDef.name;
+  if (typeof v !== "object" || Array.isArray(v)) fail(`Stage "${name}": on_verdict must be a map of verdict -> { route_to, max_round_trips }.`);
+  const own = stages.findIndex((s) => s.name === name);
+  const out = {};
+  for (const [verdict, rule] of Object.entries(v)) {
+    if (rule === null || typeof rule !== "object" || Array.isArray(rule)) {
+      fail(`Stage "${name}": on_verdict.${verdict} must be a map with route_to (and optional max_round_trips).`);
+    }
+    const target = stages.findIndex((s) => s.name === rule.route_to);
+    if (typeof rule.route_to !== "string" || target < 0) {
+      fail(`Stage "${name}": on_verdict.${verdict}.route_to ${JSON.stringify(rule.route_to)} is not a stage of workflow "${workflow}".`);
+    }
+    if (target >= own) fail(`Stage "${name}": on_verdict.${verdict}.route_to "${rule.route_to}" must name an earlier stage than "${name}".`);
+    const max = rule.max_round_trips ?? DEFAULT_MAX_ROUND_TRIPS;
+    if (!Number.isInteger(max) || max <= 0) {
+      fail(`Stage "${name}": on_verdict.${verdict}.max_round_trips must be a positive integer, got ${JSON.stringify(rule.max_round_trips)}.`);
+    }
+    out[verdict] = { routeTo: rule.route_to, maxRoundTrips: max };
+  }
+  return out;
+}
+
 const QUESTION_POLICY_ORDER = ["minimal", "standard", "aggressive"];
 const EVIDENCE_THRESHOLD_ORDER = ["low", "standard", "high"];
 
@@ -386,6 +417,7 @@ function cmdListStages(db) {
       maxTurns: resolveMaxTurns(stageDef),
       maxCostUsd: resolveMaxCostUsd(stageDef),
       onGateFailure: on_gate_failure ?? "retry",
+      onVerdict: resolveOnVerdict(stageDef, stages),
       gated: gated !== false,
       conditional: conditional === true,
       runAsSubagent: run_as_subagent !== false,
@@ -440,6 +472,7 @@ function cmdGatePrescriptions() {
     retry_mode: s.retry_mode ?? "resume",
     max_turns: resolveMaxTurns(s),
     max_cost_usd: resolveMaxCostUsd(s),
+    on_verdict: resolveOnVerdict(s, stages),
     checks: (s.gate?.checks ?? []).map((c) => ({ type: c.type, label: c.label ?? null, prescription: prescribeCheck(c, null) })),
   }));
   process.stdout.write(JSON.stringify({ workflow, stages: out }, null, 2) + "\n");
@@ -634,14 +667,22 @@ function evaluateGate(stageDef, stageName) {
   // Evaluate gate checks
   const failures = [];
   const prescriptions = [];
+  let verdict = null;      // observed /verdict of a failing JSON check
+  let otherFailure = false; // some failure is not explained by that verdict
   for (const check of (stageDef.gate?.checks ?? [])) {
     const failure = evaluateCheck(check);
-    if (failure) { failures.push(failure); prescriptions.push(prescribeCheck(check, failure)); }
+    if (failure) {
+      failures.push(failure); prescriptions.push(prescribeCheck(check, failure));
+      const seen = verdictOfCheck(check, failure);
+      if (seen !== null) verdict = seen;
+      else if (!(check.type === "require_contains" && /^verdict:/i.test(check.text ?? "") && markdownVerdict(resolveTemplates(check.path)) !== null)) otherFailure = true; // no verdict line at all: incomplete output, retry
+    }
   }
 
   const policy = { on_gate_failure: stageDef.on_gate_failure ?? "retry", max_retries: stageDef.max_retries ?? 2 };
+  // `verdict` is set only when the whole failure is a review outcome (a wrong verdict), so the runner can route on it.
   return failures.length
-    ? { stage: stageName, passed: false, failures, prescriptions, ...policy }
+    ? { stage: stageName, passed: false, failures, prescriptions, ...(verdict !== null && !otherFailure && { verdict }), ...policy }
     : { stage: stageName, passed: true,  failures: [], prescriptions: [], ...policy };
 }
 
@@ -650,13 +691,41 @@ function evaluateGate(stageDef, stageName) {
  * `failures`; it doubles as the runner's retry prompt. `failure` is the evaluateCheck string
  * (null for the audit listing, which has no observed failure).
  */
+/**
+ * The observed string value of /verdict for a require_json_field equals/in check on that pointer,
+ * or null when the check is something else or the field is absent/invalid (a missing verdict is not an outcome).
+ */
+function verdictOfCheck(check, failure) {
+  // A result that fails the stage-result schema is malformed output to repair, not a review outcome.
+  if (failure && /does not match stage-result schema/.test(failure)) return null;
+  if (check.type !== "require_json_field" || check.pointer !== "/verdict" || !("equals" in check || "in" in check)) return null;
+  try {
+    const { found, value } = resolvePointer(JSON.parse(readFileSync(resolveTemplates(check.path), "utf8")), "/verdict");
+    return found && typeof value === "string" ? value : null;
+  } catch { return null; }
+}
+
+/** The "verdict: x" value a markdown file records (first match), or null. */
+function markdownVerdict(path) {
+  try { return readFileSync(path, "utf8").match(/^[ \t>*_-]*verdict:\s*([A-Za-z_-]+)/im)?.[1] ?? null; } catch { return null; }
+}
+
+function verdictOutcome(p, observed, want) {
+  return `${p} records verdict ${JSON.stringify(observed)} (wanted ${JSON.stringify(want)}); the verdict is a review outcome, not something to rewrite, so do not change it to pass the gate.`;
+}
+
 function prescribeCheck(check, failure) {
   const q = (v) => JSON.stringify(v);
   switch (check.type) {
     case "require_non_empty":
       return `Write a non-empty file at ${resolveTemplates(check.path)}.`;
-    case "require_contains":
+    case "require_contains": {
+      // A "verdict: x" line that is present with another value is an outcome; only a MISSING one is asked for.
+      const want = failure && /^verdict:\s*(\S+)/i.exec(check.text ?? "")?.[1];
+      const seen = want ? markdownVerdict(resolveTemplates(check.path)) : null;
+      if (seen && seen.toLowerCase() !== want.toLowerCase()) return verdictOutcome(resolveTemplates(check.path), seen, want);
       return `Include the text ${q(check.text)} in ${resolveTemplates(check.path)}.`;
+    }
     case "require_files_with_prefix":
       return `Create at least one file named ${check.prefix}* under ${resolveTemplates(check.dir)}.`;
     case "require_file_matching_pattern":
@@ -676,6 +745,10 @@ function prescribeCheck(check, failure) {
       else if ("in" in check) want = `${ptr} equal to one of ${q(check.in)}`;
       else if ("equals" in check) want = `${ptr} equal to ${q(check.equals)}`;
       else want = `${ptr} set as the gate requires`;
+      if (failure && check.pointer === "/verdict" && ("equals" in check || "in" in check)) {
+        const seen = verdictOfCheck(check, failure);
+        if (seen !== null) return verdictOutcome(p, seen, "equals" in check ? check.equals : check.in);
+      }
       const detail = failure?.match(/does not match stage-result schema: ([\s\S]*)$/)?.[1];
       return `Write ${p} as JSON with ${want}${schema}.${detail ? ` Fix: ${detail}.` : ""}`;
     }

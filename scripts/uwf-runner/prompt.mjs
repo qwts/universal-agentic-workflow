@@ -218,7 +218,7 @@ function personaRole(skills, workflow) {
  * and SKILL docs (default: this checkout, or UWF_SKILLS_ROOT); `repoRoot` is the target repo the
  * agent works in, where {{cwd}} / {{output_path}} and the artifacts resolve.
  */
-export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot, outputPath, dataDir, extraContext, modelProfile } = {}) {
+export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot, outputPath, dataDir, extraContext, modelProfile, extraInputs, extraNote } = {}) {
   repoRoot = resolve(repoRoot ?? DEFAULT_REPO);
   skillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot, workflow }).root;
   // Match stage-tracker.mjs: artifacts live under <data-dir>/workflow-artifacts
@@ -267,7 +267,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   ] : [];
 
   const subst = (s) => String(s).replace(/\{\{output_path\}\}/g, outputPath).replace(/\{\{cwd\}\}/g, repoRoot);
-  const inputs = (stageDef.inputs ?? []).map(subst);
+  const inputs = [...(stageDef.inputs ?? []), ...(extraInputs ?? [])].map(subst);
   const outputs = (stageDef.outputs ?? []).map(subst);
 
   const abs = (p) => resolve(repoRoot, p);
@@ -325,6 +325,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     "## Inputs",
     inputBlocks.length ? inputBlocks.join("\n\n") : "(none)",
     "",
+    ...(extraNote ? ["## Review findings to address", extraNote, ""] : []),
     "## Required outputs",
     outputs.length ? outputs.map((o) => `- ${o}`).join("\n") : "(none)",
     "",
