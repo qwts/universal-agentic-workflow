@@ -19,6 +19,8 @@ export interface InvokeStageOptions {
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
   permissions?: Permissions;
+  allowedCommands?: string[];
+  skillsRoot?: string;
   /** Transcripts go to <dataDir>/transcripts/. Default: UWF_DATA_DIR ?? ./tmp/uwf */
   dataDir?: string;
 }

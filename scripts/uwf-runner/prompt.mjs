@@ -267,6 +267,15 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   });
   // Skill docs the agent is told to read carry their own relative `.github/skills/...` commands, which
   // the prompt cannot rewrite; give the stage the rule instead.
+  // The approved commands must match what the (possibly rewritten) prompt tells the agent to run, so
+  // list both the repo-relative form and the form resolved against the skills root.
+  const allowedCommands = [...new Set((Array.isArray(frontmatter["allowed-commands"]) ? frontmatter["allowed-commands"] : []).flatMap((c) => {
+    const rewritten = String(c).replace(/\.github\/(?:skills|agents)\/[^\s`'")]*/g, (full) => {
+      if (existsSync(join(repoRoot, full))) return full;
+      return fallbackRoots.map((r) => join(r, full)).find((q) => existsSync(q)) ?? join(fallbackRoots[0] ?? skillsRoot, full);
+    });
+    return [String(c), rewritten];
+  }))];
   const skillFilesNote = rewrote ? [
     "## Skill files",
     `The workflow skills are not all in this repository. When an instruction names a \`.github/skills/...\` or \`.github/agents/...\` path or command that does not exist in the working directory, use the same path under ${fallbackRoots.join(" or, failing that, ")} instead.`,
@@ -344,6 +353,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     systemPrompt: body,
     prompt,
     permissions: mapPermissions(frontmatter.tools, frontmatter["allowed-commands"]),
+    allowedCommands,
     model: stageDef.model ?? null,
     inputs,
     inputsMissing,

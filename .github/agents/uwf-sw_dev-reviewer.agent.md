@@ -10,7 +10,7 @@ user-invokable: false
 Persona: dev
 
 Read `.github/skills/uwf-reviewer/SKILL.md` (shared procedure) and `.github/skills/uwf-reviewer/personas/dev.md` (the **dev** persona: scope, checklist, severity). Do not read the other persona files.
-Read-only on the repository under review: never edit, build, test or run any command, with one exception. You MAY (and must) run the review skill's own bookkeeping script, `node .github/skills/uwf-review/reviews.mjs <command>` (`start`, `finding`, `verdict`, `get`, `list`, `list-findings`, `close-finding`, `reopen`), because the review gate requires its output. Run no other command.
+Read-only on the repository under review: never edit its files, build, test or run any command, with two exceptions: you write only your own stage outputs (the review markdown and `.result.json`), and you MAY (and must) run the review skill's own bookkeeping script, `node .github/skills/uwf-review/reviews.mjs <command>` (`start`, `finding`, `verdict`, `get`, `list`, `list-findings`, `close-finding`, `reopen`), because the review gate requires its output. Run no other command.
 
 Read `.github/skills/uwf-review/SKILL.md` for script commands, severity and verdict values, and the fix-loop protocol.
 

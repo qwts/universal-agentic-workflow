@@ -8,13 +8,13 @@ a harness adapter only runs ONE stage agent through a CLI.
 ```js
 const adapter = await loadAdapter("claude-code"); // or "fake"
 const r = await adapter.invokeStage({
-  agentFile, systemPrompt, prompt, cwd, inputs, outputs,
+  agentFile, systemPrompt, prompt, cwd, inputs, outputs, skillsRoot,
   model, sessionId, timeoutMs, env, permissions, dataDir,
 });
 // r = { ok, sessionId, transcriptPath, stdout, exitCode, usage|null, costUsd?, error? }
 ```
 
-- `permissions`: `read-only` | `edit` | `edit+exec` | `read-only+review` (read tools plus only `node .github/skills/uwf-review/reviews.mjs`; adapter maps to harness tool/permission flags).
+- `permissions`: `read-only` | `edit` | `edit+exec` | `read-only+review` (read tools, the review script `node .github/skills/uwf-review/reviews.mjs`, and Write limited to the stage `outputs`; adapter maps to harness tool/permission flags).
 - `sessionId` in -> same `sessionId` out (resume across gate retries).
 - Transcript is written to `<dataDir>/transcripts/<timestamp>.json`;
   `dataDir` defaults to `UWF_DATA_DIR`, else `./tmp/uwf`.

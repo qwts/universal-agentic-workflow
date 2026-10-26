@@ -21,6 +21,7 @@ for (const f of reviewers) {
   if (!allowed.includes(CMD)) fail(`${f}: frontmatter allowed-commands must list "${CMD}"`);
   if (/"(edit|execute)"/.test(tools)) fail(`${f}: reviewer must not declare edit/execute tools`);
   const body = text.slice(text.indexOf("---", 3) + 3);
+  if (!/stage outputs/.test(body)) fail(`${f}: prompt must say the reviewer writes its stage outputs`);
   if (!body.includes("reviews.mjs")) fail(`${f}: prompt must name reviews.mjs as an allowed command`);
   if (!/MAY[^.]*run[^.]*reviews\.mjs|MAY[^.]*run[^.]*bookkeeping script/.test(body)) fail(`${f}: prompt must say the reviewer MAY run reviews.mjs`);
   if (/(cannot|can't|must not|never)\s+run\s+(any\s+)?commands?\b(?![^.]*(except|exception|other than))/i.test(body)) {
@@ -38,8 +39,12 @@ for (const rel of [".github/skills/uwf-review/SKILL.md", ".github/skills/uwf-rev
 // Runner: the frontmatter must resolve to a preset that permits the command but not edit/exec.
 const { mapPermissions } = await import(join(root, "scripts", "uwf-runner", "prompt.mjs"));
 if (mapPermissions(["agent", "read"], [CMD]) !== "read-only+review") fail("mapPermissions must give read-only+review for the reviewer frontmatter");
-const adapter = readFileSync(join(root, "scripts", "uwf-runner", "adapters", "claude-code.mjs"), "utf8");
-if (!adapter.includes(`Bash(${CMD}:*)`)) fail("claude-code adapter must allow only Bash(" + CMD + ":*) for read-only+review");
+const { reviewAllowed } = await import(join(root, "scripts", "uwf-runner", "adapters", "claude-code.mjs"));
+const allow = reviewAllowed({ allowedCommands: [CMD, "node /skills/.github/skills/uwf-review/reviews.mjs"], outputs: ["tmp/a/issues-review.md", "/abs/x/issues-review.result.json"] });
+for (const want of [`Bash(${CMD}:*)`, "Bash(node /skills/.github/skills/uwf-review/reviews.mjs:*)", "Write(tmp/a/issues-review.md)", "Write(//abs/x/issues-review.result.json)"]) {
+  if (!allow.includes(want)) fail(`claude-code review allow-list missing ${want}`);
+}
+if (allow.some((a) => a === "Bash" || a === "Write" || a === "Edit")) fail("review allow-list must not contain unrestricted Bash/Write/Edit");
 
 if (failures.length) {
   console.error(failures.map((m) => `FAIL ${m}`).join("\n"));

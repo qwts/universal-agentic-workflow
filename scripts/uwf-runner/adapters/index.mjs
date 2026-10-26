@@ -24,6 +24,8 @@ import { resolve, join } from "node:path";
  * @property {string} cwd
  * @property {string[]} [inputs]
  * @property {string[]} [outputs]
+ * @property {string} [skillsRoot]  root holding the workflow skills; the review script is also approved under it
+ * @property {string[]} [allowedCommands]  commands (relative and resolved forms) a `read-only+review` stage may run
  * @property {string} [model]
  * @property {string} [sessionId]
  * @property {number} [timeoutMs]

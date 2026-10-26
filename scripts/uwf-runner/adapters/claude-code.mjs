@@ -13,10 +13,13 @@
  *   read-only  -> Read,Grep,Glob
  *   edit       -> + Edit,Write
  *   edit+exec  -> + Bash
- *   read-only+review -> Read,Grep,Glob + Bash restricted to `node .github/skills/uwf-review/reviews.mjs:*`
+ *   read-only+review -> Read,Grep,Glob + Bash restricted to `allowedCommands` (default
+ *                      `node .github/skills/uwf-review/reviews.mjs`) + Write restricted to the stage's `outputs`
  */
 
 import { spawn } from "node:child_process";
+import { isAbsolute, join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildSystemPrompt, writeTranscript } from "./index.mjs";
 
 export const name = "claude-code";
@@ -25,14 +28,31 @@ const TOOLS = {
   "read-only": ["Read", "Grep", "Glob"],
   edit: ["Read", "Grep", "Glob", "Edit", "Write"],
   "edit+exec": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
-  "read-only+review": ["Read", "Grep", "Glob", "Bash"],
+  "read-only+review": ["Read", "Grep", "Glob", "Bash", "Write"],
 };
 
-// --allowedTools entries when they differ from the tool set: the reviewer gets Bash, but only
-// the review script's own bookkeeping command is pre-approved (dontAsk denies everything else).
-const ALLOWED = {
-  "read-only+review": ["Read", "Grep", "Glob", "Bash(node .github/skills/uwf-review/reviews.mjs:*)"],
-};
+const UWF_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+const DEFAULT_REVIEW_COMMAND = "node .github/skills/uwf-review/reviews.mjs";
+
+/**
+ * --allowedTools entries for `read-only+review`: the reviewer gets Bash and Write, but only the review
+ * script's bookkeeping command(s) and the stage's required output files are pre-approved (dontAsk denies
+ * everything else, so the reviewed source stays read-only).
+ */
+export function reviewAllowed({ allowedCommands, outputs, skillsRoot }) {
+  // The prompt points the agent at the same script under the skills root (or this checkout) when the
+  // target repo lacks it, so approve those absolute forms too.
+  const rel = ".github/skills/uwf-review/reviews.mjs";
+  const roots = [skillsRoot, UWF_CHECKOUT].filter(Boolean);
+  const cmds = [...new Set([
+    ...(allowedCommands?.length ? allowedCommands : [DEFAULT_REVIEW_COMMAND]),
+    DEFAULT_REVIEW_COMMAND,
+    ...roots.map((r) => `node ${join(r, rel)}`),
+  ])];
+  // Write path rules: `//abs/path` is absolute, a bare path is relative to the working directory.
+  const rule = (p) => (isAbsolute(p) ? `/${p}` : p.replace(/^\.\//, ""));
+  return ["Read", "Grep", "Glob", ...cmds.map((c) => `Bash(${c}:*)`), ...(outputs ?? []).map((o) => `Write(${rule(o)})`)];
+}
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts @returns {Promise<import("./index.mjs").InvokeStageResult>} */
 export async function invokeStage(opts) {
@@ -60,7 +80,7 @@ export async function invokeStage(opts) {
   // needed: dontAsk keeps the user's own pre-approved tools unless --tools
   // narrows the set, so a read-only stage must not depend on ambient settings.
   const toolList = TOOLS[permissions].join(",");
-  args.push("--permission-mode", "dontAsk", "--setting-sources", "project", "--tools", toolList, "--allowedTools", (ALLOWED[permissions] ?? TOOLS[permissions]).join(","));
+  args.push("--permission-mode", "dontAsk", "--setting-sources", "project", "--tools", toolList, "--allowedTools", (permissions === "read-only+review" ? reviewAllowed(opts) : TOOLS[permissions]).join(","));
 
   return new Promise((done) => {
     let out = "", err = "", timedOut = false, settled = false;

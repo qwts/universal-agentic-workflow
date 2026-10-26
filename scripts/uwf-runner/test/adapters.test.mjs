@@ -107,6 +107,18 @@ process.stdout.write(JSON.stringify({ result: "OK", session_id: "argv-sess", is_
     const argv = existsSync(argvFile) ? JSON.parse(readFileSync(argvFile, "utf8")) : [];
     const i = argv.indexOf("--setting-sources");
     check("claude-code argv contains --setting-sources project", i >= 0 && argv[i + 1] === "project", JSON.stringify(argv));
+    const r2 = await adapter.invokeStage({
+      prompt: "argv check", cwd, dataDir: join(root, "data"), permissions: "read-only+review", skillsRoot: "/tmp/sr",
+      outputs: ["out/x-review.md"], timeoutMs: 20000,
+      env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` },
+    });
+    const argv2 = existsSync(argvFile) ? JSON.parse(readFileSync(argvFile, "utf8")) : [];
+    const allowedArg = argv2[argv2.indexOf("--allowedTools") + 1] ?? "";
+    const toolsArg = argv2[argv2.indexOf("--tools") + 1] ?? "";
+    check("claude-code read-only+review run ok", r2.ok === true, r2.error ?? "");
+    check("read-only+review allows relative and skillsRoot review script",
+      allowedArg.includes("Bash(node .github/skills/uwf-review/reviews.mjs:*)") && allowedArg.includes("Bash(node /tmp/sr/.github/skills/uwf-review/reviews.mjs:*)"), allowedArg);
+    check("read-only+review: --tools has Bash, allow-list has no bare Bash", toolsArg.split(",").includes("Bash") && !allowedArg.split(",").includes("Bash"), `${toolsArg} | ${allowedArg}`);
     check("claude-code argv passes --setting-sources right after --permission-mode dontAsk",
       i > 0 && argv[i - 1] === "dontAsk" && argv[i - 2] === "--permission-mode", JSON.stringify(argv));
   } finally {

@@ -127,6 +127,18 @@ await test("bare target: referenced files are absolute skillsRoot paths, none un
   } finally { rmSync(bare, { recursive: true, force: true }); }
 });
 
+await test("review stage: allowedCommands cover the relative and the skillsRoot-resolved script path", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "uwf-bare-"));
+  try {
+    const own = await materializePrompt({ workflow: "sw_dev", stage: "review", repoRoot, outputPath: "/OUT", dataDir: "/DATA" });
+    assert.equal(own.permissions, "read-only+review");
+    assert.deepEqual(own.allowedCommands, ["node .github/skills/uwf-review/reviews.mjs"]);
+    const r = await materializePrompt({ workflow: "sw_dev", stage: "review", repoRoot: bare, outputPath: "/OUT", dataDir: "/DATA" });
+    assert.ok(r.allowedCommands.includes("node .github/skills/uwf-review/reviews.mjs"));
+    assert.ok(r.allowedCommands.includes(`node ${repoRoot}/.github/skills/uwf-review/reviews.mjs`), "resolved absolute command not allowed");
+  } finally { rmSync(bare, { recursive: true, force: true }); }
+});
+
 // Partial target: it carries only its workflow's stages.yaml, so it is its own skills root, but the agent
 // files and skill docs still come from this checkout and the references must point there.
 await test("partial target: fallback agent references resolve to this checkout, own files stay relative", async () => {
