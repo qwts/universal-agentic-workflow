@@ -15,11 +15,14 @@ name: UWF
 on:
   pull_request:
     types: [opened, synchronize, labeled, edited]
+  issue_comment:           # `/uwf answer` replies to a paused run
+    types: [created]
 
 permissions:
+  actions: read            # download the paused-state artifact
   contents: read
   issues: read
-  pull-requests: write    # the sticky report comment
+  pull-requests: write     # the sticky comments, labels and reactions
 
 jobs:
   uwf:
@@ -40,11 +43,33 @@ jobs:
       # workflow: sw_dev          # default
       # adapter: claude-code      # default
       # max_cost_usd: 1           # default
+      # on_questions: pause       # default; `skip` marks questions skipped and never pauses
       # uwf_ref: main             # ref of this repo used as the skills root
     secrets: inherit
+
+  uwf-answer:
+    # Answers to a paused run. The reusable workflow re-checks the same condition; the caller's `if` keeps the
+    # job from being listed for every comment.
+    if: >-
+      ${{
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && startsWith(github.event.comment.body, '/uwf ')
+        && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      }}
+    uses: qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml@main
+    with:
+      model: claude-haiku-5-5    # the same value as above (the input is required, the answer job does not use it)
+    secrets: inherit
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: write
 ```
 
-Then create the label `uwf:run` in the consumer repo (`gh label create uwf:run`). If the repository restricts which
+Then create the labels `uwf:run` and `uwf:needs-input` in the consumer repo (`gh label create uwf:run`,
+`gh label create uwf:needs-input`). If the repository restricts which
 actions and reusable workflows may run, allow `qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml`.
 
 A PR starts a run when it carries the label `uwf:run` or its description contains `/uwf run`. Adding the label to an
@@ -59,6 +84,7 @@ PRs from forks never run: the job is skipped, because it would execute untrusted
 | `adapter` | `claude-code` | harness adapter (`claude-code`, `codex`) |
 | `model` | none, required | model passed to the adapter |
 | `max_cost_usd` | `1` | run cost cap; the runner stops with exit 4 above it |
+| `on_questions` | `pause` | `pause`: a required question ends the run (exit 3) and is asked on the PR; `skip`: questions are marked skipped and the run continues (the former behaviour) |
 | `uwf_ref` | `main` | ref of this repo checked out as the skills root |
 | `runner_labels` | `uwf` | reserved; `runs-on` is fixed to `[self-hosted, uwf]` |
 
@@ -76,7 +102,7 @@ secret is not exported, so it never shadows the machine's value.
 2. Installs the skill dependencies in `uwf/` (the same bounded `npm ci` steps as `ci.yml`).
 3. Builds `$RUNNER_TEMP/goal.md` from the PR title, the PR description and the linked issues (`#12`, `owner/repo#12`,
    `Closes #12`; at most 10, fetched with `gh issue view` using the job token; an unreadable one is marked as such).
-4. Runs `runner.mjs run --workflow ... --non-interactive --max-cost-usd ...` with `--repo-root target`,
+4. Runs `runner.mjs run --workflow ... --max-cost-usd ...` (plus `--non-interactive` when `on_questions: skip`) with `--repo-root target`,
    `--skills-root uwf` and `--data-dir $RUNNER_TEMP/uwf-<run_id>`. The exit code is captured, not failed on yet.
 5. Writes the stage table and the per-stage cost report to the job summary. On a non-zero exit the runner prints no table, so the summary shows the failure message and the per-stage result lines instead.
 6. On exit 0 only, pushes the changes the run left in `target/` as one commit under the bot identity (see below).
@@ -96,12 +122,51 @@ code, a table of stage, attempts and gate result, and the artifact link. By outc
 
 - exit 0: whether a commit was pushed, and an @-mention of the PR author asking for review;
 - exit 1: the gate that blocked, its failures and the runner's prescription for fixing it;
-- exit 3: "questions pending" (the questions themselves are posted by #96; until then they are in the artifact);
+- exit 3: "questions pending", pointing at the separate questions comment (see "Questions and answers");
 - exit 4: the cost cap that was hit (`max_cost_usd`).
 
 The comment is written with the job token (`pull-requests: write`). Text from the runner log is untrusted: it is shown
 in code spans (no @-mentions, no markdown breakout), scrubbed with the shared secret patterns and never passed through a
 shell.
+
+## Questions and answers
+
+With `on_questions: pause` (the default) the runner is started without `--non-interactive`. When a stage logs a
+*required* question, or the runner finds one pending, the run ends with exit 3 instead of skipping it. Optional
+questions never pause the run; they are recorded and listed in the comment. The round trip:
+
+1. **Pause.** `scripts/uwf-on-pr/pause.mjs` posts (or updates) a second sticky comment, found by the marker
+   `<!-- uwf-on-pr:questions -->`, with a checklist `- [ ] **Q<id>** (<stage>, required|optional) <question>` and the
+   proposed answer when there is one. It adds the label `uwf:needs-input` and removes `uwf:run`. It writes
+   `paused.json` (`headSha`, `stage`, `pausedAt`) and a snapshot of the run's working-tree changes into the data dir, and
+   the whole data dir is uploaded (after scrubbing) as the artifact `uwf-state-pr-<number>`, overwritten on each pause and
+   kept 14 days. The job still fails with exit code 3.
+2. **Answer.** Reply on the PR with one command per line: `/uwf answer <id> <text>` or `/uwf skip <id>`. The caller's
+   `uwf-answer` job runs the reusable workflow's `answer` job on a hosted runner: it downloads the state artifact, applies
+   the commands with `questions.mjs`, ticks the checklist, uploads the state again and replies with what is still
+   pending. Only pending questions can be changed. When no required question is left it marks the state `resume: true`,
+   swaps the labels (`uwf:needs-input` off, `uwf:run` on) and reacts with a thumbs-up.
+3. **Resume.** The `labeled` event for `uwf:run` starts the `uwf` job. It restores the state artifact and, only when
+   `paused.json` has `resume: true` and `headSha` still equals the PR head, runs `runner.mjs resume` (no `--goal`;
+   `--max-cost-usd` is passed again because it is not persisted; the costs already in the transcripts count). `resume`
+   continues the first unfinished stage, which is the one that stopped on the questions, so `--from-stage` is not needed.
+   If the head moved, or the state is missing or expired, the run starts fresh. After a resumed run that does not pause
+   again, the artifact is replaced with a `done.json` marker so a later `uwf:run` label cannot resume stale state.
+4. A comment with no pause to answer gets "No paused UWF run on this PR."
+
+Requirements and limits:
+
+- **`actions: read`** is needed in the caller's `permissions` (and the workflow's) to list and download the artifact.
+- **A bot token is needed for automatic resume.** Events raised with the job token (`GITHUB_TOKEN`) start no workflow, so
+  the `uwf:run` label added by the answer job only starts the resume run when `UWF_BOT_TOKEN` (the PAT-backed bot from
+  [the bot commits section](#commits-under-the-bot-identity), a `User` sender) is configured. Without it the answer job
+  says so and you add the `uwf:run` label yourself.
+- **Trust.** Only comments whose `author_association` is OWNER, MEMBER or COLLABORATOR are honoured. The comment body is
+  data: it is read from the environment, matched against `^/uwf (answer|skip) (\d+)(?: (.+))?$` line by line, and passed to
+  the question CLI as separate argv elements, never through a shell. An answer that starts with `--` is rejected.
+- The state stays in the artifact for 14 days; after that a `uwf:run` label starts a fresh run. Answers and the data dir
+  are scrubbed with the same patterns as the other artifacts, so do not put secrets in answers.
+- Fork PRs never run, so they never pause.
 
 ## Commits under the bot identity
 
@@ -155,6 +220,7 @@ state and transcripts of the cancelled run are not shared. The cancelled run's d
 
 - Job summary of the run: stage table and cost report.
 - Artifact `uwf-pr-<number>-<run_id>` on the run page: workflow artifacts, transcripts, runner log.
+- Artifact `uwf-state-pr-<number>`: the paused run's state (only while a run is paused).
 
 ## Not yet verified
 
@@ -168,3 +234,7 @@ need a live run on a registered runner and are still open:
 The acceptance checks of #95 and #97 also need a live run and are still open: the comment updates in place across runs;
 the pushed commit is Verified and attributed to the bot; a grep for the API key pattern over uploaded artifacts finds
 nothing; two concurrent labeled PRs on one runner never share files (this needs a live runner).
+
+The acceptance checks of #96 also need a live run: a pause posts the checklist and labels; `/uwf answer` from a
+collaborator resumes the run from the right stage; a comment from a non-collaborator is ignored; an optional question
+never pauses.

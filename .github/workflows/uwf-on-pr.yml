@@ -26,6 +26,12 @@ on:
         description: Ref of qwts/universal-agentic-workflow checked out as the skills root
         type: string
         default: main
+      on_questions:
+        description: >-
+          What to do when a stage logs a required question. pause (default) posts the questions on the PR and ends the run
+          with exit 3 until they are answered with /uwf answer comments; skip marks them skipped and continues
+        type: string
+        default: pause
       runner_labels:
         description: Reserved. The job runs on [self-hosted, uwf]; this input only documents the label set
         type: string
@@ -42,6 +48,7 @@ on:
         required: false
 
 permissions:
+  actions: read           # the answer and resume paths download the paused-state artifact
   contents: read
   issues: read
   pull-requests: write
@@ -49,6 +56,7 @@ permissions:
 jobs:
   guard:
     name: Skip runs started by the run's own commit
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: [self-hosted, uwf]
     timeout-minutes: 5
     # Same group as `uwf`: the self-hosted runner is shared, so a newer push's guard would otherwise queue
@@ -87,7 +95,7 @@ jobs:
     needs: guard
     # Fork PRs would run untrusted code on a self-hosted machine; only same-repo PRs run.
     # The run's own commit (UWF-Run trailer, checked by the guard job) and bot senders never start a run.
-    if: ${{ needs.guard.outputs.skip != 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.event.sender.type != 'Bot' }}
+    if: ${{ github.event_name == 'pull_request' && needs.guard.outputs.skip != 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.event.sender.type != 'Bot' }}
     runs-on: [self-hosted, uwf]
     timeout-minutes: 180
     concurrency:
@@ -232,6 +240,21 @@ jobs:
             echo "CODEX_API_KEY=$SECRET_OPENAI_API_KEY" >> "$GITHUB_ENV"
           fi
 
+      # A `uwf:run` label added after the questions were answered resumes the paused run: its data dir and working-tree
+      # changes come back from the uwf-state-pr-<n> artifact, but only if the answer job released it and the PR head is unchanged.
+      - name: Restore paused state
+        if: ${{ github.event.action == 'labeled' && github.event.label.name == 'uwf:run' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -euo pipefail
+          node uwf/scripts/uwf-on-pr/state.mjs restore
+
       - name: Assemble goal file
         shell: bash
         env:
@@ -252,20 +275,30 @@ jobs:
           INPUT_ADAPTER: ${{ inputs.adapter }}
           INPUT_MODEL: ${{ inputs.model }}
           INPUT_MAX_COST_USD: ${{ inputs.max_cost_usd }}
+          INPUT_ON_QUESTIONS: ${{ inputs.on_questions }}
         run: |
           set -uo pipefail
           mkdir -p "$UWF_DATA_DIR"
+          # `resume` continues the first unfinished stage of the restored data dir (a stage that stopped on questions
+          # stays active, so no --from-stage is needed); it takes no --goal, and --max-cost-usd is not persisted.
+          if [ "${UWF_MODE:-}" = resume ]; then
+            args=(resume)
+          else
+            args=(run --goal "$RUNNER_TEMP/goal.md")
+          fi
+          args+=(--workflow "$INPUT_WORKFLOW"
+            --adapter "$INPUT_ADAPTER"
+            --model "$INPUT_MODEL"
+            --repo-root "$GITHUB_WORKSPACE/target"
+            --skills-root "$GITHUB_WORKSPACE/uwf"
+            --data-dir "$UWF_DATA_DIR"
+            --max-cost-usd "$INPUT_MAX_COST_USD")
+          # skip keeps the old behaviour (questions are marked skipped); pause lets required ones end the run with exit 3.
+          if [ "$INPUT_ON_QUESTIONS" = skip ]; then
+            args+=(--non-interactive)
+          fi
           set +e
-          node uwf/scripts/uwf-runner/runner.mjs run \
-            --workflow "$INPUT_WORKFLOW" \
-            --goal "$RUNNER_TEMP/goal.md" \
-            --adapter "$INPUT_ADAPTER" \
-            --model "$INPUT_MODEL" \
-            --repo-root "$GITHUB_WORKSPACE/target" \
-            --skills-root "$GITHUB_WORKSPACE/uwf" \
-            --data-dir "$UWF_DATA_DIR" \
-            --non-interactive \
-            --max-cost-usd "$INPUT_MAX_COST_USD" 2>&1 | tee "$RUNNER_TEMP/runner.log"
+          node uwf/scripts/uwf-runner/runner.mjs "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/runner.log"
           code=${PIPESTATUS[0]}
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
@@ -326,6 +359,24 @@ jobs:
         run: |
           set -uo pipefail
           node uwf/scripts/uwf-on-pr/push-as-bot.mjs
+
+      - name: Pause for questions
+        id: pause
+        if: ${{ always() && steps.run.outputs.exit_code == '3' && inputs.on_questions != 'skip' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUNNER_LOG: ${{ runner.temp }}/runner.log
+          TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -euo pipefail
+          QUESTIONS_CLI="$GITHUB_WORKSPACE/uwf/.github/skills/uwf-question-protocol/questions.mjs" \
+            node uwf/scripts/uwf-on-pr/pause.mjs
 
       - name: Report to the PR
         if: ${{ always() }}
@@ -389,6 +440,35 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Upload the paused state
+        if: ${{ always() && steps.pause.outcome == 'success' && steps.scrub.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uwf-state-pr-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/uwf-${{ github.run_id }}
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      # A resumed run that did not pause again has consumed the state: replace it so a later `uwf:run` label starts fresh.
+      - name: Mark the paused state as consumed
+        if: ${{ always() && env.UWF_MODE == 'resume' && steps.run.outputs.exit_code != '' && steps.run.outputs.exit_code != '3' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/uwf-state-done"
+          printf '{"consumedBy":"%s","at":"%s"}\n' "$GITHUB_RUN_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUNNER_TEMP/uwf-state-done/done.json"
+
+      - name: Upload the consumed marker
+        if: ${{ always() && env.UWF_MODE == 'resume' && steps.run.outputs.exit_code != '' && steps.run.outputs.exit_code != '3' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uwf-state-pr-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/uwf-state-done/done.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Remove the per-run data directory
         if: ${{ always() && env.UWF_KEEP != 'true' }}
         shell: bash
@@ -410,3 +490,103 @@ jobs:
           esac
           echo "::error::uwf runner exited with code ${RUNNER_EXIT}: ${msg}"
           exit "$RUNNER_EXIT"
+
+  # Answers a paused run. Triggered by the caller's issue_comment event, so it runs the default branch's caller and
+  # never checks out or executes PR code, which is why a hosted runner is enough. Only owner, member and
+  # collaborator comments count; the comment body is data and reaches the scripts through the environment.
+  answer:
+    name: Apply UWF answers from a PR comment
+    if: ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/uwf ') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Answers to one PR are applied one at a time and never dropped; they do not touch the run's own group.
+    concurrency:
+      group: uwf-answer-pr-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Set the state directory
+        shell: bash
+        run: echo "UWF_DATA_DIR=$RUNNER_TEMP/uwf-answer-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Check out UWF skills root
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: qwts/universal-agentic-workflow
+          ref: ${{ inputs.uwf_ref }}
+          path: uwf
+          persist-credentials: false
+
+      - name: Install question-protocol dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install question-protocol dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-question-protocol
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Download the paused state
+        id: fetch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          STATE_DIR="$UWF_DATA_DIR" node uwf/scripts/uwf-on-pr/state.mjs fetch
+
+      - name: No paused run
+        if: ${{ steps.fetch.outputs.found != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          node uwf/scripts/uwf-on-pr/answer.mjs none
+
+      - name: Apply the answers
+        id: apply
+        if: ${{ steps.fetch.outputs.found == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # A label added with the job token starts no workflow; the bot token's does, which is how a resume begins.
+          LABEL_TOKEN: ${{ secrets.UWF_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          QUESTIONS_CLI="$GITHUB_WORKSPACE/uwf/.github/skills/uwf-question-protocol/questions.mjs" \
+            node uwf/scripts/uwf-on-pr/answer.mjs apply
+
+      - name: Save the updated state
+        if: ${{ steps.apply.outputs.applied != '' && steps.apply.outputs.applied != '0' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uwf-state-pr-${{ github.event.issue.number }}
+          path: ${{ runner.temp }}/uwf-answer-${{ github.run_id }}
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      # After the upload, so the resume run that the label starts finds the answers.
+      - name: Release the run
+        if: ${{ steps.apply.outputs.applied != '' && steps.apply.outputs.applied != '0' && steps.apply.outputs.resume == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          LABEL_TOKEN: ${{ secrets.UWF_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          node uwf/scripts/uwf-on-pr/answer.mjs activate
