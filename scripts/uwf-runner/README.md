@@ -112,6 +112,14 @@ unless the workflow in that data dir is already complete: then it prints the sta
 (`--force` re-initializes anyway). `--from-stage <s>` calls `stage-tracker.mjs reset-from` and rolls
 the phase back via `state.mjs rollback`.
 
+## Parallel fronts
+
+Several runs against one repo are supported with these rules:
+
+- **One `--data-dir` per front is required.** The skill SQLite databases (state, stage tracker, blueprint, questions, ...) live in the data dir; two fronts sharing one corrupt each other's state. `run` and `resume` write `<data-dir>/run.lock` (run id and pid) and refuse to start, exit 2, naming the other run when its pid is still alive. A lock left by a crashed run (dead pid) is replaced; the lock is removed when the run ends.
+- **Pass a distinct `--output-path` per front too.** The default `./tmp/workflow-artifacts` is per target repo, so fronts on one repo would overwrite each other's stage artifacts.
+- **ADR numbers are reserved atomically.** `adrs.mjs create` (and `adrs.mjs next-number`) claim the next number with an exclusive file create under `docs/adr/`, so concurrent fronts never get the same number. Use the path the command returns.
+
 `runner.mjs resume --workflow w [--adapter a] [--model m] [--data-dir d] [--output-path p] [--non-interactive] [--timeout-ms n]`
 continues from the first stage not passed/skipped without re-initializing stores. The goal is read
 from `<data-dir>/runner-goal.md` (written by `run`; exit 2 if missing). An `active` stage (crash) is

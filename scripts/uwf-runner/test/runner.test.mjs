@@ -1042,5 +1042,26 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 
+{
+  console.log("# run.lock: one run per data dir");
+  const s = setup();
+  try {
+    mkdirSync(s.data, { recursive: true });
+    const lock = join(s.data, "run.lock");
+    writeFileSync(lock, JSON.stringify({ runId: "other-run-1", pid: process.pid, workflow: "sw_dev" }));
+    const r = run(s);
+    check("live lock: exits 2", r.code === 2, `${r.code} ${r.err.slice(-400)}`);
+    check("live lock: names the other run and --data-dir", r.err.includes("other-run-1") && r.err.includes("distinct --data-dir"), r.err.slice(-400));
+    check("live lock: lock left untouched", JSON.parse(readFileSync(lock, "utf8")).runId === "other-run-1");
+    check("live lock: nothing ran", transcripts(s).length === 0);
+    // A dead pid: spawn a short-lived child and reuse its pid.
+    const dead = spawnSync(process.execPath, ["-e", "0"]);
+    writeFileSync(lock, JSON.stringify({ runId: "crashed-run", pid: dead.pid ?? 2147483646, workflow: "sw_dev" }));
+    const r2 = run(s);
+    check("stale lock: replaced and run completes", r2.code === 0, `${r2.code} ${r2.err.slice(-400)}`);
+    check("lock removed on exit", !existsSync(lock));
+  } finally { rmSync(s.base, { recursive: true, force: true }); }
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

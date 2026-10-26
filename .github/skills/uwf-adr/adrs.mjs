@@ -33,7 +33,7 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -124,7 +124,7 @@ function toSlug(title) {
 /** Return the next zero-padded ADR number across the DB and committed files. */
 function nextNumber(db, outputDir) {
   const row = db
-    .prepare("SELECT MAX(CAST(number AS INTEGER)) AS max_number FROM adrs")
+    ?.prepare("SELECT MAX(CAST(number AS INTEGER)) AS max_number FROM adrs")
     .get();
   let maxNumber = Number(row?.max_number ?? 0);
 
@@ -138,27 +138,56 @@ function nextNumber(db, outputDir) {
   return String(maxNumber + 1).padStart(4, "0");
 }
 
-/** Scaffold the markdown file from the template. */
-function scaffoldFile(outputDir, number, title, decision, today) {
-  const slug = toSlug(title);
-  const fileName = `ADR-${number}-${slug}.md`;
-  const filePath = join(outputDir, fileName);
-
-  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
-
+/** Render the markdown for one ADR from the template. */
+function renderAdr(number, title, decision, today) {
   const template = existsSync(TEMPLATE_PATH)
     ? readFileSync(TEMPLATE_PATH, "utf8")
     : DEFAULT_TEMPLATE;
 
-  const content = template
+  return template
     .replace(/ADR-####/g, `ADR-${number}`)
     .replace(/<Title>/g, title)
     .replace(/<YYYY-MM-DD>/g, today)
     .replace(/Status: Proposed \| Accepted \| Deprecated \| Superseded/g, "Status: Proposed")
     .replace(/- The decision, stated crisply\./g, `- ${decision}`);
+}
 
-  writeFileSync(filePath, content, "utf8");
-  return { filePath: join(outputDir, fileName).replace(/\\/g, "/"), slug };
+const CLAIM_STALE_MS = 30_000;
+
+/**
+ * Atomically reserve the next ADR number and write its scaffold. Concurrent callers (parallel
+ * fronts on one repo) never receive the same number: a claim file `.adr-NNNN.claim` is created
+ * with the `wx` flag, the directory is rescanned while holding it (a caller that finished just
+ * before us has already written its file, so we see its number), and only then is the real
+ * file written. A claim older than CLAIM_STALE_MS (crashed caller) is removed.
+ */
+function reserveAdr(db, outputDir, title, decision, today) {
+  const slug = toSlug(title);
+  mkdirSync(outputDir, { recursive: true });
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    const number = nextNumber(db, outputDir);
+    const claim = join(outputDir, `.adr-${number}.claim`);
+    let fd;
+    try {
+      fd = openSync(claim, "wx");
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try {
+        if (Date.now() - statSync(claim).mtimeMs > CLAIM_STALE_MS) unlinkSync(claim);
+      } catch { /* the holder just released it */ }
+      continue;
+    }
+    closeSync(fd);
+    try {
+      if (nextNumber(db, outputDir) !== number) continue; // someone took it between our scan and claim
+      const filePath = join(outputDir, `ADR-${number}-${slug}.md`);
+      writeFileSync(filePath, renderAdr(number, title, decision, today), { encoding: "utf8", flag: "wx" });
+      return { number, slug, filePath: filePath.replace(/\\/g, "/") };
+    } finally {
+      try { unlinkSync(claim); } catch { /* already gone */ }
+    }
+  }
+  fail("Could not reserve an ADR number after 1000 attempts.");
 }
 
 // Fallback if template file is missing
@@ -211,12 +240,10 @@ function cmdCreate(db) {
   }
 
   const outputDir = flags["output-path"] ?? "docs/adr";
-  const number = nextNumber(db, outputDir);
-  const slug = toSlug(flags["title"]);
   const today = new Date().toISOString().slice(0, 10);
   const now = new Date().toISOString();
 
-  const { filePath } = scaffoldFile(outputDir, number, flags["title"], flags["decision"], today);
+  const { number, slug, filePath } = reserveAdr(db, outputDir, flags["title"], flags["decision"], today);
 
   const info = db.prepare(
     `INSERT INTO adrs
@@ -237,6 +264,15 @@ function cmdCreate(db) {
     procedure: "create",
     adr: db.prepare("SELECT * FROM adrs WHERE id = ?").get(info.lastInsertRowid),
   });
+}
+
+/** Reserve the next number and scaffold the file only (no DB row); prints {number, path}. */
+function cmdNextNumber() {
+  requireFlag("title", "next-number");
+  const outputDir = flags["output-path"] ?? "docs/adr";
+  const today = new Date().toISOString().slice(0, 10);
+  const { number, filePath } = reserveAdr(null, outputDir, flags["title"], flags["decision"] ?? "TBD", today);
+  succeed({ procedure: "next-number", number, path: filePath });
 }
 
 function cmdUpdate(db) {
@@ -330,7 +366,9 @@ function cmdDeprecate(db) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-if (!command) usageError("No command given. Expected: create | update | get | list | supersede | deprecate");
+if (!command) usageError("No command given. Expected: create | next-number | update | get | list | supersede | deprecate");
+
+if (command === "next-number") cmdNextNumber();
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
@@ -353,5 +391,5 @@ switch (command) {
   case "deprecate": cmdDeprecate(db); break;
   case "reset":     cmdReset(db);     break;
   default:
-    usageError(`Unknown command: "${command}". Expected: create | update | get | list | supersede | deprecate | reset`);
+    usageError(`Unknown command: "${command}". Expected: create | next-number | update | get | list | supersede | deprecate | reset`);
 }

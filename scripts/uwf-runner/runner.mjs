@@ -53,6 +53,40 @@ const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
 
+const LOCK_FILE = "run.lock";
+
+/**
+ * One run per data dir: parallel fronts share skill SQLite DBs unless each has its own --data-dir.
+ * Writes <dataDir>/run.lock ({runId, pid, ...}) with the exclusive `wx` flag. A lock whose pid is
+ * dead (crashed run) is replaced; a live one throws a UsageError. Returns a release function.
+ */
+function acquireRunLock(dataDir, workflow) {
+  mkdirSync(dataDir, { recursive: true });
+  const lockPath = join(dataDir, LOCK_FILE);
+  const info = { runId: `${workflow}-${process.pid}-${Date.now()}`, pid: process.pid, workflow, startedAt: new Date().toISOString() };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      writeFileSync(lockPath, JSON.stringify(info), { flag: "wx" });
+      return () => {
+        try { if (JSON.parse(readFileSync(lockPath, "utf8")).runId === info.runId) rmSync(lockPath, { force: true }); } catch { /* already gone */ }
+      };
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+    }
+    let other = null;
+    try { other = JSON.parse(readFileSync(lockPath, "utf8")); } catch { /* unreadable: treat as stale */ }
+    if (other && Number.isInteger(other.pid) && pidAlive(other.pid)) {
+      throw new UsageError(`Data dir ${dataDir} is in use by run ${other.runId} (pid ${other.pid}). Parallel fronts must each pass a distinct --data-dir (and --output-path); two runs sharing one would collide on the skill SQLite DBs.`);
+    }
+    rmSync(lockPath, { force: true }); // stale: owner is gone
+  }
+  throw new UsageError(`Could not take ${lockPath}; another run is starting on the same --data-dir. Use a distinct --data-dir per parallel front.`);
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
 const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3, COST: 4 };
 const DEFAULT_RESUME_MAX_CONTEXT = 100_000;
 
@@ -197,6 +231,8 @@ async function main(argv) {
   else if (!existsSync(goalPath)) throw new UsageError(`No goal recorded at ${goalPath}; start with "runner.mjs run --goal ..." first`);
   else goal = readFileSync(goalPath, "utf8").trim();
 
+  const releaseLock = scratch ? () => {} : acquireRunLock(dataDir, flags.workflow);
+
   const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
   const withOut = ["--output-path", outputPath, ...common];
@@ -326,6 +362,7 @@ async function main(argv) {
       repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
       resetFrom, rollbackPhase, phaseFlags, resuming: command === "resume" });
   } finally {
+    releaseLock();
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
 }

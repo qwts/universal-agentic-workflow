@@ -32,6 +32,7 @@ Agents must never write to the database directly. Call the script via terminal a
 | Command | Purpose |
 |---|---|
 | `create --title <text> --decision <text> [--impact low\|medium\|high] [--stage <s>] [--output-path <path>]` | Register a new ADR; scaffolds `docs/adr/ADR-####-<slug>.md`; returns the assigned `number` and `id` |
+| `next-number --title <text> [--decision <text>] [--output-path <path>]` | Atomically reserve the next ADR number and scaffold its file (no DB row); prints `{number, path}`. Safe under parallel fronts; always use the returned path, never compute a number yourself |
 | `update --id <n> [field flags…]` | Update fields on an existing ADR |
 | `get --id <n>` | Get a single ADR record |
 | `list [--status <s>] [--impact <s>]` | List ADRs with optional filters |
@@ -69,7 +70,7 @@ node .github/skills/uwf-adr/adrs.mjs deprecate --id 3
 
 ## ADR procedure
 
-1. **Create the ADR** via `adrs.mjs create` — captures metadata in the DB and scaffolds the markdown file.
+1. **Create the ADR** via `adrs.mjs create` — captures metadata in the DB and scaffolds the markdown file. The number is reserved atomically (claim file plus exclusive create), so parallel fronts on one repo never collide; use the returned `file_path`, and give each parallel front its own `--data-dir` so the DBs stay separate.
 2. **Fill in the template** — edit `docs/adr/ADR-####-<slug>.md`:
    - Context, Decision, Alternatives, Consequences, Verification
    - Appendix A — ADR-300 checklist (see below)
