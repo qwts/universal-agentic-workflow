@@ -153,6 +153,8 @@ function renderAdr(number, title, decision, today) {
 }
 
 const CLAIM_STALE_MS = 30_000;
+const RESERVE_TIMEOUT_MS = 10_000;
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
  * Atomically reserve the next ADR number and write its scaffold. Concurrent callers (parallel
@@ -164,7 +166,8 @@ const CLAIM_STALE_MS = 30_000;
 function reserveAdr(db, outputDir, title, decision, today) {
   const slug = toSlug(title);
   mkdirSync(outputDir, { recursive: true });
-  for (let attempt = 0; attempt < 1000; attempt++) {
+  const deadline = Date.now() + RESERVE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
     const number = nextNumber(db, outputDir);
     const claim = join(outputDir, `.adr-${number}.claim`);
     let fd;
@@ -175,11 +178,13 @@ function reserveAdr(db, outputDir, title, decision, today) {
       try {
         if (Date.now() - statSync(claim).mtimeMs > CLAIM_STALE_MS) unlinkSync(claim);
       } catch { /* the holder just released it */ }
+      sleepMs(5 + Math.random() * 20); // a live holder is still writing: back off, then rescan
       continue;
     }
     closeSync(fd);
     try {
       if (nextNumber(db, outputDir) !== number) continue; // someone took it between our scan and claim
+      if (process.env.UWF_ADR_TEST_DELAY_MS) sleepMs(Number(process.env.UWF_ADR_TEST_DELAY_MS)); // test hook: force contention
       const filePath = join(outputDir, `ADR-${number}-${slug}.md`);
       writeFileSync(filePath, renderAdr(number, title, decision, today), { encoding: "utf8", flag: "wx" });
       return { number, slug, filePath: filePath.replace(/\\/g, "/") };
@@ -187,7 +192,7 @@ function reserveAdr(db, outputDir, title, decision, today) {
       try { unlinkSync(claim); } catch { /* already gone */ }
     }
   }
-  fail("Could not reserve an ADR number after 1000 attempts.");
+  fail(`Could not reserve an ADR number within ${RESERVE_TIMEOUT_MS / 1000}s.`);
 }
 
 // Fallback if template file is missing

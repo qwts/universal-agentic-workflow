@@ -10,13 +10,13 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ADRS = join(ROOT, ".github/skills/uwf-adr/adrs.mjs");
-const N = 8;
+const N = 16;
 const dir = mkdtempSync(join(tmpdir(), "uwf-adr-"));
 let failures = 0;
 const check = (label, cond, detail = "") => { console.log(`${cond ? "  ok  " : "  FAIL"} ${label} ${cond ? "" : detail}`); if (!cond) failures++; };
 
 const runOne = (i) => new Promise((res) => {
-  const p = spawn(process.execPath, [ADRS, "next-number", "--title", `Decision ${i}`, "--output-path", dir], { stdio: ["ignore", "pipe", "pipe"] });
+  const p = spawn(process.execPath, [ADRS, "next-number", "--title", `Decision ${i}`, "--output-path", dir], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, UWF_ADR_TEST_DELAY_MS: "50" } });
   let out = "", err = "";
   p.stdout.on("data", (d) => { out += d; });
   p.stderr.on("data", (d) => { err += d; });
