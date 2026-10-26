@@ -20,6 +20,7 @@ import { resolve, join } from "node:path";
  * @property {string} [agentFile] agent .md whose body becomes part of the system prompt
  * @property {string} [systemPrompt]
  * @property {string} prompt
+ * @property {string} [stage] stage name, set by the runner; adapters must not infer it from the prompt
  * @property {string} cwd
  * @property {string[]} [inputs]
  * @property {string[]} [outputs]
