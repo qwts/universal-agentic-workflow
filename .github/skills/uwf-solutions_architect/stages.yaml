@@ -58,6 +58,7 @@ stages:
   - name: discovery
     agent: uwf-stage-discovery
     max_retries: 2
+    max_turns: 12
     on_gate_failure: retry
     run_as_subagent: true
     advances_phase_to: discovery
@@ -170,6 +171,7 @@ stages:
   - name: blueprint
     agent: uwf-core-blueprint
     max_retries: 2
+    max_turns: 12
     on_gate_failure: retry
     run_as_subagent: true
     inputs:
