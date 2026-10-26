@@ -11,8 +11,8 @@
  *
  * Usage: node verify.mjs [--dry-run]
  */
-import { execFileSync, execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const dryRun = process.argv.includes("--dry-run");
@@ -30,12 +30,28 @@ function detect() {
   }
   if (existsSync(join(cwd, "Cargo.toml"))) { argv("cargo", ["build"]); argv("cargo", ["test"]); }
   if (existsSync(join(cwd, "go.mod"))) { argv("go", ["build", "./..."]); argv("go", ["test", "./..."]); }
-  const pyproject = existsSync(join(cwd, "pyproject.toml"))
-    ? readFileSync(join(cwd, "pyproject.toml"), "utf8") : null;
-  if ((pyproject !== null && /pytest/.test(pyproject)) || existsSync(join(cwd, "tests"))) {
-    argv("python", ["-m", "pytest", "-q"]);
-  }
+  if (looksLikePytest()) argv(pythonBin(), ["-m", "pytest", "-q"]);
   return out;
+}
+
+const has = (f) => existsSync(join(cwd, f));
+const read = (f) => { try { return readFileSync(join(cwd, f), "utf8"); } catch { return ""; } };
+
+/** Only treat the repo as Python when it shows Python/pytest signals (a bare tests/ dir is not enough). */
+function looksLikePytest() {
+  if (/pytest/.test(read("pyproject.toml"))) return true;
+  if (has("pytest.ini")) return true;
+  if (/\[tool:pytest\]/.test(read("setup.cfg"))) return true;
+  if (/\[pytest\]/.test(read("tox.ini"))) return true;
+  const pyProject = ["pyproject.toml", "setup.py", "setup.cfg"].some(has)
+    || readdirSync(cwd).some((f) => /^requirements.*\.txt$/.test(f));
+  return (has("tests") || has("test")) && pyProject;
+}
+
+/** Prefer python3 when it is the only interpreter on PATH. */
+function pythonBin() {
+  const ok = (b) => spawnSync(b, ["--version"], { stdio: "ignore" }).status === 0;
+  return ok("python") || !ok("python3") ? "python" : "python3";
 }
 
 function resolveCommands() {

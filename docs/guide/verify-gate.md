@@ -26,7 +26,9 @@ First match wins:
      `test` script is the npm default placeholder)
    - `Cargo.toml`: `cargo build`, `cargo test`
    - `go.mod`: `go build ./...`, `go test ./...`
-   - `pyproject.toml` mentioning pytest, or a `tests/` directory: `python -m pytest -q`
+   - Python with pytest signals (`pyproject.toml` mentioning pytest, `pytest.ini`, `[tool:pytest]` in
+     `setup.cfg`, `[pytest]` in `tox.ini`, or a `tests/` or `test/` dir alongside `pyproject.toml`,
+     `setup.py`, `setup.cfg` or `requirements*.txt`): `python -m pytest -q` (`python3` when only that exists)
    - nothing detected: prints "no verify commands detected" and passes
 
 Configured commands run through the shell, so only operator-controlled config should set them.

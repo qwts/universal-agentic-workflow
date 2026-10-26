@@ -69,6 +69,18 @@ assert("UWF_VERIFY_CMDS overrides package.json", r.status === 0 && r.out.include
 r = verify(repo(), [], { UWF_VERIFY_CMDS: "node -e \"process.exit(0)\"\nnode -e \"process.exit(2)\"\nnode -e \"process.exit(5)\"" });
 assert("stops at first failing command", r.status === 1 && r.out.includes("exited 2") && !r.out.includes("exited 5"), r.out);
 
+const nodeWithTests = repo({ "package.json": pkg("node -e \"process.exit(0)\"") });
+mkdirSync(join(nodeWithTests, "tests"));
+r = verify(nodeWithTests, ["--dry-run"]);
+assert("Node repo with empty tests/ does not get pytest", r.status === 0 && !/pytest/.test(r.out), r.out);
+r = verify(nodeWithTests);
+assert("Node repo with empty tests/ passes", r.status === 0, r.out);
+
+const py = repo({ "setup.py": "" });
+mkdirSync(join(py, "tests"));
+r = verify(py, ["--dry-run"]);
+assert("Python repo with tests/ and setup.py gets pytest", /-m pytest -q/.test(r.out), r.out);
+
 r = verify(failing, ["--dry-run"]);
 assert("--dry-run prints commands without running", r.status === 0 && r.out.includes("npm test") && !r.out.includes("boom-marker"), r.out);
 
