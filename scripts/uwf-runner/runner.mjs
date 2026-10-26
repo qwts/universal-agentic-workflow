@@ -351,6 +351,7 @@ async function stageLoop(ctx) {
       for (const [k, v] of Object.entries(saved.findings ?? {})) findings.set(k, v);
     } catch { /* nothing recorded */ }
   }
+  const stageCosts = new Map(); // stage -> summed cost in this invocation, kept across on_verdict round trips
   const visited = new Set();   // stages already invoked in this process (only the first visit may continue a recorded session)
   for (let i = start; i < stages.length; i++) {
     const st = stages[i];
@@ -412,7 +413,6 @@ async function stageLoop(ctx) {
     let sessionId = i === start && keepSession && !visited.has(st.name) ? resumeSessionId : undefined;
     visited.add(st.name);
     let prompt = basePrompt;
-    let stageCost = 0;
     let lastCtx = 0; // context size of the previous attempt's last turn
     // A recorded session being continued (resume / --from-stage): judge it by the newest transcript of this stage.
     if (sessionId) lastCtx = lastStageContext(dataDir, st.name);
@@ -447,7 +447,8 @@ async function stageLoop(ctx) {
       // Cost cap: checked after every attempt, before anything else can start another one.
       const used = attemptUsage(res.transcriptPath);
       lastCtx = used.ctx;
-      stageCost += used.cost;
+      stageCosts.set(st.name, (stageCosts.get(st.name) ?? 0) + used.cost);
+      const stageCost = stageCosts.get(st.name);
       if (res.transcriptPath) runTranscripts.add(res.transcriptPath);
       const runCost = runCostSoFar();
       const over = maxCostUsd !== undefined && runCost > maxCostUsd ? `run cost $${runCost.toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}`
@@ -540,8 +541,6 @@ async function stageLoop(ctx) {
             row.result = `failed (verdict ${verdict}, ${used} round trip(s) used)`;
             return finish(EXIT.GATE, rows, `${tag}: verdict "${verdict}" and the round-trip budget to ${rule.routeTo} is exhausted (${used}/${rule.maxRoundTrips}); stopping. Address the findings in ${mp.outputsRequired[0] ?? "the review output"} and rerun with --from-stage ${rule.routeTo}`, note);
           }
-          // An exceeded cap stops here too: a routed re-run would spend more.
-          if (over) return capStop(`${st.name} verdict ${verdict}; routing to ${rule.routeTo} not started`);
           trips.set(key, used + 1);
           const reviewFile = mp.outputsRequired[0];
           const noteText = `The ${st.name} stage returned verdict "${verdict}" (round trip ${used + 1} of ${rule.maxRoundTrips}). ` +
@@ -553,6 +552,8 @@ async function stageLoop(ctx) {
           row.result = `${verdict} → ${rule.routeTo} (round trip ${used + 1}/${rule.maxRoundTrips})`;
           rollbackPhase(target);
           resetFrom(target);
+          // An exceeded cap stops here, after the route is recorded: `resume` then starts at the routed-to stage with the findings.
+          if (over) return capStop(`${st.name} verdict ${verdict}; routed to ${rule.routeTo}, which resume will run next`);
           routedTo = target;
           break;
         }
