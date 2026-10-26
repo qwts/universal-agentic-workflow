@@ -14,7 +14,7 @@ name: UWF
 
 on:
   pull_request:
-    types: [opened, synchronize, labeled]
+    types: [opened, synchronize, labeled, edited]
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ Then create the label `uwf:run` in the consumer repo (`gh label create uwf:run`)
 actions and reusable workflows may run, allow `qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml`.
 
 A PR starts a run when it carries the label `uwf:run` or its description contains `/uwf run`. Adding the label to an
-already open PR starts a run through the `labeled` event; a push to a PR that already qualifies starts a new one.
+already open PR starts a run through the `labeled` event; a push to a PR that already qualifies starts a new one, and so does editing the description to add `/uwf run` (the `edited` event; any later edit of a qualifying PR also restarts the run).
 PRs from forks never run: the job is skipped, because it would execute untrusted code on a self-hosted machine.
 
 ## Inputs
@@ -68,7 +68,7 @@ secret is not exported, so it never shadows the machine's value.
    `Closes #12`; at most 10, fetched with `gh issue view` using the job token; an unreadable one is marked as such).
 4. Runs `runner.mjs run --workflow ... --non-interactive --max-cost-usd ...` with `--repo-root target`,
    `--skills-root uwf` and `--data-dir $RUNNER_TEMP/uwf-<run_id>`. The exit code is captured, not failed on yet.
-5. Writes the stage table and the per-stage cost report to the job summary.
+5. Writes the stage table and the per-stage cost report to the job summary. On a non-zero exit the runner prints no table, so the summary shows the failure message and the per-stage result lines instead.
 6. Uploads one artifact, `uwf-pr-<number>-<run_id>`, with `target/tmp/workflow-artifacts`, the transcripts under the
    data dir and the runner log (kept 14 days), then removes the data dir.
 7. Fails the job with the runner's exit code and an `::error::` line: 1 gate blocked or aborted, 2 usage or config,

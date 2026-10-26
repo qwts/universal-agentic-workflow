@@ -238,8 +238,16 @@ jobs:
             echo
             echo "Stage table"
             echo '```'
-            # The runner prints the table more than once; keep the last one.
-            awk '/^stage +attempts +result/ {buf=""; f=1} f {buf=buf $0 "\n"} END {printf "%s", buf}' "$RUNNER_TEMP/runner.log"
+            # Exit 0 prints a stage table. Any other exit logs the failure message and one
+            # "  <stage>: <result> (attempts N)" line per stage instead; show whichever applies.
+            awk -v code="$RUNNER_EXIT" '
+              /^stage +attempts +result/ {tbl=$0 "\n"; t=1; next}
+              t && NF {tbl=tbl $0 "\n"; next}
+              {t=0}
+              /^  [^ ]+: .*\(attempts [0-9]+\)$/ {if (!fl) {fail=prev "\n"; fl=1} fail=fail $0 "\n"; next}
+              {fl=0; prev=$0}
+              END {printf "%s", (code == "0" && tbl != "" ? tbl : (fail != "" ? fail : tbl))}
+            ' "$RUNNER_TEMP/runner.log"
             echo '```'
             echo
             echo "Cost per stage"
