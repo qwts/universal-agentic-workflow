@@ -15,7 +15,7 @@ Requirements are stored in a SQLite database:
 
 The schema is defined by `requirements-schema.yaml` in the same directory. Numbers are auto-assigned per type and role (e.g. `FR-001`, `NFR-002`, `AC-003`).
 
-> **Note:** `uwf-requirements.db` is in `.gitignore` and must not be committed. The requirements markdown artifact in `tmp/workflow-artifacts/` is committed.
+> **Note:** `uwf-requirements.db` is in `.gitignore` and must not be committed. The requirements markdown artifact in the workflow artifacts directory is committed.
 
 **All requirements operations MUST use the deterministic script:**
 ```

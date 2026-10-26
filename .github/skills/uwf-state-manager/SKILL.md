@@ -58,7 +58,7 @@ Agents must never write to the database directly. Call the script via terminal a
 | `sync` | Derive `status`/`phase` from `issues.mjs list` counts |
 | `note --agent <id> --note <text>` | Append a history entry |
 
-Global option: `--output-path <path>` (default `./tmp/workflow-artifacts`).
+Global option: `--output-path <path>` (the runner passes the resolved path).
 
 All output is JSON. Exit code `0` = success, `1` = operational error, `2` = usage error.
 

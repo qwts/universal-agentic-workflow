@@ -121,7 +121,7 @@ TODO: one-line description of this persona.
 | \`workflow\` | \`${name}\` |
 | \`mode\` | \`TODO\` |
 | Artifact prefix | \`${name}-\` |
-| Output path default | \`./tmp/workflow-artifacts\` |
+| Output path | the required output paths provided by the runner |
 
 ---
 

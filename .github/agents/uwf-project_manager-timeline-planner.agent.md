@@ -1,6 +1,6 @@
 ---
 name: uwf-project_manager-timeline-planner
-description: "Produce the timeline roadmap (tmp/workflow-artifacts/project-plan.md) and create the issue file-system state structure under state/. No implementation."
+description: "Produce the timeline roadmap (`project-roadmap.md`) and the issue backlog (`issues-backlog.md`) and create the issue file-system state structure under state/. No implementation."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
 user-invokable: false
 ---
@@ -11,7 +11,7 @@ This stage produces the **roadmap** and **issue state structure**. It is NOT an 
 
 Before generating issues:
 
-1. Read `./tmp/workflow-artifacts/project-intake.md`
+1. Read `project-intake.md` (listed under inputs)
 2. Verify the Goal section has substantive content (not `...`, `[TBD]`, `[TODO]`, or other placeholders)
 3. If intake is empty or contains only placeholder values, return this error:
    ```
@@ -34,7 +34,7 @@ These indicate an upstream failure. The intake stage is responsible for capturin
 
 ## Outputs
 
-Outputs are declared in `stages.yaml` and resolved by the orchestrator. Write to each path in `{outputs}`.
+Outputs are declared in `stages.yaml` and resolved by the orchestrator. Write to each required output path listed in this prompt.
 
 ---
 

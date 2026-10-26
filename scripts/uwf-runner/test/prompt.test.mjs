@@ -85,6 +85,12 @@ await test("result shape and defaults", async () => {
   assert.match(d.outputsRequired[0], /tmp\/uwf\/workflow-artifacts\/issues-retro\.md$|workflow-artifacts\/issues-retro\.md$/);
 });
 
+await test("agent body templates are replaced with the resolved output path", async () => {
+  const r = await materializePrompt({ workflow: "forensic-analyst", stage: "repo-audit", repoRoot, outputPath: "/OUT" });
+  assert.ok(!r.systemPrompt.includes("{{"), "no unreplaced {{...}} template in the system prompt");
+  assert.match(r.systemPrompt, /\/OUT\/forensic-repo-audit\.md/);
+});
+
 await test("permissions mapping", () => {
   assert.equal(mapPermissions(["agent", "todo", "search", "read"]), "read-only");
   assert.equal(mapPermissions(["agent", "read", "edit", "search"]), "edit");

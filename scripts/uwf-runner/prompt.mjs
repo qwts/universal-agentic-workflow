@@ -334,7 +334,8 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   return {
     agentFile,
     agentName: frontmatter.name ?? agentName,
-    systemPrompt: body,
+    // The agent body names its files with the same {{output_path}} / {{cwd}} templates as stages.yaml.
+    systemPrompt: subst(body),
     prompt,
     permissions: mapPermissions(frontmatter.tools),
     model: stageDef.model ?? null,
