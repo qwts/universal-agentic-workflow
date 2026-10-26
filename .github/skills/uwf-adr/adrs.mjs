@@ -33,7 +33,7 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, statSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -129,7 +129,9 @@ function nextNumber(db, outputDir) {
 
   if (existsSync(outputDir)) {
     for (const name of readdirSync(outputDir)) {
-      const match = name.match(/^ADR-(\d+)(?:-|\.md$)/i);
+      // A claim (`.adr-NNNN.claim`) counts as taken: a number another caller is reserving right now,
+      // or one left by a crashed caller, is simply skipped. Nothing is ever reclaimed.
+      const match = name.match(/^ADR-(\d+)(?:-|\.md$)/i) ?? name.match(/^\.adr-(\d+)\.claim$/);
       if (match) maxNumber = Math.max(maxNumber, Number(match[1]));
     }
   }
@@ -151,70 +153,18 @@ function renderAdr(number, title, decision, today) {
     .replace(/- The decision, stated crisply\./g, `- ${decision}`);
 }
 
-const CLAIM_STALE_MS = 30_000;
 const RESERVE_TIMEOUT_MS = Number(process.env.UWF_ADR_RESERVE_TIMEOUT_MS) || 10_000; // env: test hook only
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
 const readClaim = (claim) => { try { return JSON.parse(readFileSync(claim, "utf8")); } catch { return null; } };
 
 /**
- * A claim may be reclaimed only when it is old AND its owner is gone. Age alone is not enough: a
- * paused-but-alive holder would otherwise be displaced and both callers would publish the number.
- * An unreadable claim (owner still writing it, or foreign) counts as owned until it is old.
- */
-function claimReclaimable(claim) {
-  let mtimeMs;
-  try { mtimeMs = statSync(claim).mtimeMs; } catch { return false; } // released meanwhile
-  if (Date.now() - mtimeMs <= CLAIM_STALE_MS) return false;
-  const owner = readClaim(claim);
-  return !(owner && Number.isInteger(owner.pid) && pidAlive(owner.pid));
-}
-
-const RECLAIM_STALE_MS = 10_000;
-
-/**
- * Remove a dead-owner claim under a reclaim mutex (a directory: mkdir is atomic) that records its
- * owner pid, re-checking inside it that the claim is still the very one inspected (same token) and
- * still reclaimable. A delayed reclaimer can therefore never unlink a replacement claim that a live
- * caller created meanwhile. The mutex is reclaimed only when its owner pid is dead, or when it has no
- * readable owner and is older than RECLAIM_STALE_MS. Returns true when the claim was removed.
- */
-function reclaimClaim(outputDir, claim) {
-  if (!claimReclaimable(claim)) return false;
-  const mutex = join(outputDir, ".adr-reclaim");
-  const ownerFile = join(mutex, "owner");
-  const ownerPid = () => { try { return Number(readFileSync(ownerFile, "utf8")); } catch { return null; } };
-  try {
-    mkdirSync(mutex);
-  } catch (e) {
-    if (e.code !== "EEXIST") throw e;
-    const pid = ownerPid();
-    const dead = Number.isInteger(pid) && pid > 0 ? !pidAlive(pid) : false;
-    let old = false;
-    try { old = Date.now() - statSync(mutex).mtimeMs > RECLAIM_STALE_MS; } catch { /* vanished */ }
-    if (dead || (pid === null && old)) { try { if (ownerPid() === pid) rmSync(mutex, { recursive: true, force: true }); } catch { /* vanished */ } }
-    return false;
-  }
-  writeFileSync(ownerFile, String(process.pid));
-  try {
-    const seen = readClaim(claim);
-    if (!claimReclaimable(claim)) return false;
-    if (readClaim(claim)?.token !== seen?.token) return false; // replaced since we looked: not ours to remove
-    try { unlinkSync(claim); } catch { return false; }
-    return true;
-  } finally {
-    if (ownerPid() === process.pid) rmSync(mutex, { recursive: true, force: true });
-  }
-}
-
-/**
  * Atomically reserve the next ADR number and write its scaffold. Concurrent callers (parallel
- * fronts on one repo) never receive the same number: a claim file `.adr-NNNN.claim` is created
- * with the `wx` flag and stamped {pid, token}, the directory is rescanned while holding it (a
- * caller that finished just before us has already written its file, so we see its number), the
- * claim is re-read to confirm it is still ours, and only then is the real file written. A claim
- * is reclaimed only when it is older than CLAIM_STALE_MS and its owner pid is dead; a holder only
- * ever removes its own claim.
+ * fronts on one repo) never receive the same number: the next number is one past every ADR file
+ * AND every claim file, the claim `.adr-NNNN.claim` is created with the `wx` flag (two callers
+ * picking the same number: exactly one wins, the other rescans and moves past it), and the real
+ * file is then written with `wx` too. No claim is ever reclaimed or removed by anyone but its
+ * owner: a claim left by a crashed caller just leaves a gap in the numbering (delete the dotfile
+ * to reuse the number).
  */
 function reserveAdr(db, outputDir, title, decision, today) {
   const slug = toSlug(title);
@@ -224,28 +174,24 @@ function reserveAdr(db, outputDir, title, decision, today) {
   while (Date.now() < deadline) {
     const number = nextNumber(db, outputDir);
     const claim = join(outputDir, `.adr-${number}.claim`);
-    const mine = () => readClaim(claim)?.token === token;
-    const release = () => { try { if (mine()) unlinkSync(claim); } catch { /* already gone */ } };
     let fd;
     try {
       fd = openSync(claim, "wx");
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
-      if (!reclaimClaim(outputDir, claim)) sleepMs(5 + Math.random() * 20); // a live holder is still writing: back off, then rescan
+      sleepMs(1 + Math.random() * 5); // someone claimed it in the same instant: rescan past it
       continue;
     }
     try {
       writeFileSync(fd, JSON.stringify({ pid: process.pid, token, title, at: new Date().toISOString() }));
     } finally { closeSync(fd); }
     try {
-      if (nextNumber(db, outputDir) !== number) continue; // someone took it between our scan and claim
       if (process.env.UWF_ADR_TEST_DELAY_MS) sleepMs(Number(process.env.UWF_ADR_TEST_DELAY_MS)); // test hook: force contention
-      if (!mine()) continue; // displaced (only possible if our pid was judged dead): never publish over the new owner
       const filePath = join(outputDir, `ADR-${number}-${slug}.md`);
       writeFileSync(filePath, renderAdr(number, title, decision, today), { encoding: "utf8", flag: "wx" });
       return { number, slug, filePath: filePath.replace(/\\/g, "/") };
     } finally {
-      release();
+      try { if (readClaim(claim)?.token === token) unlinkSync(claim); } catch { /* already gone */ }
     }
   }
   fail(`Could not reserve an ADR number within ${RESERVE_TIMEOUT_MS / 1000}s.`);

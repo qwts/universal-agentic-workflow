@@ -34,32 +34,24 @@ try {
   check("each reserved path exists and is unique", new Set(results.map((r) => r.path)).size === N && results.every((r) => existsSync(r.path)));
   check("no claim files left behind", readdirSync(dir).every((f) => !f.endsWith(".claim")), readdirSync(dir).join(","));
 
-  // Claim ownership: an old claim whose owner is still alive is never reclaimed (the caller times out),
-  // while an old claim whose owner pid is dead is.
+  // A claim that is not ours, whatever its age or owner, is never reclaimed: the number is skipped
+  // (a gap), the claim stays, and reservation continues with the next free number.
   const aged = (Date.now() - 120_000) / 1000;
-  const next = String(N + 1).padStart(4, "0");
-  const claim = join(dir, `.adr-${next}.claim`);
-  writeFileSync(claim, JSON.stringify({ pid: process.pid, token: "someone-else" }));
-  utimesSync(claim, aged, aged);
-  const held = await runOne("held", { UWF_ADR_RESERVE_TIMEOUT_MS: "1500", UWF_ADR_TEST_DELAY_MS: "" });
-  check("old claim with a live owner: not reclaimed, reservation times out", held.code !== 0 && existsSync(claim), JSON.stringify(held));
-  check("old claim with a live owner: no file published for its number", !readdirSync(dir).some((f) => f.startsWith(`ADR-${next}-`)), readdirSync(dir).join(","));
+  const held = String(N + 1).padStart(4, "0");
+  const heldClaim = join(dir, `.adr-${held}.claim`);
+  writeFileSync(heldClaim, JSON.stringify({ pid: process.pid, token: "someone-else" }));
+  utimesSync(heldClaim, aged, aged);
   const dead = spawnSync(process.execPath, ["-e", "0"]);
-  writeFileSync(claim, JSON.stringify({ pid: dead.pid ?? 2147483646, token: "crashed" }));
-  utimesSync(claim, aged, aged);
-  const taken = await runOne("after-crash", { UWF_ADR_TEST_DELAY_MS: "" });
-  check("old claim with a dead owner: reclaimed and the number assigned", taken.code === 0 && taken.number === next, JSON.stringify(taken));
-  check("no claim files left behind (2)", readdirSync(dir).every((f) => !f.endsWith(".claim")), readdirSync(dir).join(","));
-
-  // Many callers race one dead-owner claim: reclamation is serialized, numbers stay distinct, nothing is left behind.
-  const next2 = String(N + 2).padStart(4, "0");
-  writeFileSync(join(dir, `.adr-${next2}.claim`), JSON.stringify({ pid: dead.pid ?? 2147483646, token: "crashed-2" }));
-  utimesSync(join(dir, `.adr-${next2}.claim`), aged, aged);
+  const orphan = String(N + 2).padStart(4, "0");
+  const orphanClaim = join(dir, `.adr-${orphan}.claim`);
+  writeFileSync(orphanClaim, JSON.stringify({ pid: dead.pid ?? 2147483646, token: "crashed" }));
+  utimesSync(orphanClaim, aged, aged);
   const racers = await Promise.all(Array.from({ length: 8 }, (_, i) => runOne(`race-${i}`)));
   const rnums = racers.map((r) => Number(r.number)).sort((a, b) => a - b);
-  check("race over a dead claim: all succeeded", racers.every((r) => r.code === 0 && r.ok), JSON.stringify(racers.filter((r) => r.code !== 0)));
-  check("race over a dead claim: numbers distinct and consecutive", new Set(rnums).size === 8 && rnums.every((n, i) => n === N + 2 + i), rnums.join(","));
-  check("race over a dead claim: no claim or mutex left behind", !readdirSync(dir).some((f) => f.endsWith(".claim") || f === ".adr-reclaim"), readdirSync(dir).join(","));
+  check("foreign claims: all reservations still succeed", racers.every((r) => r.code === 0 && r.ok), JSON.stringify(racers.filter((r) => r.code !== 0)));
+  check("foreign claims: both claimed numbers are skipped, the rest consecutive", new Set(rnums).size === 8 && rnums.every((n, i) => n === N + 3 + i), rnums.join(","));
+  check("foreign claims: neither claim was removed and nothing was published for them", existsSync(heldClaim) && existsSync(orphanClaim) && !readdirSync(dir).some((f) => f.startsWith(`ADR-${held}-`) || f.startsWith(`ADR-${orphan}-`)), readdirSync(dir).join(","));
+  check("no own claim files left behind", readdirSync(dir).filter((f) => f.endsWith(".claim")).length === 2, readdirSync(dir).join(","));
 } finally { rmSync(dir, { recursive: true, force: true }); }
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

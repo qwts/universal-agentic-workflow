@@ -116,7 +116,7 @@ the phase back via `state.mjs rollback`.
 
 Several runs against one repo are supported with these rules:
 
-- **One `--data-dir` per front is required.** The skill SQLite databases (state, stage tracker, blueprint, questions, ...) live in the data dir; two fronts sharing one corrupt each other's state. `run` and `resume` write `<data-dir>/run.lock` (run id and pid) and refuse to start, exit 2, naming the other run when its pid is still alive. A lock left by a crashed run (dead pid) is replaced; the lock is removed when the run ends.
+- **One `--data-dir` per front is required.** The skill SQLite databases (state, stage tracker, blueprint, questions, ...) live in the data dir; two fronts sharing one corrupt each other's state. `run` and `resume` write `<data-dir>/run.lock` (run id and pid) and refuse to start, exit 2, naming the other run when its pid is still alive. The runner never takes a lock over by itself: a lock left by a crashed run (dead pid, or unreadable for more than 10 s) also exits 2 with the remedy, and `--unlock` on a single recovery run removes it (do not start several runs with `--unlock` at once). The lock is removed when the run ends.
 - **Pass a distinct `--output-path` per front too.** The default `./tmp/workflow-artifacts` is per target repo, so fronts on one repo would overwrite each other's stage artifacts.
 - **ADR numbers are reserved atomically.** `adrs.mjs create` (and `adrs.mjs next-number`) claim the next number with an exclusive file create under `docs/adr/`, so concurrent fronts never get the same number. Use the path the command returns.
 

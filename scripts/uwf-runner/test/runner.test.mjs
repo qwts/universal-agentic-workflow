@@ -1068,33 +1068,33 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
     check("live lock: names the other run and --data-dir", r.err.includes("other-run-1") && r.err.includes("distinct --data-dir"), r.err.slice(-400));
     check("live lock: lock left untouched", JSON.parse(readFileSync(lock, "utf8")).runId === "other-run-1");
     check("live lock: nothing ran", transcripts(s).length === 0);
-    // A dead pid: spawn a short-lived child and reuse its pid.
+    // A dead pid: spawn a short-lived child and reuse its pid. The runner never takes a lock over by itself.
     const dead = spawnSync(process.execPath, ["-e", "0"]);
     writeFileSync(lock, JSON.stringify({ runId: "crashed-run", pid: dead.pid ?? 2147483646, workflow: "sw_dev" }));
     const r2 = run(s);
-    check("stale lock: replaced and run completes", r2.code === 0, `${r2.code} ${r2.err.slice(-400)}`);
+    check("crashed-run lock: exits 2 and names --unlock", r2.code === 2 && r2.err.includes("not running") && r2.err.includes("--unlock"), `${r2.code} ${r2.err.slice(-400)}`);
+    check("crashed-run lock: left in place", existsSync(lock));
+    const r2b = run(s, ["--unlock"]);
+    check("crashed-run lock + --unlock: replaced and run completes", r2b.code === 0, `${r2b.code} ${r2b.err.slice(-400)}`);
     check("lock removed on exit", !existsSync(lock));
-    // Unreadable metadata (an owner still writing, or garbage) is waited on while young, not reclaimed.
+    // Unreadable metadata (an owner still writing, or garbage) is waited on while young, never removed.
     writeFileSync(lock, "");
-    const r3 = run(s);
-    check("young unreadable lock: exits 2 instead of taking over", r3.code === 2 && r3.err.includes("another run is starting"), `${r3.code} ${r3.err.slice(-400)}`);
+    const r3 = run(s, ["--unlock"]);
+    check("young unreadable lock: exits 2 even with --unlock", r3.code === 2 && r3.err.includes("another run is starting"), `${r3.code} ${r3.err.slice(-400)}`);
     check("young unreadable lock: left in place", existsSync(lock));
-    // The same file, old enough that no live writer can still be filling it in, is stale.
     const old = (Date.now() - 60_000) / 1000;
     utimesSync(lock, old, old);
     const r4 = run(s);
-    check("old unreadable lock: replaced and run completes", r4.code === 0, `${r4.code} ${r4.err.slice(-400)}`);
+    check("old unreadable lock: exits 2 without --unlock", r4.code === 2 && r4.err.includes("--unlock"), `${r4.code} ${r4.err.slice(-400)}`);
+    const r4b = run(s, ["--unlock"]);
+    check("old unreadable lock + --unlock: replaced and run completes", r4b.code === 0, `${r4b.code} ${r4b.err.slice(-400)}`);
     check("lock removed on exit (2)", !existsSync(lock));
-    // Contended takeover: six runners race one stale lock; at most one may hold the data dir at a time.
+    // Contention over a crashed lock without --unlock: nobody takes it over, nothing is removed or left behind.
     writeFileSync(lock, JSON.stringify({ runId: "crashed-run-2", pid: dead.pid ?? 2147483646, workflow: "sw_dev" }));
-    const racers = Array.from({ length: 6 }, () => runAsync(s));
-    const outcomes = await Promise.all(racers);
-    const winners = outcomes.filter((o) => o.code === 0);
-    const refused = outcomes.filter((o) => o.code === 2 && /in use by run|another run is starting/.test(o.err));
-    check("contended takeover: no runner crashed or got an unexpected code", outcomes.every((o) => o.code === 0 || o.code === 2), outcomes.map((o) => o.code).join(","));
-    // All six reach the lock within a few hundred ms while a fake run holds it for seconds: exactly one may win.
-    check("contended takeover: exactly one runner won and the rest were refused", winners.length === 1 && refused.length === outcomes.length - 1, `${winners.length} won, ${refused.length} refused; ${outcomes.map((o) => o.err.slice(-120).replace(/\n/g, " ")).join(" || ")}`);
-    check("contended takeover: no mutex or temp files left behind", readdirSync(s.data).filter((f) => f.startsWith("run.lock")).length === 0, readdirSync(s.data).join(","));
+    const outcomes = await Promise.all(Array.from({ length: 6 }, () => runAsync(s)));
+    check("contended crashed lock: all six refused with exit 2", outcomes.every((o) => o.code === 2 && o.err.includes("--unlock")), outcomes.map((o) => `${o.code}`).join(","));
+    check("contended crashed lock: lock untouched", JSON.parse(readFileSync(lock, "utf8")).runId === "crashed-run-2");
+    check("contended crashed lock: no temp files left behind", readdirSync(s.data).filter((f) => f.startsWith("run.lock")).length === 1, readdirSync(s.data).join(","));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 

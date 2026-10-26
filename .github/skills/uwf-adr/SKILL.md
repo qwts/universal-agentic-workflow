@@ -70,7 +70,7 @@ node .github/skills/uwf-adr/adrs.mjs deprecate --id 3
 
 ## ADR procedure
 
-1. **Create the ADR** via `adrs.mjs create` — captures metadata in the DB and scaffolds the markdown file. The number is reserved atomically (claim file plus exclusive create), so parallel fronts on one repo never collide; use the returned `file_path`, and give each parallel front its own `--data-dir` so the DBs stay separate.
+1. **Create the ADR** via `adrs.mjs create` — captures metadata in the DB and scaffolds the markdown file. The number is reserved atomically (a claim file created exclusively, counted as taken by every other caller, then an exclusive create of the ADR file), so parallel fronts on one repo never collide; a claim left by a crashed caller (`docs/adr/.adr-NNNN.claim`) only leaves a gap in the numbering, delete it to reuse the number; use the returned `file_path`, and give each parallel front its own `--data-dir` so the DBs stay separate.
 2. **Fill in the template** — edit `docs/adr/ADR-####-<slug>.md`:
    - Context, Decision, Alternatives, Consequences, Verification
    - Appendix A — ADR-300 checklist (see below)
