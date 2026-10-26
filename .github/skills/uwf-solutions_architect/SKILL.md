@@ -11,7 +11,7 @@ Persona skill for architecture-first engagements: designing platforms, evaluatin
 | `workflow` | `solutions_architect` |
 | `role` | `design` |
 | Artifact prefix | `design-` |
-| Output path default | `./tmp/workflow-artifacts` |
+| Output path | the required output paths provided by the runner |
 
 ---
 

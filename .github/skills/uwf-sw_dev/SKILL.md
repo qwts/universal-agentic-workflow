@@ -11,7 +11,7 @@ Persona skill for driving individual work items (issues) from intake through imp
 | `workflow` | `sw_dev` |
 | `role` | `issues` |
 | Artifact prefix | `issues-` |
-| Output path default | `./tmp/workflow-artifacts` |
+| Output path | the required output paths provided by the runner |
 
 ---
 
@@ -59,7 +59,7 @@ Execute stages **in this exact order** for each active issue. Do not advance pas
 | 11 | `planning` → `execution` | `uwf-sw_dev-work-planner` | Produce work plan with implementation steps and associated tests. |
 | 12 | `execution` | `uwf-issue-implementer` | Execute the work plan. |
 | 13 | `execution` | `uwf-sw_dev-reviewer` | Review implementation; produce fix list or recommend acceptance. *(fix-loop — see engine skill)* |
-| 14 | `execution` → `acceptance` | `uwf-core-technical-writer` | Review and update `./tmp/workflow-artifacts/` documentation from new or changed artifacts. |
+| 14 | `execution` → `acceptance` | `uwf-core-technical-writer` | Review and update the workflow artifacts documentation from new or changed artifacts. |
 | 15 | `acceptance` | `uwf-core-acceptance` | Run acceptance gate checklist; produce `issues-acceptance.md`. |
 | 16 | `acceptance` → `snapshot` | `uwf-core-snapshot` | Produce `issues-drs.json`; close `issues-br.json` layer 5; append closure entry to `uwf-changelog.md`. |
 | 17 | `snapshot` → `closed` | `uwf-core-retro` | Run the retrospective and advance the phase to `closed`. When all issues are closed or skipped, summarize completion before exiting the workflow. |
@@ -87,4 +87,4 @@ node .github/skills/uwf-sw_dev/run.mjs --list-stages
 - This persona drives **one issue at a time**. Repeat the sequence for each issue in the queue.
 - Do not start implementation (step 10) without a confirmed work plan and test plan.
 - After all issues in the queue are closed or skipped, use `uwf-core-retro` to summarize project completion and capture the retrospective before exiting the workflow.
-- Ensure all workflow artifacts are scoped to the active issue and maintained in `./tmp/workflow-artifacts/` throughout the issue lifecycle.
+- Ensure all workflow artifacts are scoped to the active issue and maintained in the workflow artifacts directory throughout the issue lifecycle.
