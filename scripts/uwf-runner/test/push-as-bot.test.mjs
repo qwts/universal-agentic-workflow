@@ -47,8 +47,9 @@ try {
     ...over,
   });
   const read = (p) => readEntry(dir, p);
-  const message = commitMessage({ title: "Add X\nline2", runId: 42 });
-  assert.match(message, /^uwf\(sw_dev\): Add X line2 \(run 42\)\n\nCo-Authored-By: .+<.+>\n$/);
+  const message = commitMessage({ title: "Add X\nline2", runId: 42, runUrl: "https://github.com/o/r/actions/runs/42", model: "m-1" });
+  assert.equal(message, "uwf(sw_dev): Add X line2 (run 42)\n\nUWF-Run: https://github.com/o/r/actions/runs/42\nUWF-Model: m-1\n");
+  assert.ok(!/Co-Authored-By/i.test(message));
 
   const entries = await buildTreeEntries(changes, read, fakeApi());
   assert.deepEqual(entries.map((e) => [e.path, e.mode, e.sha === null]), [

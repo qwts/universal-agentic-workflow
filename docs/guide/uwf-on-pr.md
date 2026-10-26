@@ -109,7 +109,7 @@ The sw_dev stages edit files in `target/` and do not run `git commit`, so a fini
 After an exit 0, `scripts/uwf-on-pr/push-as-bot.mjs` collects the changes (`git diff HEAD` plus untracked files that
 `.gitignore` does not exclude; `tmp/` is never included) and creates ONE commit on the PR head branch through the Git
 Data API (blobs, tree, commit, ref update), the procedure of the `signed-commit` skill, so GitHub signs it and it shows
-Verified. The message is `uwf(<workflow>): <PR title> (run <run_id>)` plus a `Co-Authored-By` trailer.
+Verified. The message is `uwf(<workflow>): <PR title> (run <run_id>)` plus the `UWF-Run` and `UWF-Model` trailers.
 
 - It needs the repo Actions secret `UWF_BOT_TOKEN` (see [self-hosted-runner.md](self-hosted-runner.md)); only that one
   step reads it, it is never printed or written, and `secrets: inherit` in the caller passes it. Without it nothing is
@@ -117,9 +117,10 @@ Verified. The message is `uwf(<workflow>): <PR title> (run <run_id>)` plus a `Co
 - It pushes only when the PR head is still the commit the run checked out and the ref update is a fast-forward. If the
   branch moved, nothing is pushed and the comment says so.
 - Nothing is ever pushed after exit 1, 2, 3 or 4.
-- Use a GitHub App token for the bot. A push made with an App token raises a `synchronize` event whose sender is a bot,
-  and the workflow's job condition skips bot senders, so the bot's own push does not start another (paid) run. A
-  personal access token of a user account would not be skipped.
+- A run-generated commit never starts a run. The message ends with the trailers `UWF-Run: <run url>` and `UWF-Model:
+  <model>`, and a first `guard` job reads the PR head commit through the API and skips the run when a line starts with
+  `UWF-Run:`. This holds for a PAT-backed bot too, whose push raises a `synchronize` event with a `User` sender. A human
+  push after the bot's commit changes the head, so it does start a run. The job also skips events sent by a `Bot`.
 - The API refuses a review request for the PR author, so the comment @-mentions the author asking for review. The
   workflow never merges.
 

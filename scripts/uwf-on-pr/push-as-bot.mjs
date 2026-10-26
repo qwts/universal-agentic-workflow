@@ -7,7 +7,7 @@
  * Run it only after a runner exit 0. Env (nothing is read from argv, nothing is shell-interpolated):
  *   UWF_BOT_TOKEN  bot token; empty -> result "no-token", exit 0
  *   REPO, PR_NUMBER, PR_TITLE, RUN_ID, EXPECTED_SHA (the PR head sha the run checked out), TARGET_DIR,
- *   RESULT_FILE (JSON { status, sha?, files?, branch?, reason? }), WORKFLOW (default sw_dev),
+ *   RESULT_FILE (JSON { status, sha?, files?, branch?, reason? }), WORKFLOW (default sw_dev), RUN_URL, MODEL (commit trailers),
  *   GITHUB_API_URL (default https://api.github.com), GITHUB_OUTPUT (optional: status=...).
  * Statuses: pushed | no-changes | moved | no-token | error. The token is never printed or written.
  */
@@ -16,7 +16,6 @@ import { lstatSync, readFileSync, readlinkSync, writeFileSync, appendFileSync } 
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const COAUTHOR = "Co-Authored-By: Claude <noreply@anthropic.com>";
 const EXCLUDED = (p) => p === "tmp" || p.startsWith("tmp/") || p === ".git" || p.startsWith(".git/");
 
 const git = (dir, args) => execFileSync("git", ["-C", dir, ...args], { encoding: "buffer", maxBuffer: 256 * 1024 * 1024 });
@@ -58,9 +57,14 @@ export async function buildTreeEntries(changes, read, api) {
   return entries;
 }
 
-export function commitMessage({ workflow = "sw_dev", title, runId }) {
+/**
+ * The `UWF-Run:` trailer is load-bearing: the workflow's guard job skips any run whose PR head commit
+ * carries it, so a run's own push can never start another run.
+ */
+export function commitMessage({ workflow = "sw_dev", title, runId, runUrl = "", model = "" }) {
   const t = String(title ?? "").replace(/\s+/g, " ").trim().slice(0, 200) || "changes";
-  return `uwf(${workflow}): ${t} (run ${runId})\n\n${COAUTHOR}\n`;
+  const one = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+  return `uwf(${workflow}): ${t} (run ${runId})\n\nUWF-Run: ${one(runUrl) || runId}\nUWF-Model: ${one(model) || "unknown"}\n`;
 }
 
 /**
@@ -117,7 +121,7 @@ function finish(result) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const { UWF_BOT_TOKEN = "", REPO, PR_NUMBER, PR_TITLE = "", RUN_ID, EXPECTED_SHA, TARGET_DIR, WORKFLOW = "sw_dev", GITHUB_API_URL } = process.env;
+  const { UWF_BOT_TOKEN = "", REPO, PR_NUMBER, PR_TITLE = "", RUN_ID, EXPECTED_SHA, TARGET_DIR, WORKFLOW = "sw_dev", RUN_URL = "", MODEL = "", GITHUB_API_URL } = process.env;
   if (!REPO || !PR_NUMBER || !RUN_ID || !EXPECTED_SHA || !TARGET_DIR) {
     console.error("push-as-bot: REPO, PR_NUMBER, RUN_ID, EXPECTED_SHA and TARGET_DIR are required");
     process.exit(2);
@@ -129,7 +133,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       changes: listChanges(TARGET_DIR),
       read: (p) => readEntry(TARGET_DIR, p),
       expectedSha: EXPECTED_SHA,
-      message: commitMessage({ workflow: WORKFLOW, title: PR_TITLE, runId: RUN_ID }),
+      message: commitMessage({ workflow: WORKFLOW, title: PR_TITLE, runId: RUN_ID, runUrl: RUN_URL, model: MODEL }),
     });
     finish(result);
   } catch (e) {

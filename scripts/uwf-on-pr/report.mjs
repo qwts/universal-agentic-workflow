@@ -131,7 +131,7 @@ export function buildBody({ log, exitCode, runUrl, workflow = "sw_dev", maxCostU
   out.push(runUrl
     ? `Artifacts: [uwf-pr artifact on the run page](${runUrl}#artifacts) (kept 14 days${kept ? "; the whole data directory is included because of the `uwf:keep` label" : ""}).`
     : "Artifacts: on the workflow run page.");
-  let body = out.join("\n");
+  let body = redactSecrets(out.join("\n")).text;
   if (body.length > MAX_BODY) body = body.slice(0, MAX_BODY) + "\n…(truncated)";
   return body;
 }

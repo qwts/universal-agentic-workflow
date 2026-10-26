@@ -47,11 +47,41 @@ permissions:
   pull-requests: write
 
 jobs:
+  guard:
+    name: Skip runs started by the run's own commit
+    runs-on: [self-hosted, uwf]
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check the PR head commit for a UWF-Run trailer
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          if ! msg=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq .commit.message); then
+            echo "::warning::could not read the head commit; not skipping"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if printf '%s\n' "$msg" | grep -q '^UWF-Run:'; then
+            echo "::notice::head commit carries a UWF-Run trailer (made by a UWF run); skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::head commit is not a UWF run commit; running"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   uwf:
     name: UWF ${{ inputs.workflow }} on PR
+    needs: guard
     # Fork PRs would run untrusted code on a self-hosted machine; only same-repo PRs run.
-    # A push by a bot (the run's own commit, made with a GitHub App token) must not start another run.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.sender.type != 'Bot' }}
+    # The run's own commit (UWF-Run trailer, checked by the guard job) and bot senders never start a run.
+    if: ${{ needs.guard.outputs.skip != 'true' && github.event.pull_request.head.repo.full_name == github.repository && github.event.sender.type != 'Bot' }}
     runs-on: [self-hosted, uwf]
     timeout-minutes: 180
     concurrency:
@@ -279,6 +309,8 @@ jobs:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
           TARGET_DIR: ${{ github.workspace }}/target
           WORKFLOW: ${{ inputs.workflow }}
+          MODEL: ${{ inputs.model }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RESULT_FILE: ${{ runner.temp }}/push-result.json
           GITHUB_API_URL: ${{ github.api_url }}
         run: |
