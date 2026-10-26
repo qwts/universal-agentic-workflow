@@ -366,12 +366,23 @@ function resolveTemplates(str) {
  * becomes the same path under the skills root (absolute). Applies to cmd and args alike.
  */
 const SKILL_PATH_RE = /(^|[\s"'=(;|&<>`])(\.github\/(?:skills|agents)\/[^\s"'|;&)<>`]*)/g;
-function resolveGateSkillPaths(str) {
+/** POSIX single-quoting: the shell takes the result as one literal word, whatever the root contains. */
+const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+/**
+ * @param {string} str cmd or arg text
+ * @param {boolean} shell true when `str` is a shell-form command (string run through execSync): the
+ *   substituted absolute root is then quoted as one word, unless the stages.yaml already quoted it.
+ *   Argv-form values (execFileSync) are passed as data and must not be quoted.
+ */
+function resolveGateSkillPaths(str, shell = false) {
   if (typeof str !== "string" || !SKILLS_ROOT) return str;
-  return str.replace(SKILL_PATH_RE, (whole, lead, rel) =>
-    existsSync(resolve(process.cwd(), rel)) ? whole : lead + join(SKILLS_ROOT, rel));
+  return str.replace(SKILL_PATH_RE, (whole, lead, rel) => {
+    if (existsSync(resolve(process.cwd(), rel))) return whole;
+    const abs = join(SKILLS_ROOT, rel);
+    return lead + (shell && lead !== '"' && lead !== "'" ? shellQuote(abs) : abs);
+  });
 }
-const gateTemplates = (str) => resolveGateSkillPaths(resolveTemplates(str));
+const gateTemplates = (str, shell = false) => resolveGateSkillPaths(resolveTemplates(str), shell);
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -746,7 +757,7 @@ function prescribeCheck(check, failure) {
     case "require_file_matching_pattern":
       return `Create a file under ${resolveTemplates(check.dir)} whose name matches ${check.pattern}.`;
     case "run_script": {
-      const cmd = [gateTemplates(check.cmd), ...(Array.isArray(check.args) ? check.args.map((a) => gateTemplates(String(a))) : [])].join(" ");
+      const cmd = [gateTemplates(check.cmd, !Array.isArray(check.args)), ...(Array.isArray(check.args) ? check.args.map((a) => gateTemplates(String(a))) : [])].join(" ");
       const m = failure && failure.match(/ failed \(exit [^)]*\)(?:: ([\s\S]*))?$/);
       const tail = m?.[1] ? m[1].split(/\r?\n/).slice(-5).join(" | ").slice(-400) : "no output";
       return `Make ${q(cmd)} exit 0${failure ? `; it currently fails with: ${tail}` : ""}.`;
@@ -825,7 +836,7 @@ function evaluateCheck(check) {
       if (!Array.isArray(check.args) && rawCmd?.includes("{{")) {
         return `${check.label ?? "run_script"} cannot template a shell command; use args`;
       }
-      const cmd = gateTemplates(rawCmd);
+      const cmd = gateTemplates(rawCmd, !Array.isArray(check.args));
       if (!cmd) return `${check.label ?? "run_script"} is missing cmd`;
       // Gate subprocesses read the same run's stores: forward the chosen data dir.
       const env = { ...process.env, ...(dataDirFlag ? { UWF_DATA_DIR: dataDirFlag } : {}) };

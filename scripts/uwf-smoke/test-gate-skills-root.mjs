@@ -24,7 +24,8 @@ function assert(label, condition, detail = "") {
 }
 
 const tmp = mkdtempSync(join(tmpdir(), "uwf-gate-root-"));
-const skillsRoot = join(tmp, "skills-root");
+// A root with a space, parentheses and a `$` proves shell-form commands get it as one literal word.
+const skillsRoot = join(tmp, "skills root ($1)");
 const target = join(tmp, "target");
 const targetWithCopy = join(tmp, "target-with-copy");
 const dataDir = join(tmp, "data");
