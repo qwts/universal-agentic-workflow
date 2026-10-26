@@ -65,7 +65,7 @@ Nothing more. Use a fine-grained token scoped to the single repo where you can.
 scripts/runner-host/doctor.sh --name uwf-mac-01      # or --dir <runner dir>
 ```
 
-Checks node >= 24, `claude`, `codex`, `gh`; `gh auth status` as the bot; both API keys present (values never echoed;
+Checks node >= 24, `claude`, `codex`, `gh`; `gh auth status` as the bot; the three API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`) present (values never echoed;
 read from the environment or the runner's `.env`); free disk >= 10 GB; runner registered (`.runner`); service installed
 and running (`./svc.sh status`); and whether a job is running (`Runner.Worker`). Exit 0 when all is good. Otherwise
 exit 1 with one named fix per failure, for example:
@@ -75,6 +75,10 @@ missing: codex - run: npm i -g @openai/codex
 ```
 
 A running job is reported as a warning (the runner is busy, not broken); `--strict-idle` makes it a failure.
+
+The runner listener applies every line of `<runner dir>/.env` to its environment at startup, `PATH` included
+(`LoadAndSetEnv` in actions/runner `Runner.Listener/Program.cs`). That is why `PATH` lives in `.env` rather than only in
+the runner's `.path` file, and why the doctor resolves the CLIs against the `PATH` from `.env`.
 
 ## Secrets: what goes where
 

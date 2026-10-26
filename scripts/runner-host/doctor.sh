@@ -121,6 +121,8 @@ svc_state() {
   active="$(printf '%s\n' "$out" | grep -Ei '^[[:space:]]*Active:' | head -n 1)"
   if [ -n "$active" ]; then
     if printf '%s' "$active" | grep -Eiq 'active \(running\)'; then echo running; else echo stopped; fi
+  elif printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*not installed'; then echo missing
+  elif printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*Stopped'; then echo stopped
   elif printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*Not started'; then echo stopped
   elif printf '%s\n' "$out" | grep -Eiq '^[[:space:]]*Started'; then echo running
   else echo unknown; fi
@@ -137,6 +139,8 @@ if [ -f "$DIR/.service" ] && [ -x "$DIR/svc.sh" ]; then
     fail "stopped: runner service - run: cd $DIR && ${pre}./svc.sh start"
   elif [ "$state" = running ]; then
     ok "runner service running"
+  elif [ "$state" = missing ]; then
+    fail "missing: runner service (not installed) - run: cd $DIR && ${pre}./svc.sh install && ${pre}./svc.sh start"
   else
     fail "unknown: runner service state - run: cd $DIR && ${pre}./svc.sh status"
   fi

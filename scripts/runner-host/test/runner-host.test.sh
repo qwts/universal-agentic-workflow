@@ -107,6 +107,15 @@ OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC
 [ "$rc" -eq 1 ] && pass "stopped service exits 1" || bad "stopped service exits 1 (got $rc)"
 assert_has "$OUT" "svc.sh start" "named fix for stopped service"
 
+printf '#!/bin/sh\necho Stopped\n' >"$RUNNER/svc.sh"
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b CODEX_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && pass "macOS Stopped exits 1" || bad "macOS Stopped (got $rc)"
+assert_has "$OUT" "stopped: runner service" "macOS Stopped classified as stopped"
+assert_has "$OUT" "svc.sh start" "macOS Stopped names svc.sh start"
+printf '#!/bin/sh\necho "not installed"\n' >"$RUNNER/svc.sh"
+OUT="$(env -i HOME="$TMP" UWF_DOCTOR_SUDO= PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b CODEX_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" 2>&1)"
+assert_has "$OUT" "svc.sh install" "not installed names svc.sh install"
+
 printf '#!/bin/sh\necho "$@" >"%s/sudo.log"; exec "$@"\n' "$TMP" >"$TMP/good/sudo"; chmod +x "$TMP/good/sudo"
 printf '#!/bin/sh\necho "     Active: active (running)"\n' >"$RUNNER/svc.sh"
 env -i HOME="$TMP" UWF_DOCTOR_SUDO=sudo PATH="$TMP/good" GH_TOKEN=x ANTHROPIC_API_KEY=a OPENAI_API_KEY=b CODEX_API_KEY=b UWF_DOCTOR_MIN_DISK_GB=0 "$BASH_BIN" "$RH/doctor.sh" --dir "$RUNNER" >/dev/null 2>&1; rc=$?
