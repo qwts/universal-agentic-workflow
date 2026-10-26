@@ -199,10 +199,17 @@ export function parseAgentFile(yaml, text) {
 }
 
 /** Copilot tool names -> adapter permission preset. `agent`, `todo`, `web`, ... are ignored. */
-export function mapPermissions(tools) {
+export const REVIEW_SCRIPT_COMMAND = "node .github/skills/uwf-review/reviews.mjs";
+
+/**
+ * `allowedCommands` is the agent frontmatter `allowed-commands` list. A read-only agent that lists
+ * the review script gets the `read-only+review` preset: read tools plus that one command, nothing else.
+ */
+export function mapPermissions(tools, allowedCommands) {
   const t = new Set((Array.isArray(tools) ? tools : []).map((x) => String(x).toLowerCase()));
   if (t.has("execute")) return "edit+exec";
   if (t.has("edit")) return "edit";
+  if ((Array.isArray(allowedCommands) ? allowedCommands : []).includes(REVIEW_SCRIPT_COMMAND)) return "read-only+review";
   return "read-only";
 }
 
@@ -260,6 +267,15 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   });
   // Skill docs the agent is told to read carry their own relative `.github/skills/...` commands, which
   // the prompt cannot rewrite; give the stage the rule instead.
+  // The approved commands must match what the (possibly rewritten) prompt tells the agent to run, so
+  // list both the repo-relative form and the form resolved against the skills root.
+  const allowedCommands = [...new Set((Array.isArray(frontmatter["allowed-commands"]) ? frontmatter["allowed-commands"] : []).flatMap((c) => {
+    const rewritten = String(c).replace(/\.github\/(?:skills|agents)\/[^\s`'")]*/g, (full) => {
+      if (existsSync(join(repoRoot, full))) return full;
+      return fallbackRoots.map((r) => join(r, full)).find((q) => existsSync(q)) ?? join(fallbackRoots[0] ?? skillsRoot, full);
+    });
+    return [String(c), rewritten];
+  }))];
   const skillFilesNote = rewrote ? [
     "## Skill files",
     `The workflow skills are not all in this repository. When an instruction names a \`.github/skills/...\` or \`.github/agents/...\` path or command that does not exist in the working directory, use the same path under ${fallbackRoots.join(" or, failing that, ")} instead.`,
@@ -337,7 +353,8 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     // The agent body names its files with the same {{output_path}} / {{cwd}} templates as stages.yaml.
     systemPrompt: subst(body),
     prompt,
-    permissions: mapPermissions(frontmatter.tools),
+    permissions: mapPermissions(frontmatter.tools, frontmatter["allowed-commands"]),
+    allowedCommands,
     model: stageDef.model ?? null,
     inputs,
     inputsMissing,

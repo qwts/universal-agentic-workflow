@@ -27,7 +27,7 @@ Severities: `critical` · `major` · `minor`. Verdicts: `approved` · `changes_r
 
 ## Review procedure
 
-The reviewer is **read-only** (no `edit` or `execute`); it reads artifacts and logs findings, never fixes.
+The reviewer is **read-only on the repository under review** (no `edit`, no builds, no tests, no other commands); it reads artifacts and logs findings, never fixes. The one command it MAY run is this skill's own script, `node .github/skills/uwf-review/reviews.mjs <command>`, because the review gate requires its output. Reviewer agents declare it in their frontmatter as `allowed-commands`, and the runner grants exactly that command (preset `read-only+review`).
 
 1. `reviews.mjs start --role {role} --stage {stage}`.
 2. Read the stage's artifacts in `{outputPath}/` and the inputs declared for the stage in `stages.yaml`; evaluate completeness, consistency, acceptance criteria, and security/quality gaps.
@@ -50,7 +50,7 @@ The stage gate checks `/verdict` equals `approved` in `{prefix}-<stage>.result.j
 
 ## Hard constraints
 
-- Never use `edit` or `execute`; read files only.
+- Never use `edit`; read files only. Never run a command other than `node .github/skills/uwf-review/reviews.mjs ...` (no builds, tests, linters or shell commands against the repository).
 - Never prescribe implementation ("create X with Y", "add section A to file B"); report the gap only.
 - Never invent content for missing files; report the absence and why the file is expected.
 - Stay within the stage named in the review run; do not review other stages' artifacts unless they are declared `inputs` for this stage.

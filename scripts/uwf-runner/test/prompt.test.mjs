@@ -95,6 +95,8 @@ await test("permissions mapping", () => {
   assert.equal(mapPermissions(["agent", "todo", "search", "read"]), "read-only");
   assert.equal(mapPermissions(["agent", "read", "edit", "search"]), "edit");
   assert.equal(mapPermissions(["read", "edit", "execute", "web"]), "edit+exec");
+  assert.equal(mapPermissions(["agent", "read"], ["node .github/skills/uwf-review/reviews.mjs"]), "read-only+review");
+  assert.equal(mapPermissions(["agent", "read"], ["rm -rf"]), "read-only");
 });
 
 await test("unknown stage exits 2", () => {
@@ -128,6 +130,18 @@ await test("bare target: referenced files are absolute skillsRoot paths, none un
       assert.ok(r.agentFile.startsWith(`${repoRoot}/.github/agents/`));
       assert.match(r.prompt, /## Skill files\n[^\n]*use the same path under /, `${stage}: no skill-files rule for the bare target`);
     }
+  } finally { rmSync(bare, { recursive: true, force: true }); }
+});
+
+await test("review stage: allowedCommands cover the relative and the skillsRoot-resolved script path", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "uwf-bare-"));
+  try {
+    const own = await materializePrompt({ workflow: "sw_dev", stage: "review", repoRoot, outputPath: "/OUT", dataDir: "/DATA" });
+    assert.equal(own.permissions, "read-only+review");
+    assert.deepEqual(own.allowedCommands, ["node .github/skills/uwf-review/reviews.mjs"]);
+    const r = await materializePrompt({ workflow: "sw_dev", stage: "review", repoRoot: bare, outputPath: "/OUT", dataDir: "/DATA" });
+    assert.ok(r.allowedCommands.includes("node .github/skills/uwf-review/reviews.mjs"));
+    assert.ok(r.allowedCommands.includes(`node ${repoRoot}/.github/skills/uwf-review/reviews.mjs`), "resolved absolute command not allowed");
   } finally { rmSync(bare, { recursive: true, force: true }); }
 });
 

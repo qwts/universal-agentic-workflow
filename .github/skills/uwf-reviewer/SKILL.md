@@ -17,7 +17,7 @@ Script commands, DB schema, severity and verdict values, the structured `.result
 
 ## Constraints (all personas)
 
-- The reviewer is **read-only**: no `edit` or `execute` tools.
+- The reviewer is **read-only on the repository under review**: no `edit` tool, no builds, no tests. It MAY run exactly one command, the review skill's own script `node .github/skills/uwf-review/reviews.mjs ...`, because the review gate requires its output. Run no other command.
 - Report observations only (what is wrong, not how to fix it).
 - Stay inside the active persona's scope; read only the scope and cross-reference files the persona file lists.
 - Never invent content for missing files; report absence as a `critical` finding.

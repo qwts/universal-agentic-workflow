@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 
 /**
- * @typedef {"read-only"|"edit"|"edit+exec"} Permissions
+ * @typedef {"read-only"|"edit"|"edit+exec"|"read-only+review"} Permissions
  * @typedef {{ inputTokens: number, outputTokens: number }} Usage
  * @typedef {object} InvokeStageOptions
  * @property {string} [agentFile] agent .md whose body becomes part of the system prompt
@@ -24,6 +24,8 @@ import { resolve, join } from "node:path";
  * @property {string} cwd
  * @property {string[]} [inputs]
  * @property {string[]} [outputs]
+ * @property {string} [skillsRoot]  root holding the workflow skills; the review script is also approved under it
+ * @property {string[]} [allowedCommands]  commands (relative and resolved forms) a `read-only+review` stage may run
  * @property {string} [model]
  * @property {string} [sessionId]
  * @property {number} [timeoutMs]

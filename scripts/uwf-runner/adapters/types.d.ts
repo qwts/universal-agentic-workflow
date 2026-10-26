@@ -2,7 +2,7 @@
  * UWF harness adapter contract (types only). See ../README.md.
  */
 
-export type Permissions = "read-only" | "edit" | "edit+exec";
+export type Permissions = "read-only" | "edit" | "edit+exec" | "read-only+review";
 
 export interface InvokeStageOptions {
   /** .github/agents/<name>.agent.md; its body (frontmatter stripped) is prepended to systemPrompt. */
@@ -19,6 +19,8 @@ export interface InvokeStageOptions {
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
   permissions?: Permissions;
+  allowedCommands?: string[];
+  skillsRoot?: string;
   /** Transcripts go to <dataDir>/transcripts/. Default: UWF_DATA_DIR ?? ./tmp/uwf */
   dataDir?: string;
 }
