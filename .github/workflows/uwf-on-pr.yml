@@ -88,10 +88,14 @@ jobs:
       group: uwf-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
-      UWF_DATA_DIR: ${{ runner.temp }}/uwf-${{ github.run_id }}
       # The `uwf:keep` label keeps the whole data dir in the artifact and skips its removal.
       UWF_KEEP: ${{ contains(github.event.pull_request.labels.*.name, 'uwf:keep') }}
     steps:
+      # `runner` is not a valid context in job-level env, so the per-run data dir is set in a step.
+      - name: Set the per-run data directory
+        shell: bash
+        run: echo "UWF_DATA_DIR=$RUNNER_TEMP/uwf-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+
       - name: Check out the PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
