@@ -61,6 +61,13 @@ stages:
           cmd: node
           args: ["{{skills_root}}/.github/skills/uwf-demo/probe.mjs", "{{cwd}}"]
           label: probe via template
+  - name: viaengine
+    gate:
+      checks:
+        - type: run_script
+          cmd: node
+          args: [".github/skills/uwf-orchestration-engine/verify.mjs", "--dry-run"]
+          label: engine script absent from a partial skills root
 `;
 writeFileSync(join(demoDir(skillsRoot), "stages.yaml"), STAGES);
 
@@ -77,7 +84,7 @@ function gate(cwd, stage, root) {
 
 console.log("\nSmoke test: gate commands resolve against the skills root\n");
 
-for (const stage of ["viaargs", "viashell", "viatemplate"]) {
+for (const stage of ["viaargs", "viashell", "viatemplate", "viaengine"]) {
   const r = gate(target, stage, skillsRoot);
   assert(`${stage}: passes with a skills root and a target without skills`, r.status === 0 && r.out?.passed === true, r.detail);
 }

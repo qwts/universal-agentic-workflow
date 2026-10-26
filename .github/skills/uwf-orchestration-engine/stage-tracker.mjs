@@ -374,11 +374,16 @@ const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
  *   substituted absolute root is then quoted as one word, unless the stages.yaml already quoted it.
  *   Argv-form values (execFileSync) are passed as data and must not be quoted.
  */
+const UWF_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 function resolveGateSkillPaths(str, shell = false) {
-  if (typeof str !== "string" || !SKILLS_ROOT) return str;
+  if (typeof str !== "string") return str;
   return str.replace(SKILL_PATH_RE, (whole, lead, rel) => {
     if (existsSync(resolve(process.cwd(), rel))) return whole;
-    const abs = join(SKILLS_ROOT, rel);
+    // Target copy > skills root > the UWF checkout that holds this tracker: a partial copy of the
+    // skills (say only uwf-sw_dev/) is a valid skills root but lacks the engine's own scripts.
+    const roots = [...new Set([SKILLS_ROOT, UWF_CHECKOUT].filter(Boolean))];
+    if (!roots.length) return whole;
+    const abs = roots.map((r) => join(r, rel)).find((q) => existsSync(q)) ?? join(roots[0], rel);
     return lead + (shell && lead !== '"' && lead !== "'" ? shellQuote(abs) : abs);
   });
 }
