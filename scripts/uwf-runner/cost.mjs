@@ -8,7 +8,10 @@
  * SKILL/reference files the stage's agent file tells it to read.
  *
  * Flags: "!50K" = average context per turn above 50K; "!100K" = the final turn (the largest) is
- * likely above 100K, the pricing tier boundary.
+ * likely above 100K, the pricing tier boundary; "!MISS" = cache_write exceeds both cache_read and 50K (the cache
+ * missed and the conversation was re-written at cache-write price, typical of a resumed retry).
+ *
+ * Also used by the runner: attemptUsage() (one transcript) and listTranscripts() (all transcripts in a data dir).
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -38,8 +41,33 @@ export function transcriptRow(file, t) {
   return {
     file, stage: m ? m[1] : "?", turns: r.num_turns, perTurn, lastCtx, input, read, write,
     output: num(u.output_tokens), thinking, cost: typeof r.total_cost_usd === "number" ? r.total_cost_usd : null,
-    flags: [perTurn > AVG_LIMIT ? "!50K" : null, lastCtx > TURN_LIMIT || perTurn > TURN_LIMIT ? "!100K" : null].filter(Boolean),
+    flags: [perTurn > AVG_LIMIT ? "!50K" : null, lastCtx > TURN_LIMIT || perTurn > TURN_LIMIT ? "!100K" : null, write > read && write > AVG_LIMIT ? "!MISS" : null].filter(Boolean),
   };
+}
+
+/** { ctx, cost } for one transcript file: context of the last turn (falls back to the per-turn average) and reported cost (0 when unknown). */
+export function attemptUsage(path) {
+  try {
+    const row = transcriptRow(path, JSON.parse(readFileSync(path, "utf8")));
+    return row ? { ctx: row.lastCtx || row.perTurn, cost: row.cost ?? 0 } : { ctx: 0, cost: 0 };
+  } catch { return { ctx: 0, cost: 0 }; }
+}
+
+/** Absolute paths of every transcript file in <dataDir>/transcripts. */
+export function listTranscripts(dataDir) {
+  const dir = join(dataDir, "transcripts");
+  return existsSync(dir) ? readdirSync(dir).filter((x) => x.endsWith(".json")).map((f) => join(dir, f)) : [];
+}
+
+/** Context size of the last turn of the newest transcript whose prompt names this stage (0 when none). */
+export function lastStageContext(dataDir, stage) {
+  for (const f of listTranscripts(dataDir).sort().reverse()) {
+    try {
+      const row = transcriptRow(f, JSON.parse(readFileSync(f, "utf8")));
+      if (row?.stage === stage) return row.lastCtx || row.perTurn;
+    } catch { /* unreadable transcript */ }
+  }
+  return 0;
 }
 
 /** Files the agent body tells the stage to read (`.github/...` paths in backticks), with their sizes. */
@@ -92,6 +120,6 @@ export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outp
   const w = head.map((_, i) => Math.max(...all.map((r) => r[i].length)));
   const line = (r) => r.map((c, i) => (i === 0 || i === r.length - 1 || (workflow && i >= r.length - 2) ? c.padEnd(w[i]) : c.padStart(w[i]))).join("  ").trimEnd();
   const out = [line(head), ...body.map(line), line(total)];
-  out.push("", `ctx/turn = (uncached input + cache_read + cache_write) / turns. Flags: !50K = average above ${AVG_LIMIT / 1000}K per turn; !100K = final turn likely above ${TURN_LIMIT / 1000}K (pricing tier).`);
+  out.push("", `ctx/turn = (uncached input + cache_read + cache_write) / turns. Flags: !50K = average above ${AVG_LIMIT / 1000}K per turn; !100K = final turn likely above ${TURN_LIMIT / 1000}K (pricing tier); !MISS = cache_write above both cache_read and ${AVG_LIMIT / 1000}K (a real re-bill, not just the first write; cache miss: the context was re-billed at cache-write price).`);
   return out.join("\n") + "\n";
 }

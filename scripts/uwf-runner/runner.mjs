@@ -7,13 +7,20 @@
  *     [--adapter claude-code|fake] [--model <m>] [--data-dir <d>] [--output-path <p>]
  *     [--from-stage <s>] [--force] [--non-interactive] [--dry-run] [--timeout-ms <n>]
  *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
+ *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
  *   node scripts/uwf-runner/runner.mjs resume --workflow <w>
  *     [--adapter] [--model] [--data-dir] [--output-path] [--non-interactive] [--timeout-ms]
+ *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
  *
  *   node scripts/uwf-runner/runner.mjs cost --data-dir <d> [--workflow <w> [--repo-root <r>]]
  *     per-stage turns, context per turn, tokens and cost from <d>/transcripts (see cost.mjs)
  *
- * Exit codes: 0 complete | 1 gate blocked / abort / on_verdict round trips exhausted | 2 usage or config error | 3 questions pending (incl. a review needing a user decision)
+ * Exit codes: 0 complete | 1 gate blocked / abort / on_verdict round trips exhausted | 2 usage or config error | 3 questions pending (incl. a review needing a user decision) | 4 cost cap exceeded
+ *
+ * Cost: after every attempt the runner sums the cost in <data-dir>/transcripts. --max-cost-usd caps the run total
+ * (stages.yaml `max_cost_usd` caps one stage's attempts); exceeding either stops the run with exit 4.
+ * --resume-max-context (default 100000): when an attempt's last turn held more tokens than that, the next
+ * retry starts a fresh session (with an excerpt of the previous output) even under retry_mode: resume.
  *
  * Two roots: --repo-root is where the agent works (cwd, artifacts, {{cwd}} gate paths); --skills-root
  * (env UWF_SKILLS_ROOT) is where workflow definitions, agents and skill docs are read. Default: this
@@ -31,7 +38,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
-import { costReport } from "./cost.mjs";
+import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -46,7 +53,8 @@ const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
 
-const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3 };
+const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3, COST: 4 };
+const DEFAULT_RESUME_MAX_CONTEXT = 100_000;
 
 class UsageError extends Error {}
 
@@ -163,6 +171,15 @@ async function main(argv) {
     timeoutMs = Number(flags["timeout-ms"]);
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new UsageError("--timeout-ms must be a positive number");
   }
+
+  const positive = (key) => {
+    if (flags[key] === undefined) return undefined;
+    const n = Number(flags[key]);
+    if (!Number.isFinite(n) || n <= 0) throw new UsageError(`--${key} must be a positive number`);
+    return n;
+  };
+  const maxCostUsd = positive("max-cost-usd");
+  const resumeMaxContext = positive("resume-max-context") ?? DEFAULT_RESUME_MAX_CONTEXT;
 
   const dryRun = flags["dry-run"] === true;
   const nonInteractive = flags["non-interactive"] === true;
@@ -299,8 +316,9 @@ async function main(argv) {
 
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
-    return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase, resuming: command === "resume" });
+    return await stageLoop({ command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
+      resetFrom, rollbackPhase, resuming: command === "resume" });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
@@ -311,9 +329,13 @@ async function main(argv) {
  * returns an exit code. ctx carries everything resolved by main().
  */
 async function stageLoop(ctx) {
-  const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, resetFrom, rollbackPhase, resuming } = ctx;
+  const { command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
+    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, resuming } = ctx;
   let first = true;
+  // Run-total cost covers this run's transcripts only. A fresh `run` leaves older transcripts in the data dir untouched
+  // but does not count them; `resume` and `run --from-stage` continue the same run, so what is already there counts.
+  const runTranscripts = new Set(command === "resume" || flags["from-stage"] ? listTranscripts(dataDir) : []);
+  const runCostSoFar = () => [...runTranscripts].reduce((a, f) => a + attemptUsage(f).cost, 0);
   const trips = new Map();     // "<stage>|<verdict>" -> round trips used
   const findings = new Map();  // stage -> { files, note, from } review findings to pass as extra input on a re-run
   // Persisted in the data dir so an interrupted run keeps its budget and findings on `resume` / `--from-stage`.
@@ -390,7 +412,22 @@ async function stageLoop(ctx) {
     let sessionId = i === start && keepSession && !visited.has(st.name) ? resumeSessionId : undefined;
     visited.add(st.name);
     let prompt = basePrompt;
+    let stageCost = 0;
+    let lastCtx = 0; // context size of the previous attempt's last turn
+    // A recorded session being continued (resume / --from-stage): judge it by the newest transcript of this stage.
+    if (sessionId) lastCtx = lastStageContext(dataDir, st.name);
     for (let attempt = 1; ; attempt++) {
+      // An already-exhausted cap must not buy another attempt (e.g. `resume` after a cost-cap stop with the same cap).
+      if (maxCostUsd !== undefined && runCostSoFar() > maxCostUsd) {
+        row.result = "stopped: cost cap exceeded";
+        cli(STATE, ["release-agent"], withOut); // the stage setup above claimed the token
+        return finish(EXIT.COST, rows, `${tag}: cost cap exceeded before attempt ${attempt}: run cost $${runCostSoFar().toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}; raise the cap and use "resume" to continue`, note);
+      }
+      if (sessionId && lastCtx > resumeMaxContext) {
+        log(`${tag}: ${attempt === 1 ? "the recorded session" : `attempt ${attempt - 1}`} ended with a ${Math.round(lastCtx)}-token context (> --resume-max-context ${resumeMaxContext}); ${attempt === 1 ? "starting" : "retrying"} in a fresh session instead of resuming`);
+        sessionId = undefined;
+        prompt = `${prompt}\n\n## Previous output (fresh session)\nThis is a new session, so you do not remember the previous attempt. Its primary output file ${mp.outputsRequired[0] ?? "(none)"} ends with (last 40 lines):\n${outputExcerpt(mp.outputsRequired[0], repoRoot)}`;
+      }
       row.attempts = priorAttempts + attempt;
       log(`${tag} → ${adapterName} (attempt ${attempt}/${maxAttempts})`);
       if (attempt > 1) cli(STATE, ["set-agent", "--agent", AGENT_ID, "--force"], withOut);
@@ -406,6 +443,20 @@ async function stageLoop(ctx) {
       // Persist right away so the session survives a crash between attempts.
       if (sessionId) cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
       cli(STATE, ["release-agent"], withOut); // 4.
+
+      // Cost cap: checked after every attempt, before anything else can start another one.
+      const used = attemptUsage(res.transcriptPath);
+      lastCtx = used.ctx;
+      stageCost += used.cost;
+      if (res.transcriptPath) runTranscripts.add(res.transcriptPath);
+      const runCost = runCostSoFar();
+      const over = maxCostUsd !== undefined && runCost > maxCostUsd ? `run cost $${runCost.toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}`
+        : st.maxCostUsd && stageCost > st.maxCostUsd ? `stage ${st.name} cost $${stageCost.toFixed(3)} exceeds max_cost_usd $${st.maxCostUsd}` : null;
+      // The attempt is recorded first (gate verdict, stage status); only then does an exceeded cap stop the run.
+      const capStop = (status) => {
+        row.result = `${row.result || status}; cost cap exceeded`;
+        return finish(EXIT.COST, rows, `${tag}: ${status}; cost cap exceeded after attempt ${attempt}: ${over}; raise the cap and use "resume" to continue`, note);
+      };
 
       // 5. questions
       const text = res.stdout || transcriptText(res.transcriptPath);
@@ -455,6 +506,7 @@ async function stageLoop(ctx) {
           if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
           if (adv) row.result += ` (${adv})`;
+          if (over) return capStop(`${st.name} passed`);
           break;
         }
         failures = g.data?.failures ?? [g.error];
@@ -488,6 +540,8 @@ async function stageLoop(ctx) {
             row.result = `failed (verdict ${verdict}, ${used} round trip(s) used)`;
             return finish(EXIT.GATE, rows, `${tag}: verdict "${verdict}" and the round-trip budget to ${rule.routeTo} is exhausted (${used}/${rule.maxRoundTrips}); stopping. Address the findings in ${mp.outputsRequired[0] ?? "the review output"} and rerun with --from-stage ${rule.routeTo}`, note);
           }
+          // An exceeded cap stops here too: a routed re-run would spend more.
+          if (over) return capStop(`${st.name} verdict ${verdict}; routing to ${rule.routeTo} not started`);
           trips.set(key, used + 1);
           const reviewFile = mp.outputsRequired[0];
           const noteText = `The ${st.name} stage returned verdict "${verdict}" (round trip ${used + 1} of ${rule.maxRoundTrips}). ` +
@@ -513,13 +567,16 @@ async function stageLoop(ctx) {
         // A skipped stage still moves the workflow forward, as stage-tracker does.
         const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
         if (adv) row.result += ` (${adv})`;
+        if (over) return capStop(`${st.name} skipped (gate failed)`);
         break;
       }
       if (st.onGateFailure === "abort" || attempt >= maxAttempts) {
         cli(TRACKER, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; "), ...sessionArgs(sessionId)], withOut);
         row.result = st.onGateFailure === "abort" ? "failed (abort)" : "failed";
+        if (over) return capStop(`${st.name} failed`);
         return finish(EXIT.GATE, rows, `${tag}: gate blocked after ${attempt} attempt(s): ${failures.join("; ")}`, note);
       }
+      if (over) { row.result = "gate failed"; return capStop(`${st.name} gate failed, retry ${attempt} of ${st.maxRetries} not started`); }
       if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
       prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
     }
@@ -615,6 +672,11 @@ export function retryPrompt({ basePrompt, stage, retry, maxRetries, prescription
   return `${basePrompt}\n\n## Gate failure (retry ${retry} of ${maxRetries})\nThe gate for stage ${stage} did not pass.\n` +
     `${prescriptions.map((p) => `- ${p}`).join("\n")}\n\nWhat happens next: ${next}.\n\n` +
     `## Your previous attempt (last 40 lines)\n${tail}`;
+}
+
+/** Last 40 lines of a stage output file (relative paths resolve against the repo root); a note when it is missing. */
+function outputExcerpt(path, repoRoot) {
+  try { return readFileSync(resolve(repoRoot, path), "utf8").split(/\r?\n/).slice(-40).join("\n"); } catch { return "(file not found)"; }
 }
 
 /** One-paragraph human-readable summary for on_gate_failure abort|skip. */

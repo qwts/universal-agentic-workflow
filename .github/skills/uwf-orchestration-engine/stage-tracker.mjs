@@ -115,6 +115,16 @@ function resolveMaxTurns(stageDef) {
   return v;
 }
 
+/** max_cost_usd: optional per-stage cap on the summed cost of the stage's attempts (runner `--max-cost-usd` is the run-wide one). */
+function resolveMaxCostUsd(stageDef) {
+  const v = stageDef.max_cost_usd;
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+    fail(`Stage "${stageDef.name}": max_cost_usd must be a positive number, got ${JSON.stringify(v)}.`);
+  }
+  return v;
+}
+
 /**
  * on_verdict: map of verdict value -> { route_to, max_round_trips }. When the stage's verdict check fails
  * with an observed value that is a key here, the runner routes back to `route_to` (an EARLIER stage of the
@@ -405,6 +415,7 @@ function cmdListStages(db) {
       maxRetries: max_retries ?? 2,
       retryMode: retry_mode,
       maxTurns: resolveMaxTurns(stageDef),
+      maxCostUsd: resolveMaxCostUsd(stageDef),
       onGateFailure: on_gate_failure ?? "retry",
       onVerdict: resolveOnVerdict(stageDef, stages),
       gated: gated !== false,
@@ -460,6 +471,7 @@ function cmdGatePrescriptions() {
     max_retries: s.max_retries ?? 2,
     retry_mode: s.retry_mode ?? "resume",
     max_turns: resolveMaxTurns(s),
+    max_cost_usd: resolveMaxCostUsd(s),
     on_verdict: resolveOnVerdict(s, stages),
     checks: (s.gate?.checks ?? []).map((c) => ({ type: c.type, label: c.label ?? null, prescription: prescribeCheck(c, null) })),
   }));

@@ -74,10 +74,11 @@ Limitations:
 
 ```sh
 node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapter claude-code|fake] \
-  [--model m] [--data-dir d] [--output-path p] [--from-stage s] [--non-interactive] [--dry-run] [--timeout-ms n]
+  [--model m] [--data-dir d] [--output-path p] [--from-stage s] [--non-interactive] [--dry-run] [--timeout-ms n] \
+  [--max-cost-usd n] [--resume-max-context tokens]
 ```
 
-Exit codes: 0 complete, 1 gate blocked, abort or `on_verdict` round trips exhausted, 2 usage/config error, 3 questions pending (or a review needing a user decision)
+Exit codes: 0 complete, 1 gate blocked, abort or `on_verdict` round trips exhausted, 2 usage/config error, 3 questions pending (or a review needing a user decision), 4 cost cap exceeded
 (answer with `questions.mjs answer`, then rerun with `--from-stage <stage>`).
 A run without `--from-stage` re-initializes the stage-tracker and state stores in the data dir,
 unless the workflow in that data dir is already complete: then it prints the stage table and exits 0
@@ -119,3 +120,9 @@ What the target needs: a git repo and the output path (created on demand). No `.
 node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md --repo-root ../my-app
 node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md --repo-root ../my-app --skills-root ../uwf-fork
 ```
+
+### Cost caps and resume context threshold
+
+- `--max-cost-usd <n>`: after every attempt the runner sums `total_cost_usd` over this run's transcripts; above `n` it stops with **exit 4** (cost cap exceeded). The attempt is recorded first (gate verdict, stage passed/failed/skipped) and the run stops before any further attempt or stage starts, naming the stage status (e.g. "review passed; cost cap exceeded"). "This run" means the transcripts produced by this invocation; a fresh `run` leaves older transcripts in the data dir but does not count them, while `resume` and `run --from-stage` also count the transcripts already present (same run). A stage can carry its own cap with `max_cost_usd: <n>` in `stages.yaml` (summed over that stage's attempts in this invocation; exposed by `--list-stages` as `maxCostUsd`, null when unset). Raise the cap and use `resume` to continue.
+- `--resume-max-context <tokens>` (default 100000): `retry_mode: resume` re-submits the whole conversation, and a cache miss re-writes it at cache-write price. When an attempt's last turn held more than this many tokens (input + cache read + cache write), the next retry of that stage starts a fresh session instead, with the gate prescription plus the last 40 lines of the previous attempt's primary output file appended to the prompt. A log line says why it switched.
+- `cost` marks attempts whose `cache_write` exceeds `cache_read` with `!MISS` in the flags column when cache_write also exceeds 50K (a real re-bill; the first write of a short stage does not count).
