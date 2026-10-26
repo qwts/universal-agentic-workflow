@@ -170,6 +170,12 @@ jobs:
             node "$test_file"
           done
 
+      - name: Run runner-host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/runner-host/test/runner-host.test.sh
+
   companion:
     name: UWF Companion
     needs: policy
