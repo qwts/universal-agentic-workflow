@@ -38,6 +38,14 @@ The `claude-code` adapter passes `--setting-sources project`, so a stage loads o
 settings do not reach the stage. `--bare` would also skip hooks and CLAUDE.md discovery, but it only works
 with API-key auth, so the runner does not use it.
 
+The adapter also passes `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`, so a stage never inherits the
+operator's claude.ai connectors (Gmail, Drive, Calendar, ...) or other MCP servers. `--setting-sources` does
+not exclude them and `--tools` only filters built-in tools. This matters for cost (the connector tool schemas
+added about 50k tokens to every stage, roughly 72k versus 12k on the first call, about 5x) and for isolation (a
+stage must not see the operator's personal connectors). To opt in to specific MCP servers, set the
+`mcpConfig` option of `invokeStage` to a JSON file path or an inline JSON string; it is passed verbatim to
+`--mcp-config` (the strict flag stays on).
+
 ### `codex` adapter
 
 Command: `codex exec --cd <cwd> [--model m] --json -c sandbox_mode=".." -c approval_policy="never" --skip-git-repo-check --output-last-message <tmpfile> -`
