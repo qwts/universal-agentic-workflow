@@ -1,0 +1,286 @@
+# Reusable workflow: run a UWF workflow against a pull request on a self-hosted runner.
+# It has no pull_request trigger of its own, so it does not fire on this repository's PRs.
+# A consumer repo calls it from a thin caller workflow (see docs/guide/uwf-on-pr.md).
+name: UWF on PR
+
+on:
+  workflow_call:
+    inputs:
+      workflow:
+        description: UWF workflow to run (a uwf-<workflow> skill with stages.yaml)
+        type: string
+        default: sw_dev
+      adapter:
+        description: Harness adapter (claude-code, codex)
+        type: string
+        default: claude-code
+      model:
+        description: Model passed to the adapter
+        type: string
+        required: true
+      max_cost_usd:
+        description: Run cost cap in USD (runner exit 4 when exceeded)
+        type: number
+        default: 1
+      uwf_ref:
+        description: Ref of qwts/universal-agentic-workflow checked out as the skills root
+        type: string
+        default: main
+      runner_labels:
+        description: Reserved. The job runs on [self-hosted, uwf]; this input only documents the label set
+        type: string
+        default: uwf
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Optional. Normally the self-hosted machine's service environment supplies it
+        required: false
+      OPENAI_API_KEY:
+        description: Optional. Normally the self-hosted machine's service environment supplies it
+        required: false
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  uwf:
+    name: UWF ${{ inputs.workflow }} on PR
+    # Fork PRs would run untrusted code on a self-hosted machine; only same-repo PRs run.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, uwf]
+    timeout-minutes: 180
+    concurrency:
+      group: uwf-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      UWF_DATA_DIR: ${{ runner.temp }}/uwf-${{ github.run_id }}
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: target
+          persist-credentials: false
+
+      - name: Check out UWF skills root
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: qwts/universal-agentic-workflow
+          ref: ${{ inputs.uwf_ref }}
+          path: uwf
+          persist-credentials: false
+
+      - name: Install model-adaptation dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install model-adaptation dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-model-adaptation
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install orchestration-engine dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install orchestration-engine dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-orchestration-engine
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install state-manager dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install state-manager dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-state-manager
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install adr dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install adr dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-adr
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install discovery dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install discovery dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-discovery
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install local-tracking dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install local-tracking dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-local-tracking
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install question-protocol dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install question-protocol dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-question-protocol
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install review dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install review dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-review
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install requirements dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        with:
+          task: Install requirements dependencies
+          executable: npm
+          arguments-json: '["ci","--no-audit","--no-fund"]'
+          working-directory: uwf/.github/skills/uwf-requirements
+          timeout-seconds: '300'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Pass through API keys from secrets when present
+        shell: bash
+        env:
+          SECRET_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SECRET_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Only export a key that exists, so an empty secret never shadows the runner service environment.
+          if [ -n "$SECRET_ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY=$SECRET_ANTHROPIC_API_KEY" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$SECRET_OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY=$SECRET_OPENAI_API_KEY" >> "$GITHUB_ENV"
+            echo "CODEX_API_KEY=$SECRET_OPENAI_API_KEY" >> "$GITHUB_ENV"
+          fi
+
+      - name: Assemble goal file
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node uwf/scripts/uwf-on-pr/build-goal.mjs "$RUNNER_TEMP/goal.md"
+
+      - name: Run UWF workflow
+        id: run
+        shell: bash
+        env:
+          INPUT_WORKFLOW: ${{ inputs.workflow }}
+          INPUT_ADAPTER: ${{ inputs.adapter }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_MAX_COST_USD: ${{ inputs.max_cost_usd }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$UWF_DATA_DIR"
+          set +e
+          node uwf/scripts/uwf-runner/runner.mjs run \
+            --workflow "$INPUT_WORKFLOW" \
+            --goal "$RUNNER_TEMP/goal.md" \
+            --adapter "$INPUT_ADAPTER" \
+            --model "$INPUT_MODEL" \
+            --repo-root "$GITHUB_WORKSPACE/target" \
+            --skills-root "$GITHUB_WORKSPACE/uwf" \
+            --data-dir "$UWF_DATA_DIR" \
+            --non-interactive \
+            --max-cost-usd "$INPUT_MAX_COST_USD" 2>&1 | tee "$RUNNER_TEMP/runner.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "runner exited with $code"
+
+      - name: Write job summary
+        if: ${{ always() && steps.run.outputs.exit_code != '' }}
+        shell: bash
+        env:
+          INPUT_WORKFLOW: ${{ inputs.workflow }}
+          RUNNER_EXIT: ${{ steps.run.outputs.exit_code }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### UWF ${INPUT_WORKFLOW} on PR #${{ github.event.pull_request.number }} (runner exit ${RUNNER_EXIT})"
+            echo
+            echo "Stage table"
+            echo '```'
+            # The runner prints the table more than once; keep the last one.
+            awk '/^stage +attempts +result/ {buf=""; f=1} f {buf=buf $0 "\n"} END {printf "%s", buf}' "$RUNNER_TEMP/runner.log"
+            echo '```'
+            echo
+            echo "Cost per stage"
+            echo '```'
+            node uwf/scripts/uwf-runner/runner.mjs cost \
+              --data-dir "$UWF_DATA_DIR" \
+              --workflow "$INPUT_WORKFLOW" \
+              --repo-root "$GITHUB_WORKSPACE/target" 2>&1 || echo "cost report unavailable"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload workflow artifacts and transcripts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uwf-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: |
+            target/tmp/workflow-artifacts
+            ${{ runner.temp }}/uwf-${{ github.run_id }}/transcripts
+            ${{ runner.temp }}/runner.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove the per-run data directory
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if test -e "$UWF_DATA_DIR"; then rm -r "$UWF_DATA_DIR"; fi
+
+      - name: Fail with the runner's exit code
+        if: ${{ always() && steps.run.outputs.exit_code != '' && steps.run.outputs.exit_code != '0' }}
+        shell: bash
+        env:
+          RUNNER_EXIT: ${{ steps.run.outputs.exit_code }}
+        run: |
+          case "$RUNNER_EXIT" in
+            1) msg="gate blocked, run aborted, or review round trips exhausted" ;;
+            2) msg="runner usage or configuration error" ;;
+            3) msg="questions pending: the run needs a user decision" ;;
+            4) msg="cost cap exceeded (max_cost_usd)" ;;
+            *) msg="unexpected runner failure" ;;
+          esac
+          echo "::error::uwf runner exited with code ${RUNNER_EXIT}: ${msg}"
+          exit "$RUNNER_EXIT"

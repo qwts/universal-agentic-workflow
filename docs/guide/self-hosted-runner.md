@@ -117,7 +117,7 @@ as registration, endpoint `.../actions/runners/remove-token`).
 
 ## How `uwf-on-pr.yml` uses the runner
 
-`uwf-on-pr.yml` (#94, not yet written) will target this runner:
+`uwf-on-pr.yml` (#94, see [uwf-on-pr.md](uwf-on-pr.md)) targets this runner. Its job has this shape:
 
 ```yaml
 jobs:
