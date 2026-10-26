@@ -184,6 +184,21 @@ function parseArgs(argv) {
 
 const log = (s) => process.stderr.write(s + "\n");
 
+// Adapter-specific economical default model, used when neither --model nor the stage's `model:` is set.
+// Without it the claude-code CLI inherits the account's (expensive) default. Other adapters keep their own default.
+const DEFAULT_MODEL = { "claude-code": "claude-sonnet-5-5" };
+
+/** --model flag > stage `model:` > DEFAULT_MODEL[adapter]. Returns { model, source } (model undefined = adapter default). */
+function resolveModel(flags, stageModel, adapterName) {
+  if (flags.model) return { model: flags.model, source: "--model" };
+  if (stageModel) return { model: stageModel, source: "stage" };
+  const def = DEFAULT_MODEL[adapterName];
+  if (def) return { model: def, source: `default for ${adapterName}; pass --model to override` };
+  return { model: undefined, source: "adapter default" };
+}
+
+const COST_CAP_NOTE = (n) => `--max-cost-usd $${n} is a stop-after check: the run stops after the first attempt that pushes the summed cost over the cap, so a single attempt can exceed it`;
+
 /** Parse a QUESTIONS_NEEDED block (format: uwf-question-protocol/SKILL.md). */
 export function parseQuestions(text) {
   const idx = text.indexOf("QUESTIONS_NEEDED");
@@ -280,7 +295,7 @@ async function main(argv) {
       if (start < 0) throw new UsageError(`--from-stage "${flags["from-stage"]}" not in: ${stages.map((s) => s.name).join(", ")}`);
     }
 
-    if (dryRun) return await dryRunReport({ workflow, stages: stages.slice(start), total: stages.length, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags });
+    if (dryRun) return await dryRunReport({ workflow, stages: stages.slice(start), total: stages.length, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags, adapterName, maxCostUsd });
 
     const readTracker = () => {
       const r = cli(TRACKER, ["read", "--workflow", workflow], withOut);
@@ -406,6 +421,8 @@ async function stageLoop(ctx) {
   const { command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
     outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, phaseFlags, resuming } = ctx;
   let first = true;
+  let lastModelLine = null;
+  if (maxCostUsd !== undefined) log(`[runner] ${COST_CAP_NOTE(maxCostUsd)}`);
   // Run-total cost covers this run's transcripts only. A fresh `run` leaves older transcripts in the data dir untouched
   // but does not count them; `resume` and `run --from-stage` continue the same run, so what is already there counts.
   const runTranscripts = new Set(command === "resume" || flags["from-stage"] ? listTranscripts(dataDir) : []);
@@ -488,7 +505,9 @@ async function stageLoop(ctx) {
     }
     const basePrompt = first ? `Goal:\n${goal}\n\n${mp.prompt}` : mp.prompt;
     first = false;
-    const model = flags.model ?? mp.model ?? undefined;
+    const { model, source: modelSource } = resolveModel(flags, mp.model, adapterName);
+    const modelLine = `model: ${model ?? "(adapter default)"} (${modelSource})`;
+    if (modelLine !== lastModelLine) { log(`${tag}: ${modelLine}`); lastModelLine = modelLine; }
     const maxAttempts = st.maxRetries + 1;
 
     // retry_mode "resume": each retry passes the previous attempt's session id to the adapter.
@@ -798,7 +817,7 @@ function finish(code, rows, message, note) {
 // Dry run
 // ---------------------------------------------------------------------------
 
-async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags }) {
+async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags, adapterName, maxCostUsd }) {
   let gateChecks = {};
   try {
     const req = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"));
@@ -807,11 +826,13 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRo
   } catch (e) {
     log(`[dry-run] gate checks unavailable: ${e.message}`);
   }
-  const out = [`workflow: ${workflow}  stages: ${total}  starting at: ${stages[0]?.name}  output-path: ${outputPath}`, ""];
+  const out = [`workflow: ${workflow}  stages: ${total}  starting at: ${stages[0]?.name}  output-path: ${outputPath}`];
+  if (maxCostUsd !== undefined) out.push(COST_CAP_NOTE(maxCostUsd));
+  out.push("");
   for (const [j, st] of stages.entries()) {
     const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, skillsRoot, outputPath, dataDir, extraContext: { goal } });
     out.push(`[${start + j + 1}/${total}] ${st.name}  (agent: ${mp.agentName})`);
-    out.push(`  permissions: ${mp.permissions}   model: ${flags.model ?? mp.model ?? "(adapter default)"}`);
+    out.push(`  permissions: ${mp.permissions}   model: ${(({ model, source }) => `${model ?? "(adapter default)"} (${source})`)(resolveModel(flags, mp.model, adapterName))}`);
     out.push(`  retries: ${st.maxRetries}   retry_mode: ${st.retryMode}   max_turns: ${st.maxTurns}   on_gate_failure: ${st.onGateFailure}   gated: ${st.gated}${st.conditional ? "   conditional" : ""}`);
     if (st.onVerdict) out.push(`  on_verdict: ${Object.entries(st.onVerdict).map(([v, r]) => `${v} -> ${r.routeTo} (max_round_trips ${r.maxRoundTrips})`).join(", ")}`);
     out.push(`  required outputs: ${mp.outputsRequired.length ? mp.outputsRequired.join(", ") : "(none)"}`);
