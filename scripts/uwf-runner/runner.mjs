@@ -7,13 +7,20 @@
  *     [--adapter claude-code|fake] [--model <m>] [--data-dir <d>] [--output-path <p>]
  *     [--from-stage <s>] [--force] [--non-interactive] [--dry-run] [--timeout-ms <n>]
  *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
+ *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
  *   node scripts/uwf-runner/runner.mjs resume --workflow <w>
  *     [--adapter] [--model] [--data-dir] [--output-path] [--non-interactive] [--timeout-ms]
+ *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
  *
  *   node scripts/uwf-runner/runner.mjs cost --data-dir <d> [--workflow <w> [--repo-root <r>]]
  *     per-stage turns, context per turn, tokens and cost from <d>/transcripts (see cost.mjs)
  *
- * Exit codes: 0 complete | 1 gate blocked / abort | 2 usage or config error | 3 questions pending
+ * Exit codes: 0 complete | 1 gate blocked / abort | 2 usage or config error | 3 questions pending | 4 cost cap exceeded
+ *
+ * Cost: after every attempt the runner sums the cost in <data-dir>/transcripts. --max-cost-usd caps the run total
+ * (stages.yaml `max_cost_usd` caps one stage's attempts); exceeding either stops the run with exit 4.
+ * --resume-max-context (default 100000): when an attempt's last turn held more tokens than that, the next
+ * retry starts a fresh session (with an excerpt of the previous output) even under retry_mode: resume.
  *
  * Two roots: --repo-root is where the agent works (cwd, artifacts, {{cwd}} gate paths); --skills-root
  * (env UWF_SKILLS_ROOT) is where workflow definitions, agents and skill docs are read. Default: this
@@ -31,7 +38,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
-import { costReport } from "./cost.mjs";
+import { attemptUsage, costReport, totalCost } from "./cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -45,7 +52,8 @@ const GOAL_FILE = "runner-goal.md";
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
 
-const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3 };
+const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3, COST: 4 };
+const DEFAULT_RESUME_MAX_CONTEXT = 100_000;
 
 class UsageError extends Error {}
 
@@ -162,6 +170,15 @@ async function main(argv) {
     timeoutMs = Number(flags["timeout-ms"]);
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new UsageError("--timeout-ms must be a positive number");
   }
+
+  const positive = (key) => {
+    if (flags[key] === undefined) return undefined;
+    const n = Number(flags[key]);
+    if (!Number.isFinite(n) || n <= 0) throw new UsageError(`--${key} must be a positive number`);
+    return n;
+  };
+  const maxCostUsd = positive("max-cost-usd");
+  const resumeMaxContext = positive("resume-max-context") ?? DEFAULT_RESUME_MAX_CONTEXT;
 
   const dryRun = flags["dry-run"] === true;
   const nonInteractive = flags["non-interactive"] === true;
@@ -298,7 +315,7 @@ async function main(argv) {
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut });
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
@@ -310,7 +327,7 @@ async function main(argv) {
  */
 async function stageLoop(ctx) {
   const { resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut } = ctx;
+    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext } = ctx;
   let first = true;
   for (let i = start; i < stages.length; i++) {
     const st = stages[i];
@@ -365,6 +382,8 @@ async function stageLoop(ctx) {
     const keepSession = st.retryMode !== "fresh";
     let sessionId = i === start && keepSession ? resumeSessionId : undefined;
     let prompt = basePrompt;
+    let stageCost = 0;
+    let lastCtx = 0; // context size of the previous attempt's last turn
     for (let attempt = 1; ; attempt++) {
       row.attempts = attempt;
       log(`${tag} → ${adapterName} (attempt ${attempt}/${maxAttempts})`);
@@ -381,6 +400,18 @@ async function stageLoop(ctx) {
       // Persist right away so the session survives a crash between attempts.
       if (sessionId) cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
       cli(STATE, ["release-agent"], withOut); // 4.
+
+      // Cost cap: checked after every attempt, before anything else can start another one.
+      const used = attemptUsage(res.transcriptPath);
+      lastCtx = used.ctx;
+      stageCost += used.cost;
+      const runCost = totalCost(dataDir);
+      const over = maxCostUsd !== undefined && runCost > maxCostUsd ? `run cost $${runCost.toFixed(3)} exceeds --max-cost-usd $${maxCostUsd}`
+        : st.maxCostUsd && stageCost > st.maxCostUsd ? `stage ${st.name} cost $${stageCost.toFixed(3)} exceeds max_cost_usd $${st.maxCostUsd}` : null;
+      if (over) {
+        row.result = "stopped: cost cap";
+        return finish(EXIT.COST, rows, `${tag}: cost cap exceeded after attempt ${attempt}: ${over}; raise the cap and use "resume" to continue`, note);
+      }
 
       // 5. questions
       const text = res.stdout || transcriptText(res.transcriptPath);
@@ -451,6 +482,12 @@ async function stageLoop(ctx) {
       }
       if (!keepSession) sessionId = undefined; // retry_mode fresh: the next attempt starts a new session
       prompt = retryPrompt({ basePrompt, stage: st.name, retry: attempt, maxRetries: st.maxRetries, prescriptions, transcript: text });
+      if (keepSession && sessionId && lastCtx > resumeMaxContext) {
+        // A resumed retry re-bills the whole conversation (cache misses re-write it at cache-write price): start fresh instead.
+        log(`${tag}: attempt ${attempt} ended with a ${Math.round(lastCtx)}-token context (> --resume-max-context ${resumeMaxContext}); retrying in a fresh session instead of resuming`);
+        sessionId = undefined;
+        prompt = `${prompt}\n\n## Previous output (fresh session)\nThis retry is a new session, so you do not remember the previous attempt. Its primary output file ${mp.outputsRequired[0] ?? "(none)"} ends with (last 40 lines):\n${outputExcerpt(mp.outputsRequired[0], repoRoot)}`;
+      }
     }
   }
   return finish(EXIT.OK, rows, "workflow complete", note);
@@ -519,6 +556,11 @@ export function retryPrompt({ basePrompt, stage, retry, maxRetries, prescription
   return `${basePrompt}\n\n## Gate failure (retry ${retry} of ${maxRetries})\nThe gate for stage ${stage} did not pass.\n` +
     `${prescriptions.map((p) => `- ${p}`).join("\n")}\n\nWhat happens next: ${next}.\n\n` +
     `## Your previous attempt (last 40 lines)\n${tail}`;
+}
+
+/** Last 40 lines of a stage output file (relative paths resolve against the repo root); a note when it is missing. */
+function outputExcerpt(path, repoRoot) {
+  try { return readFileSync(resolve(repoRoot, path), "utf8").split(/\r?\n/).slice(-40).join("\n"); } catch { return "(file not found)"; }
 }
 
 /** One-paragraph human-readable summary for on_gate_failure abort|skip. */

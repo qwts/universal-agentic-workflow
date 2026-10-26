@@ -706,5 +706,88 @@ function setupBareDry(s) { return { ...s, data: s.data + "-dry" }; }
   check("ctx/turn includes uncached input tokens", row?.perTurn === 60000 && row.flags.includes("!50K"), JSON.stringify(row));
 }
 
+{
+  console.log("# cost cap, resume context threshold, !MISS");
+  const claudeResult = (ctx, cost, extra = {}) => ({ num_turns: 2, total_cost_usd: cost,
+    usage: { input_tokens: 10, output_tokens: 50, cache_read_input_tokens: ctx - 10, cache_creation_input_tokens: 0, iterations: [{ input_tokens: 10, cache_read_input_tokens: ctx - 10, cache_creation_input_tokens: 0 }], ...extra } });
+  // review fails its gate until its result.json appears (attempt 3 here), so attempts 1-2 are retried.
+  const reviewFixture = (s, first, later) => {
+    s.good ??= JSON.parse(readFileSync(join(s.fixtures, "review.json"), "utf8"));
+    const good = s.good;
+    const partial = { "tmp/workflow-artifacts/issues-review.md": "# Review\n\nline-one-of-the-first-attempt\n" };
+    writeFileSync(join(s.fixtures, "review.json"), JSON.stringify({ attempts: [{ files: partial, transcript: "r1", ...first }, { files: partial, transcript: "r2", ...first }, { files: good.files, transcript: "ok", ...later }] }));
+  };
+  const reviewT = (s) => transcripts(s).filter((t) => t.prompt.includes("Run the review stage"));
+
+  const a = setup();
+  try {
+    reviewFixture(a, { claudeResult: claudeResult(1000, 0.6) }, { claudeResult: claudeResult(1000, 0.01) });
+    const r = run(a, ["--max-cost-usd", "1"]);
+    check("run cost cap: exit 4 after the attempt that crosses it", r.code === 4 && reviewT(a).length === 2, `${r.code} ${reviewT(a).length} ${r.err.slice(-400)}`);
+    check("run cost cap: message names the cap and the cost", /cost cap exceeded after attempt 2: run cost \$1\.200 exceeds --max-cost-usd \$1/.test(r.err), r.err.slice(-400));
+    const ok = run(setup0(a), ["--max-cost-usd", "50"]);
+    check("a generous cap does not stop the run", ok.code === 0, `${ok.code} ${ok.err.slice(-300)}`);
+    const bad = run(a, ["--max-cost-usd", "free", "--dry-run"]);
+    check("invalid --max-cost-usd exits 2", bad.code === 2 && /--max-cost-usd must be a positive number/.test(bad.err), bad.err.slice(-200));
+  } finally { rmSync(a.base, { recursive: true, force: true }); }
+
+  const b = setup();
+  try {
+    const yamlPath = join(b.repo, ".github", "skills", "uwf-sw_dev", "stages.yaml");
+    const text = readFileSync(yamlPath, "utf8");
+    const marked = text.replace("    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n", "    agent: uwf-sw_dev-reviewer\n    max_retries: 3\n    max_cost_usd: 0.5\n");
+    check("test setup: stages.yaml patched with max_cost_usd", marked !== text);
+    writeFileSync(yamlPath, marked);
+    const list = skillJson("uwf-sw_dev/run.mjs", ["--list-stages"], b);
+    check("--list-stages exposes maxCostUsd (set on review, null elsewhere)", list?.find((x) => x.name === "review")?.maxCostUsd === 0.5 && list?.find((x) => x.name === "intake")?.maxCostUsd === null, JSON.stringify(list?.find((x) => x.name === "review")));
+    reviewFixture(b, { claudeResult: claudeResult(1000, 0.3) }, {});
+    const r = run(b);
+    check("stage max_cost_usd: exit 4 after the second attempt (0.6 > 0.5)", r.code === 4 && reviewT(b).length === 2 && /stage review cost \$0\.600 exceeds max_cost_usd \$0\.5/.test(r.err), `${r.code} ${r.err.slice(-300)}`);
+    for (const badVal of ["0", "-1", "lots"]) {
+      writeFileSync(yamlPath, marked.replace("max_cost_usd: 0.5", `max_cost_usd: ${badVal}`));
+      const x = spawnSync(process.execPath, [join(SKILLS, "uwf-sw_dev", "run.mjs"), "--list-stages", "--data-dir", b.data], { encoding: "utf8", cwd: b.repo });
+      check(`invalid max_cost_usd ${badVal} is rejected`, x.status !== 0 && /max_cost_usd must be a positive number/.test(x.stdout), x.stdout.slice(0, 200));
+    }
+  } finally { rmSync(b.base, { recursive: true, force: true }); }
+
+  const c = setup();
+  try {
+    reviewFixture(c, { claudeResult: claudeResult(150000, 0.01) }, { claudeResult: claudeResult(150000, 0.01) });
+    const r = run(c);
+    const rev = reviewT(c);
+    check("big context: run still completes", r.code === 0 && rev.length === 3, `${r.code} ${rev.length} ${r.err.slice(-300)}`);
+    check("big context: log line says why it switched to a fresh session", /attempt 1 ended with a 150000-token context \(> --resume-max-context 100000\); retrying in a fresh session/.test(r.err), r.err.slice(-500));
+    check("big context: every retry used a new session", new Set(rev.map((t) => t.sessionId)).size === 3, rev.map((t) => t.sessionId).join(","));
+    check("big context: retry prompt carries the prescription and the previous output excerpt", /## Gate failure \(retry 1 of 3\)/.test(rev[1].prompt) && /## Previous output \(fresh session\)[\s\S]*line-one-of-the-first-attempt/.test(rev[1].prompt), rev[1].prompt.slice(-500));
+  } finally { rmSync(c.base, { recursive: true, force: true }); }
+
+  const d = setup();
+  try {
+    reviewFixture(d, { claudeResult: claudeResult(150000, 0.01) }, {});
+    const r = run(d, ["--resume-max-context", "200000"]);
+    const rev = reviewT(d);
+    check("--resume-max-context above the context keeps resuming (one session)", r.code === 0 && new Set(rev.map((t) => t.sessionId)).size === 1 && !r.err.includes("fresh session"), `${r.code} ${rev.map((t) => t.sessionId).join(",")}`);
+    reviewFixture(d, { claudeResult: claudeResult(50000, 0.01) }, {});
+    const d2 = setup0(d);
+    const low = run(d2);
+    check("default threshold: a 50K context keeps resuming", low.code === 0 && reviewT(d2).length === 3 && new Set(reviewT(d2).map((t) => t.sessionId)).size === 1 && !low.err.includes("fresh session"), `${low.code} ${reviewT(d2).length} ${low.err.slice(-900)}`);
+    const bad = run(d, ["--resume-max-context", "0", "--dry-run"]);
+    check("invalid --resume-max-context exits 2", bad.code === 2, bad.err.slice(-200));
+  } finally { rmSync(d.base, { recursive: true, force: true }); }
+
+  const miss = transcriptRow("t.json", { prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200000 }, total_cost_usd: 0.5 }) });
+  const hit = transcriptRow("t.json", { prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 200000, cache_creation_input_tokens: 1000 }, total_cost_usd: 0.1 }) });
+  check("transcriptRow flags !MISS when cache_write exceeds cache_read", miss?.flags.includes("!MISS") && !hit?.flags.includes("!MISS"), JSON.stringify([miss?.flags, hit?.flags]));
+  const m = scratch();
+  try {
+    mkdirSync(join(m.data, "transcripts"), { recursive: true });
+    writeFileSync(join(m.data, "transcripts", "a.json"), JSON.stringify({ prompt: "Run the review stage for the sw_dev workflow.", stdout: JSON.stringify({ num_turns: 2, usage: { input_tokens: 5, output_tokens: 10, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200000 }, total_cost_usd: 0.5 }) }));
+    const cr = spawnSync(process.execPath, [RUNNER, "cost", "--data-dir", m.data], { encoding: "utf8" });
+    check("cost report shows !MISS and explains it in the footer", cr.status === 0 && /^review .*!MISS/m.test(cr.stdout) && /!MISS = cache_write above cache_read/.test(cr.stdout), cr.stdout + cr.stderr);
+  } finally { rmSync(m.base, { recursive: true, force: true }); }
+}
+// reuse a scratch (fresh data dir, same fixtures/repo) for a second run
+function setup0(s) { return { ...s, data: s.data + "-2" }; }
+
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

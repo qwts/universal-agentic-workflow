@@ -115,6 +115,16 @@ function resolveMaxTurns(stageDef) {
   return v;
 }
 
+/** max_cost_usd: optional per-stage cap on the summed cost of the stage's attempts (runner `--max-cost-usd` is the run-wide one). */
+function resolveMaxCostUsd(stageDef) {
+  const v = stageDef.max_cost_usd;
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+    fail(`Stage "${stageDef.name}": max_cost_usd must be a positive number, got ${JSON.stringify(v)}.`);
+  }
+  return v;
+}
+
 const QUESTION_POLICY_ORDER = ["minimal", "standard", "aggressive"];
 const EVIDENCE_THRESHOLD_ORDER = ["low", "standard", "high"];
 
@@ -374,6 +384,7 @@ function cmdListStages(db) {
       maxRetries: max_retries ?? 2,
       retryMode: retry_mode,
       maxTurns: resolveMaxTurns(stageDef),
+      maxCostUsd: resolveMaxCostUsd(stageDef),
       onGateFailure: on_gate_failure ?? "retry",
       gated: gated !== false,
       conditional: conditional === true,
@@ -428,6 +439,7 @@ function cmdGatePrescriptions() {
     max_retries: s.max_retries ?? 2,
     retry_mode: s.retry_mode ?? "resume",
     max_turns: resolveMaxTurns(s),
+    max_cost_usd: resolveMaxCostUsd(s),
     checks: (s.gate?.checks ?? []).map((c) => ({ type: c.type, label: c.label ?? null, prescription: prescribeCheck(c, null) })),
   }));
   process.stdout.write(JSON.stringify({ workflow, stages: out }, null, 2) + "\n");

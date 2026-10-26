@@ -8,6 +8,8 @@
  * Files are written under `cwd`. A non-zero exitCode yields ok:false.
  * turnsNeeded (optional): turns the stage would take; above opts.maxTurns the call fails with "max turns (N) exceeded".
  * delayMs simulates a slow stage (used to exercise timeoutMs).
+ * claudeResult (optional): a claude-code style result ({ num_turns, usage, total_cost_usd, ... }) stored as the
+ * transcript's stdout so cost.mjs can read usage from it; `stdout` returned to the runner stays the plain text.
  * attempts (optional): per-invocation variants. The Nth call for a fixture path uses
  * attempts[N-1] (the last entry repeats). The call count lives in `<dataDir>/fake-attempts.json`
  * so it survives separate adapter calls. Without `attempts` the top-level fields apply.
@@ -90,7 +92,8 @@ export async function invokeStage(opts, extra = {}) {
   const exitCode = fx.exitCode ?? 0;
   const stdout = fx.transcript ?? "";
   const transcriptPath = writeTranscript(dataDir, {
-    adapter: name, prompt: opts.prompt, sessionId: sid, exitCode, stdout, files: Object.keys(fx.files ?? {}),
+    adapter: name, prompt: opts.prompt, sessionId: sid, exitCode,
+    stdout: fx.claudeResult ? JSON.stringify({ result: stdout, ...fx.claudeResult }) : stdout, files: Object.keys(fx.files ?? {}),
   });
   const res = { ok: exitCode === 0, sessionId: sid, transcriptPath, stdout, exitCode, usage: null };
   if (exitCode !== 0) res.error = `fake adapter: fixture exitCode ${exitCode}`;
