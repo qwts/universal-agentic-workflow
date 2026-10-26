@@ -49,7 +49,7 @@ const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
 const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings, so `resume` keeps them
-// Mirrors VALID_PHASES in uwf-state-manager/state.mjs (used to roll the phase back on --from-stage).
+// Mirrors VALID_PHASES in uwf-state-manager/state.mjs (canonical order; each workflow visits a subsequence of it).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
 
@@ -219,6 +219,12 @@ async function main(argv) {
       const r = cli(TRACKER, ["read", "--workflow", workflow], withOut);
       return r.ok && Array.isArray(r.data?.state) ? r.data.state : [];
     };
+    // The phases this workflow visits, in order (planning-only workflows have no execution phase).
+    // Passed to the state manager so it accepts exactly the advances this sequence implies.
+    const phaseSeq = [...new Set(stages.map((s) => s.advancesTo).filter((p) => PHASES.includes(p)))]
+      .sort((a, b) => PHASES.indexOf(a) - PHASES.indexOf(b));
+    const phaseFlags = phaseSeq.length ? ["--phases", phaseSeq.join(",")] : [];
+    const nextPhase = (cur) => phaseSeq.find((p) => PHASES.indexOf(p) > PHASES.indexOf(cur));
     const readPhase = () => cli(STATE, ["read"], withOut).data?.state?.phase ?? null;
     const tableRows = (tracked) => stages.map((st) => {
       const t = tracked.find((x) => x.stage === st.name);
@@ -253,8 +259,8 @@ async function main(argv) {
         return;
       }
       while (PHASES.indexOf(cur) < PHASES.indexOf(reached)) {
-        const next = PHASES[PHASES.indexOf(cur) + 1];
-        const a = cli(STATE, ["advance", "--to", next, "--agent", AGENT_ID, "--note", `runner resume: phase reconciled to ${next}`], withOut);
+        const next = nextPhase(cur) ?? reached;
+        const a = cli(STATE, ["advance", "--to", next, "--agent", AGENT_ID, "--note", `runner resume: phase reconciled to ${next}`, ...phaseFlags], withOut);
         if (!a.ok) { log(`[runner] phase reconcile to "${next}" not applied: ${a.error}`); return; }
         cur = next;
       }
@@ -318,7 +324,7 @@ async function main(argv) {
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
       repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
-      resetFrom, rollbackPhase, resuming: command === "resume" });
+      resetFrom, rollbackPhase, phaseFlags, resuming: command === "resume" });
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
@@ -330,7 +336,7 @@ async function main(argv) {
  */
 async function stageLoop(ctx) {
   const { command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, resuming } = ctx;
+    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, phaseFlags, resuming } = ctx;
   let first = true;
   // Run-total cost covers this run's transcripts only. A fresh `run` leaves older transcripts in the data dir untouched
   // but does not count them; `resume` and `run --from-stage` continue the same run, so what is already there counts.
@@ -504,7 +510,7 @@ async function stageLoop(ctx) {
           // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
           const had = [...findings].filter(([, v]) => v.from === st.name);
           if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
-          const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
+          const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
           if (adv) row.result += ` (${adv})`;
           if (over) return capStop(`${st.name} passed`);
           break;
@@ -565,7 +571,7 @@ async function stageLoop(ctx) {
         cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`, ...sessionArgs(sessionId)], withOut);
         row.result = "skipped (gate failed)";
         // A skipped stage still moves the workflow forward, as stage-tracker does.
-        const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name) : null;
+        const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
         if (adv) row.result += ` (${adv})`;
         if (over) return capStop(`${st.name} skipped (gate failed)`);
         break;
@@ -587,10 +593,10 @@ async function stageLoop(ctx) {
   rmSync(routingPath, { force: true });
   return finish(EXIT.OK, rows, "workflow complete", note);
 
-  function advancePhase(target, stageName) {
+  function advancePhase(target, stageName, phaseFlags) {
     const cur = cli(STATE, ["read"], withOut);
     if (cur.ok && cur.data?.state?.phase === target) return null;
-    const a = cli(STATE, ["advance", "--to", target, "--agent", AGENT_ID, "--note", `stage ${stageName} passed`], withOut);
+    const a = cli(STATE, ["advance", "--to", target, "--agent", AGENT_ID, "--note", `stage ${stageName} passed`, ...phaseFlags], withOut);
     if (a.ok) return `phase→${target}`;
     log(`[runner] phase "${target}" not applied after ${stageName}: ${a.error}`);
     return `phase ${target} not applied`;

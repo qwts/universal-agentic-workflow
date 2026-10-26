@@ -48,7 +48,7 @@ Agents must never write to the database directly. Call the script via terminal a
 |---|---|
 | `read` | Read current state |
 | `init [--mode <mode>]` | Initialize fresh DB — clears all data and resets to `idea` |
-| `advance --to <phase> --agent <id> [--note <text>] [--force]` | Advance to next phase |
+| `advance --to <phase> --agent <id> [--note <text>] [--phases <a,b,c>] [--force]` | Advance to the next phase of the workflow (see below) |
 | `rollback --to <phase> --agent <id> [--note <text>]` | Roll back to earlier phase |
 | `set-agent --agent <id> [--force]` | Claim the agent token |
 | `release-agent` | Release the agent token |
@@ -124,13 +124,15 @@ Defined by `workflow-schema.yaml`.
 idea → intake → discovery → planning → execution → acceptance → snapshot → closed
 ```
 
+This is the canonical chain, used when `advance` gets no `--phases`. A workflow that does not visit every phase (the planning-only personas `project_manager` and `solutions_architect` have no `execution`) passes the phases it visits, in lifecycle order, as `--phases intake,discovery,planning,acceptance,snapshot,closed`; the legal next phase is then the first listed phase after the current one, so `planning → acceptance` is legal there but still rejected for `sw_dev`, whose sequence contains `execution`. The runner derives the list from the ordered `advances_phase_to` values of the workflow's `stages.yaml`. Moving backwards or skipping a phase inside the sequence is always rejected without `--force`; `rollback` is unaffected.
+
 ---
 
 ## Validation rules
 - `phase` must be one of: `idea`, `intake`, `discovery`, `planning`, `execution`, `acceptance`, `snapshot`, `closed`.
 - `status` must be one of: `idle`, `active`, `blocked`.
 - `workflow_history` is append-only — never remove or mutate existing rows.
-- Phase advances must follow lifecycle order unless `--force` is supplied.
+- Phase advances must follow the workflow's phase sequence (`--phases`, default: the canonical chain) unless `--force` is supplied.
 - All writes are wrapped in SQLite transactions — no partial state.
 
 ---
