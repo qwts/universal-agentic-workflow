@@ -663,7 +663,7 @@ function evaluateGate(stageDef, stageName) {
       failures.push(failure); prescriptions.push(prescribeCheck(check, failure));
       const seen = verdictOfCheck(check, failure);
       if (seen !== null) verdict = seen;
-      else if (!(check.type === "require_contains" && /^verdict:/i.test(check.text ?? ""))) otherFailure = true;
+      else if (!(check.type === "require_contains" && /^verdict:/i.test(check.text ?? "") && markdownVerdict(resolveTemplates(check.path)) !== null)) otherFailure = true; // no verdict line at all: incomplete output, retry
     }
   }
 
