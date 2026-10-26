@@ -50,6 +50,16 @@ try {
   const taken = await runOne("after-crash", { UWF_ADR_TEST_DELAY_MS: "" });
   check("old claim with a dead owner: reclaimed and the number assigned", taken.code === 0 && taken.number === next, JSON.stringify(taken));
   check("no claim files left behind (2)", readdirSync(dir).every((f) => !f.endsWith(".claim")), readdirSync(dir).join(","));
+
+  // Many callers race one dead-owner claim: reclamation is serialized, numbers stay distinct, nothing is left behind.
+  const next2 = String(N + 2).padStart(4, "0");
+  writeFileSync(join(dir, `.adr-${next2}.claim`), JSON.stringify({ pid: dead.pid ?? 2147483646, token: "crashed-2" }));
+  utimesSync(join(dir, `.adr-${next2}.claim`), aged, aged);
+  const racers = await Promise.all(Array.from({ length: 8 }, (_, i) => runOne(`race-${i}`)));
+  const rnums = racers.map((r) => Number(r.number)).sort((a, b) => a - b);
+  check("race over a dead claim: all succeeded", racers.every((r) => r.code === 0 && r.ok), JSON.stringify(racers.filter((r) => r.code !== 0)));
+  check("race over a dead claim: numbers distinct and consecutive", new Set(rnums).size === 8 && rnums.every((n, i) => n === N + 2 + i), rnums.join(","));
+  check("race over a dead claim: no claim or mutex left behind", !readdirSync(dir).some((f) => f.endsWith(".claim") || f === ".adr-reclaim"), readdirSync(dir).join(","));
 } finally { rmSync(dir, { recursive: true, force: true }); }
 console.log(failures ? `\n${failures} check(s) FAILED` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

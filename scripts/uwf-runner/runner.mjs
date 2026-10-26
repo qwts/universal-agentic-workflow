@@ -121,20 +121,31 @@ function acquireRunLock(dataDir, workflow) {
 const TAKEOVER_STALE_MS = 10_000;
 
 /**
- * Serialize stale-lock takeover with a mutex directory (mkdir is atomic and fails with EEXIST).
- * Returns false when another runner holds it (caller backs off and re-inspects). A mutex left by
- * a crash (older than TAKEOVER_STALE_MS; the critical section is a few syscalls) is removed.
+ * Serialize stale-lock takeover with a mutex directory (mkdir is atomic and fails with EEXIST)
+ * that records its owner pid. Returns false when another runner holds it (caller backs off and
+ * re-inspects). A mutex is reclaimed only when its owner pid is dead, or when it has no readable
+ * owner and is older than TAKEOVER_STALE_MS; age alone never displaces a live (suspended) owner,
+ * and cleanup removes the mutex only while this process still owns it.
  */
 function withTakeoverMutex(lockPath, fn) {
   const mutex = `${lockPath}.takeover`;
+  const ownerFile = join(mutex, "owner");
+  const ownerPid = () => { try { return Number(readFileSync(ownerFile, "utf8")); } catch { return null; } };
   try {
     mkdirSync(mutex);
   } catch (e) {
     if (e.code !== "EEXIST") throw e;
-    try { if (Date.now() - statSync(mutex).mtimeMs > TAKEOVER_STALE_MS) rmSync(mutex, { recursive: true, force: true }); } catch { /* vanished */ }
+    const pid = ownerPid();
+    const dead = Number.isInteger(pid) && pid > 0 ? !pidAlive(pid) : false;
+    let old = false;
+    try { old = Date.now() - statSync(mutex).mtimeMs > TAKEOVER_STALE_MS; } catch { /* vanished */ }
+    if (dead || (pid === null && old)) { try { if (ownerPid() === pid) rmSync(mutex, { recursive: true, force: true }); } catch { /* vanished */ } }
     return false;
   }
-  try { fn(); return true; } finally { rmSync(mutex, { recursive: true, force: true }); }
+  writeFileSync(ownerFile, String(process.pid));
+  try { fn(); return true; } finally {
+    if (ownerPid() === process.pid) rmSync(mutex, { recursive: true, force: true });
+  }
 }
 
 function pidAlive(pid) {

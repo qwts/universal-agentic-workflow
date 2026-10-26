@@ -33,7 +33,7 @@
 import Database from "better-sqlite3";
 import yaml from "js-yaml";
 import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, statSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -170,6 +170,43 @@ function claimReclaimable(claim) {
   return !(owner && Number.isInteger(owner.pid) && pidAlive(owner.pid));
 }
 
+const RECLAIM_STALE_MS = 10_000;
+
+/**
+ * Remove a dead-owner claim under a reclaim mutex (a directory: mkdir is atomic) that records its
+ * owner pid, re-checking inside it that the claim is still the very one inspected (same token) and
+ * still reclaimable. A delayed reclaimer can therefore never unlink a replacement claim that a live
+ * caller created meanwhile. The mutex is reclaimed only when its owner pid is dead, or when it has no
+ * readable owner and is older than RECLAIM_STALE_MS. Returns true when the claim was removed.
+ */
+function reclaimClaim(outputDir, claim) {
+  if (!claimReclaimable(claim)) return false;
+  const mutex = join(outputDir, ".adr-reclaim");
+  const ownerFile = join(mutex, "owner");
+  const ownerPid = () => { try { return Number(readFileSync(ownerFile, "utf8")); } catch { return null; } };
+  try {
+    mkdirSync(mutex);
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+    const pid = ownerPid();
+    const dead = Number.isInteger(pid) && pid > 0 ? !pidAlive(pid) : false;
+    let old = false;
+    try { old = Date.now() - statSync(mutex).mtimeMs > RECLAIM_STALE_MS; } catch { /* vanished */ }
+    if (dead || (pid === null && old)) { try { if (ownerPid() === pid) rmSync(mutex, { recursive: true, force: true }); } catch { /* vanished */ } }
+    return false;
+  }
+  writeFileSync(ownerFile, String(process.pid));
+  try {
+    const seen = readClaim(claim);
+    if (!claimReclaimable(claim)) return false;
+    if (readClaim(claim)?.token !== seen?.token) return false; // replaced since we looked: not ours to remove
+    try { unlinkSync(claim); } catch { return false; }
+    return true;
+  } finally {
+    if (ownerPid() === process.pid) rmSync(mutex, { recursive: true, force: true });
+  }
+}
+
 /**
  * Atomically reserve the next ADR number and write its scaffold. Concurrent callers (parallel
  * fronts on one repo) never receive the same number: a claim file `.adr-NNNN.claim` is created
@@ -194,8 +231,7 @@ function reserveAdr(db, outputDir, title, decision, today) {
       fd = openSync(claim, "wx");
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
-      if (claimReclaimable(claim)) { try { unlinkSync(claim); } catch { /* the holder just released it */ } }
-      else sleepMs(5 + Math.random() * 20); // a live holder is still writing: back off, then rescan
+      if (!reclaimClaim(outputDir, claim)) sleepMs(5 + Math.random() * 20); // a live holder is still writing: back off, then rescan
       continue;
     }
     try {
