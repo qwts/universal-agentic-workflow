@@ -89,6 +89,8 @@ await test("permissions mapping", () => {
   assert.equal(mapPermissions(["agent", "todo", "search", "read"]), "read-only");
   assert.equal(mapPermissions(["agent", "read", "edit", "search"]), "edit");
   assert.equal(mapPermissions(["read", "edit", "execute", "web"]), "edit+exec");
+  assert.equal(mapPermissions(["agent", "read"], ["node .github/skills/uwf-review/reviews.mjs"]), "read-only+review");
+  assert.equal(mapPermissions(["agent", "read"], ["rm -rf"]), "read-only");
 });
 
 await test("unknown stage exits 2", () => {

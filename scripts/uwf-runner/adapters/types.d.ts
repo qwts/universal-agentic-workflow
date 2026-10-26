@@ -2,7 +2,7 @@
  * UWF harness adapter contract (types only). See ../README.md.
  */
 
-export type Permissions = "read-only" | "edit" | "edit+exec";
+export type Permissions = "read-only" | "edit" | "edit+exec" | "read-only+review";
 
 export interface InvokeStageOptions {
   /** .github/agents/<name>.agent.md; its body (frontmatter stripped) is prepended to systemPrompt. */

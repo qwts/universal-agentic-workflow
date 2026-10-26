@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 
 /**
- * @typedef {"read-only"|"edit"|"edit+exec"} Permissions
+ * @typedef {"read-only"|"edit"|"edit+exec"|"read-only+review"} Permissions
  * @typedef {{ inputTokens: number, outputTokens: number }} Usage
  * @typedef {object} InvokeStageOptions
  * @property {string} [agentFile] agent .md whose body becomes part of the system prompt

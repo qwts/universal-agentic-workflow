@@ -13,6 +13,7 @@
  *   read-only  -> Read,Grep,Glob
  *   edit       -> + Edit,Write
  *   edit+exec  -> + Bash
+ *   read-only+review -> Read,Grep,Glob + Bash restricted to `node .github/skills/uwf-review/reviews.mjs:*`
  */
 
 import { spawn } from "node:child_process";
@@ -24,6 +25,13 @@ const TOOLS = {
   "read-only": ["Read", "Grep", "Glob"],
   edit: ["Read", "Grep", "Glob", "Edit", "Write"],
   "edit+exec": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+  "read-only+review": ["Read", "Grep", "Glob", "Bash"],
+};
+
+// --allowedTools entries when they differ from the tool set: the reviewer gets Bash, but only
+// the review script's own bookkeeping command is pre-approved (dontAsk denies everything else).
+const ALLOWED = {
+  "read-only+review": ["Read", "Grep", "Glob", "Bash(node .github/skills/uwf-review/reviews.mjs:*)"],
 };
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts @returns {Promise<import("./index.mjs").InvokeStageResult>} */
@@ -52,7 +60,7 @@ export async function invokeStage(opts) {
   // needed: dontAsk keeps the user's own pre-approved tools unless --tools
   // narrows the set, so a read-only stage must not depend on ambient settings.
   const toolList = TOOLS[permissions].join(",");
-  args.push("--permission-mode", "dontAsk", "--setting-sources", "project", "--tools", toolList, "--allowedTools", toolList);
+  args.push("--permission-mode", "dontAsk", "--setting-sources", "project", "--tools", toolList, "--allowedTools", (ALLOWED[permissions] ?? TOOLS[permissions]).join(","));
 
   return new Promise((done) => {
     let out = "", err = "", timedOut = false, settled = false;

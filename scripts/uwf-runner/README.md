@@ -14,7 +14,7 @@ const r = await adapter.invokeStage({
 // r = { ok, sessionId, transcriptPath, stdout, exitCode, usage|null, costUsd?, error? }
 ```
 
-- `permissions`: `read-only` | `edit` | `edit+exec` (adapter maps to harness tool/permission flags).
+- `permissions`: `read-only` | `edit` | `edit+exec` | `read-only+review` (read tools plus only `node .github/skills/uwf-review/reviews.mjs`; adapter maps to harness tool/permission flags).
 - `sessionId` in -> same `sessionId` out (resume across gate retries).
 - Transcript is written to `<dataDir>/transcripts/<timestamp>.json`;
   `dataDir` defaults to `UWF_DATA_DIR`, else `./tmp/uwf`.
@@ -48,6 +48,7 @@ Command: `codex exec --cd <cwd> [--model m] --json -c sandbox_mode=".." -c appro
 | `read-only` | `sandbox_mode="read-only"` |
 | `edit` | `sandbox_mode="workspace-write"` |
 | `edit+exec` | `sandbox_mode="workspace-write"` |
+| `read-only+review` | `sandbox_mode="workspace-write"` (review DB must be writable; the command limit is prompt-enforced) |
 
 Never uses `danger-full-access` or `--dangerously-bypass-*`.
 

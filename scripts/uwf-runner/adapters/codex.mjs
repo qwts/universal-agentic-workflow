@@ -13,6 +13,8 @@
  *   read-only  -> sandbox_mode="read-only"
  *   edit       -> sandbox_mode="workspace-write"
  *   edit+exec  -> sandbox_mode="workspace-write"
+ *   read-only+review -> sandbox_mode="workspace-write" (the review DB must be writable; the
+ *                      read-only-on-the-repo rule is enforced by the agent prompt, not the sandbox)
  * Codex has no per-tool allowlist: commands always run inside the sandbox, so `edit` and
  * `edit+exec` are identical here (see README). approval_policy="never" keeps a headless run
  * from blocking on a prompt; commands that need more than the sandbox allows simply fail.
@@ -35,7 +37,7 @@ import { buildSystemPrompt, writeTranscript } from "./index.mjs";
 
 export const name = "codex";
 
-const SANDBOX = { "read-only": "read-only", edit: "workspace-write", "edit+exec": "workspace-write" };
+const SANDBOX = { "read-only": "read-only", edit: "workspace-write", "edit+exec": "workspace-write", "read-only+review": "workspace-write" };
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts @returns {Promise<import("./index.mjs").InvokeStageResult>} */
 export async function invokeStage(opts) {

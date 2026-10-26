@@ -199,10 +199,17 @@ export function parseAgentFile(yaml, text) {
 }
 
 /** Copilot tool names -> adapter permission preset. `agent`, `todo`, `web`, ... are ignored. */
-export function mapPermissions(tools) {
+export const REVIEW_SCRIPT_COMMAND = "node .github/skills/uwf-review/reviews.mjs";
+
+/**
+ * `allowedCommands` is the agent frontmatter `allowed-commands` list. A read-only agent that lists
+ * the review script gets the `read-only+review` preset: read tools plus that one command, nothing else.
+ */
+export function mapPermissions(tools, allowedCommands) {
   const t = new Set((Array.isArray(tools) ? tools : []).map((x) => String(x).toLowerCase()));
   if (t.has("execute")) return "edit+exec";
   if (t.has("edit")) return "edit";
+  if ((Array.isArray(allowedCommands) ? allowedCommands : []).includes(REVIEW_SCRIPT_COMMAND)) return "read-only+review";
   return "read-only";
 }
 
@@ -336,7 +343,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     agentName: frontmatter.name ?? agentName,
     systemPrompt: body,
     prompt,
-    permissions: mapPermissions(frontmatter.tools),
+    permissions: mapPermissions(frontmatter.tools, frontmatter["allowed-commands"]),
     model: stageDef.model ?? null,
     inputs,
     inputsMissing,
