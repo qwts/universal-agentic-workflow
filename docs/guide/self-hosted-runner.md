@@ -40,7 +40,7 @@ Flags:
 
 What it does, in order: install Node 24 (nvm if present, else Homebrew on macOS, else nvm on Linux), `npm i -g` the two
 CLIs, install `gh` (Homebrew, apt or dnf), confirm `gh auth status` as the bot, download the runner for the platform and
-architecture, write the API keys and a `PATH` into the runner's `.env` (mode 600), register with
+architecture, write `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY` (set from `OPENAI_API_KEY` unless you export it; it is what `codex exec` reads headlessly) and a `PATH` covering the directories of node, npm, claude, codex and gh into the runner's `.env` (mode 600), register with
 `config.sh --unattended`, run `./svc.sh install && ./svc.sh start`, then run the doctor.
 
 It is idempotent: every step checks current state first (installed tools, unpacked runner, `.runner`, `.service`,
@@ -82,10 +82,11 @@ A running job is reported as a warning (the runner is busy, not broken); `--stri
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | yes, only if a workflow step needs it directly | yes: `<runner dir>/.env`, written by provisioning |
 | `OPENAI_API_KEY` | same | same |
+| `CODEX_API_KEY` | no | yes: `.env`, derived from `OPENAI_API_KEY` by provisioning |
 | Bot GitHub token | yes, as `UWF_BOT_TOKEN` for workflow steps that call `gh` | provisioning shell only (not stored on disk) |
 
 The runner service does not load shell profiles; it reads `<runner dir>/.env`. That is why provisioning writes the API
-keys and a `PATH` that finds Node there. The bot token is needed only while provisioning and when running the doctor;
+keys and a `PATH` that resolves every required CLI there (the doctor checks this PATH, not just your shell's). The bot token is needed only while provisioning and when running the doctor;
 jobs receive it from repo Actions secrets.
 
 ### Deliberately not used

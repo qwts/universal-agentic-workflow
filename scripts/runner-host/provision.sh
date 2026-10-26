@@ -204,12 +204,21 @@ fi
 
 step "7. service environment: API keys and PATH into $DIR/.env (mode 600, values not printed)"
 if [ "$DRY" -eq 1 ]; then
-  echo "+ write ANTHROPIC_API_KEY, OPENAI_API_KEY, PATH to $DIR/.env"
+  echo "+ write ANTHROPIC_API_KEY, OPENAI_API_KEY, CODEX_API_KEY, PATH (dirs of node/npm/claude/codex/gh) to $DIR/.env"
 else
-  NODE_BIN="$(dirname "$(command -v node)")"
+  # Service PATH: the directory of every required CLI as resolved now (so CLIs installed
+  # elsewhere, e.g. ~/.local/bin, stay reachable), then the usual system directories.
+  SVC_PATH=""
+  for cli in node npm claude codex gh; do
+    d="$(dirname "$(command -v "$cli")")"
+    case ":$SVC_PATH:" in *":$d:"*) ;; *) SVC_PATH="${SVC_PATH:+$SVC_PATH:}$d" ;; esac
+  done
+  SVC_PATH="$SVC_PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   set_env_line "$DIR/.env" ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
   set_env_line "$DIR/.env" OPENAI_API_KEY "$OPENAI_API_KEY"
-  set_env_line "$DIR/.env" PATH "$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  # codex exec authenticates headlessly via CODEX_API_KEY; same key as OPENAI_API_KEY unless overridden
+  set_env_line "$DIR/.env" CODEX_API_KEY "${CODEX_API_KEY:-$OPENAI_API_KEY}"
+  set_env_line "$DIR/.env" PATH "$SVC_PATH"
   echo "ok: $DIR/.env up to date"
 fi
 

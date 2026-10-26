@@ -75,11 +75,26 @@ env_has() { # env_has KEY : set in environment or in the runner's .env
   [ -n "${!key:-}" ] && return 0
   [ -f "$DIR/.env" ] && grep -Eq "^$key=.+" "$DIR/.env"
 }
-for key in ANTHROPIC_API_KEY OPENAI_API_KEY; do
+for key in ANTHROPIC_API_KEY OPENAI_API_KEY CODEX_API_KEY; do
   if env_has "$key"; then ok "$key present (value not shown)"; else
-    fail "missing: $key - run: export $key=<key> and re-run scripts/runner-host/provision.sh (writes it to $DIR/.env)"
+    if [ "$key" = CODEX_API_KEY ]; then
+      fail "missing: CODEX_API_KEY (what `codex exec` reads) - run: export OPENAI_API_KEY=<key> and re-run scripts/runner-host/provision.sh (writes CODEX_API_KEY to $DIR/.env)"
+    else
+      fail "missing: $key - run: export $key=<key> and re-run scripts/runner-host/provision.sh (writes it to $DIR/.env)"
+    fi
   fi
 done
+
+# ---- the service environment must be able to resolve the CLIs ----------------
+
+if [ -f "$DIR/.env" ] && grep -q '^PATH=' "$DIR/.env"; then
+  svc_path="$(grep '^PATH=' "$DIR/.env" | tail -n 1)"; svc_path="${svc_path#PATH=}"
+  for cli in node claude codex gh; do
+    if ! PATH="$svc_path" command -v "$cli" >/dev/null 2>&1; then
+      fail "unreachable: $cli is not on the runner service PATH in $DIR/.env - run: re-run scripts/runner-host/provision.sh (rewrites PATH) then restart the service"
+    fi
+  done
+fi
 
 # ---- disk ----------------------------------------------------------------
 
