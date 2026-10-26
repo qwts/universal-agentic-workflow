@@ -23,10 +23,19 @@ permissions:
 
 jobs:
   uwf:
-    if: ${{ contains(github.event.pull_request.labels.*.name, 'uwf:run') || contains(github.event.pull_request.body, '/uwf run') }}
+    # Runs cost money: an edit starts a run only when it newly adds `/uwf run` to the description.
+    if: >-
+      ${{
+        (github.event.action != 'edited'
+          && (contains(github.event.pull_request.labels.*.name, 'uwf:run')
+              || contains(github.event.pull_request.body, '/uwf run')))
+        || (github.event.action == 'edited'
+            && contains(github.event.pull_request.body, '/uwf run')
+            && !contains(github.event.changes.body.from || '', '/uwf run'))
+      }}
     uses: qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml@main
     with:
-      model: claude-sonnet-4-5   # required; use the model id your adapter accepts
+      model: claude-haiku-5-5    # required; the model id your adapter accepts
       # workflow: sw_dev          # default
       # adapter: claude-code      # default
       # max_cost_usd: 1           # default
@@ -38,7 +47,7 @@ Then create the label `uwf:run` in the consumer repo (`gh label create uwf:run`)
 actions and reusable workflows may run, allow `qwts/universal-agentic-workflow/.github/workflows/uwf-on-pr.yml`.
 
 A PR starts a run when it carries the label `uwf:run` or its description contains `/uwf run`. Adding the label to an
-already open PR starts a run through the `labeled` event; a push to a PR that already qualifies starts a new one, and so does editing the description to add `/uwf run` (the `edited` event; any later edit of a qualifying PR also restarts the run).
+already open PR starts a run through the `labeled` event; a push to a PR that already qualifies starts a new one, and so does editing the description to add `/uwf run` (the `edited` event). Other edits of a qualifying PR do not restart the run; the caller's condition checks that `/uwf run` was not already in the previous description, because every run spends model budget.
 PRs from forks never run: the job is skipped, because it would execute untrusted code on a self-hosted machine.
 
 ## Inputs
