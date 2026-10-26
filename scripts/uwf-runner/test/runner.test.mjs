@@ -10,7 +10,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { transcriptRow } from "../cost.mjs";
 
@@ -51,6 +51,20 @@ function run(s, extraArgs = [], extraEnv = {}) {
     env: { ...process.env, UWF_FAKE_FIXTURE_DIR: s.fixtures, UWF_DATA_DIR: "", ...extraEnv },
   });
   return { code: r.status, out: r.stdout, err: r.stderr };
+}
+
+/** Same as run(), but concurrent: resolves when the runner exits. */
+function runAsync(s, extraArgs = [], extraEnv = {}) {
+  return new Promise((res) => {
+    const p = spawn(process.execPath, [RUNNER, "run", "--workflow", "sw_dev", "--goal", "Add a widget",
+      "--repo-root", s.repo, "--data-dir", s.data, ...extraArgs], {
+      env: { ...process.env, UWF_FAKE_FIXTURE_DIR: s.fixtures, UWF_DATA_DIR: "", ...extraEnv },
+    });
+    let out = "", err = "";
+    p.stdout.on("data", (d) => { out += d; });
+    p.stderr.on("data", (d) => { err += d; });
+    p.on("close", (code) => res({ code, out, err }));
+  });
 }
 
 function skillJson(script, args, s) {
@@ -1071,6 +1085,16 @@ const countInvocations = (s, stage) => transcripts(s).filter((t) => t.prompt.inc
     const r4 = run(s);
     check("old unreadable lock: replaced and run completes", r4.code === 0, `${r4.code} ${r4.err.slice(-400)}`);
     check("lock removed on exit (2)", !existsSync(lock));
+    // Contended takeover: six runners race one stale lock; at most one may hold the data dir at a time.
+    writeFileSync(lock, JSON.stringify({ runId: "crashed-run-2", pid: dead.pid ?? 2147483646, workflow: "sw_dev" }));
+    const racers = Array.from({ length: 6 }, () => runAsync(s));
+    const outcomes = await Promise.all(racers);
+    const winners = outcomes.filter((o) => o.code === 0);
+    const refused = outcomes.filter((o) => o.code === 2 && /in use by run|another run is starting/.test(o.err));
+    check("contended takeover: no runner crashed or got an unexpected code", outcomes.every((o) => o.code === 0 || o.code === 2), outcomes.map((o) => o.code).join(","));
+    // All six reach the lock within a few hundred ms while a fake run holds it for seconds: exactly one may win.
+    check("contended takeover: exactly one runner won and the rest were refused", winners.length === 1 && refused.length === outcomes.length - 1, `${winners.length} won, ${refused.length} refused; ${outcomes.map((o) => o.err.slice(-120).replace(/\n/g, " ")).join(" || ")}`);
+    check("contended takeover: no mutex or temp files left behind", readdirSync(s.data).filter((f) => f.startsWith("run.lock")).length === 0, readdirSync(s.data).join(","));
   } finally { rmSync(s.base, { recursive: true, force: true }); }
 }
 

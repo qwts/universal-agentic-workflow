@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -64,8 +64,8 @@ const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0
  * (a temp file hard-linked into place: link fails with EEXIST when a lock exists, and no reader
  * ever sees a half-written lock). A lock whose owner pid is dead is taken over; an unreadable lock
  * is waited on while young and treated as stale only when old; a live owner throws a UsageError.
- * Takeover renames the inspected file aside and checks it is still the same inode before
- * discarding it, so a lock that another run created meanwhile is put back, never deleted.
+ * Takeover runs under a mutex directory and removes only the exact inode it inspected, then
+ * returns to the atomic link; a lock another run created meanwhile is never removed or overwritten.
  * Returns a release function that removes only this run's own lock.
  */
 function acquireRunLock(dataDir, workflow) {
@@ -73,7 +73,6 @@ function acquireRunLock(dataDir, workflow) {
   const lockPath = join(dataDir, LOCK_FILE);
   const info = { runId: `${workflow}-${process.pid}-${Date.now()}`, pid: process.pid, workflow, startedAt: new Date().toISOString() };
   const tmp = `${lockPath}.${process.pid}.tmp`;
-  const aside = `${lockPath}.stale.${process.pid}`;
   const readLock = () => { try { return JSON.parse(readFileSync(lockPath, "utf8")); } catch { return null; } };
   const deadline = Date.now() + LOCK_WAIT_MS;
   try {
@@ -99,16 +98,43 @@ function acquireRunLock(dataDir, workflow) {
         sleepMs(50);
         continue;
       }
-      // Stale: move the inspected file aside; if the inode changed, someone replaced it meanwhile.
-      try { renameSync(lockPath, aside); } catch { continue; }
-      try {
-        if (statSync(aside).ino === st.ino) rmSync(aside, { force: true });
-        else renameSync(aside, lockPath); // not the file we inspected: give it back
-      } catch { /* vanished */ }
+      // Stale: take it over under a takeover mutex, so only one runner removes a stale lock at a
+      // time, and only the exact inode it inspected. Nothing is ever renamed or written over a lock:
+      // after the removal we go back to the atomic link, and a runner that got in first wins.
+      if (!withTakeoverMutex(lockPath, () => {
+        let now;
+        try { now = statSync(lockPath); } catch { return; } // already gone
+        if (now.ino !== st.ino) return; // replaced since we inspected it: not ours to remove
+        const owner = readLock();
+        if (owner && Number.isInteger(owner.pid) && pidAlive(owner.pid)) return;
+        rmSync(lockPath, { force: true });
+      })) {
+        if (Date.now() >= deadline) throw new UsageError(`Could not take ${lockPath}; another run is starting on the same --data-dir. Use a distinct --data-dir per parallel front.`);
+        sleepMs(25 + Math.random() * 50);
+      }
     }
   } finally {
     rmSync(tmp, { force: true });
   }
+}
+
+const TAKEOVER_STALE_MS = 10_000;
+
+/**
+ * Serialize stale-lock takeover with a mutex directory (mkdir is atomic and fails with EEXIST).
+ * Returns false when another runner holds it (caller backs off and re-inspects). A mutex left by
+ * a crash (older than TAKEOVER_STALE_MS; the critical section is a few syscalls) is removed.
+ */
+function withTakeoverMutex(lockPath, fn) {
+  const mutex = `${lockPath}.takeover`;
+  try {
+    mkdirSync(mutex);
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+    try { if (Date.now() - statSync(mutex).mtimeMs > TAKEOVER_STALE_MS) rmSync(mutex, { recursive: true, force: true }); } catch { /* vanished */ }
+    return false;
+  }
+  try { fn(); return true; } finally { rmSync(mutex, { recursive: true, force: true }); }
 }
 
 function pidAlive(pid) {
