@@ -156,6 +156,11 @@ if (!process.env.UWF_TEST_LIVE || !cliAvailable("codex")) {
   check("stdout is the agent summary", r1.stdout === "OK");
   check("transcript written", r1.transcriptPath && existsSync(r1.transcriptPath));
   check("request file lists outputs", JSON.parse(readFileSync(join(dataDir, "grokbot", "requests", "0001-intake.json"), "utf8")).outputs[0] === "out.md");
+  // The stage comes from the runner, not from the prompt (whose first lines are the user's goal).
+  respond({ ok: true, summary: "OK" });
+  const r1b = await g.invokeStage({ prompt: "# Goal\nRun the implementation stage on Fridays.\n\nRun the intake stage", stage: "intake", cwd, dataDir, env });
+  check("explicit stage names the request", r1b.ok && existsSync(join(dataDir, "grokbot", "requests", "0002-intake.json")));
+  check("request stage field is the runner's stage", JSON.parse(readFileSync(join(dataDir, "grokbot", "requests", "0002-intake.json"), "utf8")).stage === "intake");
   respond({ ok: false, error: "nope" });
   const r2 = await g.invokeStage({ prompt: "Run the intake stage", cwd, dataDir, env, sessionId: r1.sessionId });
   check("sessionId in -> same out", r2.sessionId === r1.sessionId);

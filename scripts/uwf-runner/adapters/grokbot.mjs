@@ -32,14 +32,16 @@ function nextId(dir) {
   return String(n + 1).padStart(4, "0");
 }
 
-function stageOf(prompt) {
-  const m = /Run the ([\w-]+) stage/.exec(prompt ?? "");
+// The runner passes the stage name; the prompt is only a last resort (it starts with user goal text).
+function stageOf(stage, prompt) {
+  if (stage) return String(stage).replace(/[^\w-]/g, "-");
+  const m = /^Run the ([\w-]+) stage/m.exec(prompt ?? "");
   return m ? m[1] : "stage";
 }
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts */
 export async function invokeStage(opts) {
-  const { prompt, cwd, inputs = [], outputs = [], sessionId, timeoutMs, env, permissions, maxTurns, model } = opts;
+  const { prompt, stage: stageName, cwd, inputs = [], outputs = [], sessionId, timeoutMs, env, permissions, maxTurns, model } = opts;
   const dataDir = resolveDataDir(opts.dataDir ?? env?.UWF_DATA_DIR);
   const fail = (error) => ({ ok: false, sessionId: sessionId ?? null, transcriptPath: null, stdout: "", exitCode: null, usage: null, error });
   let systemPrompt;
@@ -50,10 +52,11 @@ export async function invokeStage(opts) {
   const resDir = join(root, "responses");
   mkdirSync(reqDir, { recursive: true });
   mkdirSync(resDir, { recursive: true });
-  const id = `${nextId(root)}-${stageOf(prompt)}`;
+  const stage = stageOf(stageName, prompt);
+  const id = `${nextId(root)}-${stage}`;
   const sid = sessionId ?? `grokbot-session-${id}`;
   const responsePath = join(resDir, `${id}.json`);
-  const request = { id, stage: stageOf(prompt), cwd, permissions: permissions ?? "edit", model: model ?? null, maxTurns: maxTurns ?? null,
+  const request = { id, stage, cwd, permissions: permissions ?? "edit", model: model ?? null, maxTurns: maxTurns ?? null,
     sessionId: sid, resumed: Boolean(sessionId), inputs, outputs, systemPrompt, prompt, responsePath, createdAt: new Date().toISOString() };
   const md = [`# UWF stage request ${id}`, "", `- stage: ${request.stage}`, `- cwd: ${cwd}`, `- permissions: ${request.permissions}`,
     `- session: ${sid}${request.resumed ? " (resumed: this is a retry; previous work is in place)" : ""}`,

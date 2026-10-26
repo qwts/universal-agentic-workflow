@@ -435,7 +435,7 @@ async function stageLoop(ctx) {
       const env = { UWF_DATA_DIR: dataDir };
       if (fixtureDir) env.UWF_FAKE_FIXTURE = join(fixtureDir, `${st.name}.json`);
       const res = await adapter.invokeStage({
-        systemPrompt: mp.systemPrompt, prompt, cwd: repoRoot, inputs: mp.inputs, outputs: mp.outputsRequired,
+        systemPrompt: mp.systemPrompt, prompt, stage: st.name, cwd: repoRoot, inputs: mp.inputs, outputs: mp.outputsRequired,
         model, sessionId, timeoutMs, env, permissions: mp.permissions, dataDir,
         maxTurns: st.maxTurns,
       });
