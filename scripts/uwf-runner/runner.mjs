@@ -357,6 +357,11 @@ async function stageLoop(ctx) {
       for (const [k, v] of Object.entries(saved.findings ?? {})) findings.set(k, v);
     } catch { /* nothing recorded */ }
   }
+  // Stages skipped (this run or recorded earlier): inputs only they would produce are optional downstream.
+  const recorded = cli(TRACKER, ["read", "--workflow", workflow], withOut);
+  const skippedStages = new Set((recorded.ok && Array.isArray(recorded.data?.state) ? recorded.data.state : [])
+    .filter((x) => x.status === "skipped").map((x) => x.stage));
+  const skipNoted = new Set();
   const visited = new Set();   // stages already invoked in this process (only the first visit may continue a recorded session)
   for (let i = start; i < stages.length; i++) {
     const st = stages[i];
@@ -390,6 +395,7 @@ async function stageLoop(ctx) {
         cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", "condition not met"], withOut);
         log(`${tag} → skipped (${g.data.note})`);
         row.result = "skipped (not required)";
+        skippedStages.add(st.name);
         continue;
       }
     }
@@ -404,8 +410,14 @@ async function stageLoop(ctx) {
     const extraContext = { goal, answeredQuestions: answered.ok ? (answered.data?.questions ?? answered.data?.items ?? []) : [] };
     const fnd = findings.get(st.name);
     const mp = await materializePrompt({ workflow, stage: st.name, repoRoot, skillsRoot, outputPath, dataDir, extraContext,
-      extraInputs: fnd?.files, extraNote: fnd?.note });
+      extraInputs: fnd?.files, extraNote: fnd?.note, skippedStages: [...skippedStages] });
     if (mp.inputsMissing?.length) log(`${tag}: inputs not found: ${mp.inputsMissing.join(", ")}`);
+    // One line per skipped stage for the whole run, not one per downstream stage.
+    for (const sk of new Set((mp.inputsSkipped ?? []).map((x) => x.stage))) {
+      if (skipNoted.has(sk)) continue;
+      skipNoted.add(sk);
+      log(`inputs from skipped stage ${sk} are unavailable: ${mp.inputsSkipped.filter((x) => x.stage === sk).map((x) => x.path).join(", ")}`);
+    }
     const basePrompt = first ? `Goal:\n${goal}\n\n${mp.prompt}` : mp.prompt;
     first = false;
     const model = flags.model ?? mp.model ?? undefined;
@@ -570,6 +582,7 @@ async function stageLoop(ctx) {
       if (st.onGateFailure === "skip") {
         cli(TRACKER, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", `gate failed: ${failures.join("; ")}`, ...sessionArgs(sessionId)], withOut);
         row.result = "skipped (gate failed)";
+        skippedStages.add(st.name);
         // A skipped stage still moves the workflow forward, as stage-tracker does.
         const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
         if (adv) row.result += ` (${adv})`;

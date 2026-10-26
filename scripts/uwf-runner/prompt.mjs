@@ -220,12 +220,20 @@ function personaRole(skills, workflow) {
   return m ? m[1] : null;
 }
 
+/** One line per skipped stage whose outputs are unavailable as inputs. */
+function skippedInputNotes(inputsSkipped) {
+  const by = new Map();
+  for (const { stage, path } of inputsSkipped) by.set(stage, [...(by.get(stage) ?? []), path]);
+  const lines = [...by].map(([stage, paths]) => `inputs from skipped stage ${stage} are unavailable: ${paths.join(", ")}`);
+  return lines.length ? [...lines, ""] : [];
+}
+
 /**
  * Two roots: `skillsRoot` holds workflow definitions, stage contracts, traits, profiles, agent files
  * and SKILL docs (default: this checkout, or UWF_SKILLS_ROOT); `repoRoot` is the target repo the
  * agent works in, where {{cwd}} / {{output_path}} and the artifacts resolve.
  */
-export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot, outputPath, dataDir, extraContext, modelProfile, extraInputs, extraNote } = {}) {
+export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot, outputPath, dataDir, extraContext, modelProfile, extraInputs, extraNote, skippedStages } = {}) {
   repoRoot = resolve(repoRoot ?? DEFAULT_REPO);
   skillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot, workflow }).root;
   // Match stage-tracker.mjs: artifacts live under <data-dir>/workflow-artifacts
@@ -289,11 +297,22 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   const abs = (p) => resolve(repoRoot, p);
   const expand = (p) =>
     /[*?[{]/.test(p) ? globFiles(p, repoRoot).map(abs).sort() : existsSync(abs(p)) ? [abs(p)] : [];
+  // Outputs of skipped stages: a missing input that one of them would have produced is expected, not an error.
+  const skippedOutputs = new Map();
+  for (const sk of skippedStages ?? []) {
+    const def = (stagesDoc.stages ?? []).find((s) => s.name === sk);
+    for (const o of def?.outputs ?? []) if (!skippedOutputs.has(subst(o))) skippedOutputs.set(subst(o), sk);
+  }
   const inputsMissing = [];
+  const inputsSkipped = [];
   const inputBlocks = [];
   for (const p of inputs) {
     const files = expand(p);
     if (files.length === 0) {
+      if (skippedOutputs.has(p)) {
+        inputsSkipped.push({ stage: skippedOutputs.get(p), path: p });
+        continue;
+      }
       inputsMissing.push(p);
       inputBlocks.push(`### ${p}\n(missing)`);
       continue;
@@ -339,6 +358,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     "",
     ...skillFilesNote,
     "## Inputs",
+    ...skippedInputNotes(inputsSkipped),
     inputBlocks.length ? inputBlocks.join("\n\n") : "(none)",
     "",
     ...(extraNote ? ["## Review findings to address", extraNote, ""] : []),
@@ -358,6 +378,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     model: stageDef.model ?? null,
     inputs,
     inputsMissing,
+    inputsSkipped,
     outputsRequired: outputs,
   };
 }

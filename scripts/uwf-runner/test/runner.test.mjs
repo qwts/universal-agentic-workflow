@@ -126,6 +126,9 @@ function transcripts(s) {
     check("stage tracker: 13 passed, adr + security-plan skipped",
       Object.values(rowsByStage).filter((v) => v === "passed").length === 13 && SKIPPED.every((st) => rowsByStage[st] === "skipped"), JSON.stringify(rowsByStage));
     const first = transcripts(s).find((t) => t.prompt.includes("Run the intake stage"));
+    const skipLines = r.err.split("\n").filter((l) => l.includes("inputs from skipped stage adr are unavailable"));
+    check("skipped-stage inputs warned once per run, not per stage", skipLines.length === 1, JSON.stringify(skipLines));
+    check("no per-stage 'inputs not found' for the skipped adr output", !/inputs not found:.*docs\/adr/.test(r.err), r.err.slice(-600));
     check("goal is prepended to the first stage prompt", !!first && first.prompt.startsWith("Goal:\nAdd a widget"));
     check("goal is in the context of later stages", transcripts(s).some((t) => t.prompt.includes("Run the discovery stage") && t.prompt.includes('"goal": "Add a widget"')));
     check("goal is not prepended to later stages", transcripts(s).filter((t) => t.prompt.startsWith("Goal:")).length === 1);

@@ -189,5 +189,30 @@ await test("explicit skillsRoot is honoured and the target's own copy is auto-de
   console.log("ok   glob fallback matches native");
 }
 
+await test("inputs of a skipped stage are optional: not missing, one-line note in the prompt", async () => {
+  const out = mkdtempSync(join(tmpdir(), "uwf-prompt-"));
+  const repo = mkdtempSync(join(tmpdir(), "uwf-prompt-repo-"));
+  const o = { workflow: "sw_dev", stage: "risk-plan", repoRoot: repo, outputPath: out, dataDir: "/DATA", skillsRoot: repoRoot };
+  const adrGlob = `${repo}/docs/adr/ADR-[0-9]*.md`;
+  const skipped = await materializePrompt({ ...o, skippedStages: ["adr"] });
+  assert.ok(!skipped.inputsMissing.includes(adrGlob), `adr input not missing: ${skipped.inputsMissing}`);
+  assert.deepEqual(skipped.inputsSkipped, [{ stage: "adr", path: adrGlob }]);
+  const notes = skipped.prompt.split("\n").filter((l) => l.startsWith("inputs from skipped stage adr are unavailable: "));
+  assert.equal(notes.length, 1, "exactly one note line");
+  assert.ok(notes[0].endsWith(adrGlob));
+  assert.ok(!skipped.prompt.includes(`### ${adrGlob}`), "no (missing) block for the skipped input");
+  // genuinely missing inputs still reported
+  assert.ok(skipped.inputsMissing.some((p) => p.endsWith("issues-intake.md")));
+});
+
+await test("adr not skipped but files absent: still reported missing", async () => {
+  const out = mkdtempSync(join(tmpdir(), "uwf-prompt-"));
+  const repo = mkdtempSync(join(tmpdir(), "uwf-prompt-repo-"));
+  const r = await materializePrompt({ workflow: "sw_dev", stage: "risk-plan", repoRoot: repo, outputPath: out, dataDir: "/DATA", skillsRoot: repoRoot, skippedStages: ["security-plan"] });
+  assert.ok(r.inputsMissing.includes(`${repo}/docs/adr/ADR-[0-9]*.md`), `${r.inputsMissing}`);
+  assert.deepEqual(r.inputsSkipped, []);
+  assert.doesNotMatch(r.prompt, /inputs from skipped stage/);
+});
+
 if (failures) { console.log(`\n${failures} failed`); process.exit(1); }
 console.log("\nall prompt tests passed");
