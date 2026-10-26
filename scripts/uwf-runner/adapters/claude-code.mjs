@@ -7,6 +7,9 @@
  *   --permission-mode dontAsk --allowedTools <list>   (from `permissions`)
  *   --setting-sources project  (help: "Comma-separated list of setting sources
  *     to load (user, project, local)"; a stage never inherits ~/.claude settings)
+ *   --strict-mcp-config --mcp-config <json>  (default `{"mcpServers":{}}`; a stage never inherits the
+ *     user's claude.ai connectors or MCP servers, which cost ~50k tokens of tool schemas per stage.
+ *     Opt in with InvokeStageOptions.mcpConfig: a file path or inline JSON, passed verbatim.)
  * There is no --cwd flag; the working directory is set on the child process.
  *
  * Permission mapping (dontAsk denies anything not allow-listed):
@@ -81,6 +84,9 @@ export async function invokeStage(opts) {
   // narrows the set, so a read-only stage must not depend on ambient settings.
   const toolList = TOOLS[permissions].join(",");
   args.push("--permission-mode", "dontAsk", "--setting-sources", "project", "--tools", toolList, "--allowedTools", (permissions === "read-only+review" ? reviewAllowed(opts) : TOOLS[permissions]).join(","));
+
+  // --setting-sources does not exclude claude.ai connectors, and --tools only filters built-ins.
+  args.push("--strict-mcp-config", "--mcp-config", opts.mcpConfig ?? '{"mcpServers":{}}');
 
   return new Promise((done) => {
     let out = "", err = "", timedOut = false, settled = false;

@@ -107,6 +107,15 @@ process.stdout.write(JSON.stringify({ result: "OK", session_id: "argv-sess", is_
     const argv = existsSync(argvFile) ? JSON.parse(readFileSync(argvFile, "utf8")) : [];
     const i = argv.indexOf("--setting-sources");
     check("claude-code argv contains --setting-sources project", i >= 0 && argv[i + 1] === "project", JSON.stringify(argv));
+    const m = argv.indexOf("--mcp-config");
+    check("claude-code argv passes --strict-mcp-config", argv.includes("--strict-mcp-config"), JSON.stringify(argv));
+    check("claude-code argv defaults --mcp-config to an empty server map", m >= 0 && argv[m + 1] === '{"mcpServers":{}}', JSON.stringify(argv));
+    await adapter.invokeStage({
+      prompt: "argv check", cwd, dataDir: join(root, "data"), permissions: "read-only", mcpConfig: "/some/file.json", timeoutMs: 20000,
+      env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` },
+    });
+    const argvM = JSON.parse(readFileSync(argvFile, "utf8"));
+    check("claude-code mcpConfig option is passed verbatim", argvM[argvM.indexOf("--mcp-config") + 1] === "/some/file.json" && argvM.includes("--strict-mcp-config"), JSON.stringify(argvM));
     const r2 = await adapter.invokeStage({
       prompt: "argv check", cwd, dataDir: join(root, "data"), permissions: "read-only+review", skillsRoot: "/tmp/sr",
       outputs: ["out/x-review.md"], timeoutMs: 20000,
