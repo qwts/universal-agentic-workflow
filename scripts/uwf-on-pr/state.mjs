@@ -13,13 +13,12 @@
  * paused.json: { headSha, stage, pausedAt, resume? }. done.json marks consumed state.
  */
 import { spawnSync } from "node:child_process";
-import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { listChanges } from "./push-as-bot.mjs";
 
 export const stateArtifactName = (pr) => `uwf-state-pr-${pr}`;
-const SNAP = "target-snapshot";
 
 /** Newest unexpired artifact of an `actions/artifacts` listing (the API lists newest first), or null. */
 export function pickArtifact(listing) {
@@ -44,21 +43,27 @@ export function clearDir(dir) {
   for (const e of readdirSync(dir)) rmSync(join(dir, e), { recursive: true, force: true });
 }
 
-/** Save the run's working-tree changes (and tmp/workflow-artifacts) so a resume starts from the same tree. */
+const TAR = "target-snapshot.tar";
+const DELETED = "target-snapshot.deleted.json";
+
+const tar = (args, input) => {
+  const r = spawnSync("tar", args, { input, maxBuffer: 256 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`tar ${args[0]} failed: ${String(r.stderr || r.error?.message || "").trim().slice(0, 300)}`);
+  return r.stdout.toString("utf8");
+};
+
+/**
+ * Save the run's working-tree changes (and tmp/workflow-artifacts) as one tar archive so dotfiles and file modes
+ * survive the artifact upload. The archive holds NUL bytes, so scrub.mjs skips it as binary: it is not scrubbed,
+ * because it is exactly what a successful resume would commit.
+ */
 export function snapshotTarget(targetDir, dataDir) {
-  const snap = join(dataDir, SNAP);
-  rmSync(snap, { recursive: true, force: true });
-  mkdirSync(join(snap, "files"), { recursive: true });
+  for (const f of [TAR, DELETED, "target-snapshot"]) rmSync(join(dataDir, f), { recursive: true, force: true });
   const changes = listChanges(targetDir);
-  for (const c of changes) {
-    if (c.deleted) continue;
-    const dest = join(snap, "files", c.path);
-    mkdirSync(dirname(dest), { recursive: true });
-    cpSync(join(targetDir, c.path), dest, { verbatimSymlinks: true });
-  }
-  writeFileSync(join(snap, "deleted.json"), JSON.stringify(changes.filter((c) => c.deleted).map((c) => c.path)));
-  const wa = join(targetDir, "tmp", "workflow-artifacts");
-  if (existsSync(wa)) cpSync(wa, join(snap, "workflow-artifacts"), { recursive: true, verbatimSymlinks: true });
+  const paths = changes.filter((c) => !c.deleted).map((c) => c.path);
+  if (existsSync(join(targetDir, "tmp", "workflow-artifacts"))) paths.push("tmp/workflow-artifacts");
+  writeFileSync(join(dataDir, DELETED), JSON.stringify(changes.filter((c) => c.deleted).map((c) => c.path)));
+  if (paths.length) tar(["-c", "-f", join(dataDir, TAR), "-C", targetDir, "--null", "-T", "-"], Buffer.from(paths.map((x) => x + "\0").join("")));
   return { files: changes.length };
 }
 
@@ -68,29 +73,34 @@ const inside = (root, p) => {
   return r.startsWith(base + sep) ? r : null;
 };
 
-export function restoreTarget(dataDir, targetDir) {
-  const snap = join(dataDir, SNAP);
-  if (!existsSync(snap)) return { files: 0 };
-  let n = 0;
-  const walk = (dir, rel = "") => {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) { walk(join(dir, e.name), r); continue; }
-      const dest = inside(targetDir, r);
-      if (!dest) continue;
-      mkdirSync(dirname(dest), { recursive: true });
-      cpSync(join(dir, e.name), dest, { verbatimSymlinks: true });
-      n++;
-    }
-  };
-  if (existsSync(join(snap, "files"))) walk(join(snap, "files"));
-  let deleted = [];
-  try { deleted = JSON.parse(readFileSync(join(snap, "deleted.json"), "utf8")); } catch { /* none */ }
-  for (const p of deleted) { const d = inside(targetDir, String(p)); if (d) rmSync(d, { force: true, recursive: true }); }
-  if (existsSync(join(snap, "workflow-artifacts"))) {
-    cpSync(join(snap, "workflow-artifacts"), join(targetDir, "tmp", "workflow-artifacts"), { recursive: true, verbatimSymlinks: true });
+const escapes = (name) => name.startsWith("/") || /^[A-Za-z]:/.test(name) || name.split("/").includes("..");
+
+/** Refuse an archive with any member (or link target) that is absolute, uses `..`, or leaves the target. */
+export function checkArchive(tarFile, targetDir) {
+  for (const name of tar(["-t", "-f", tarFile]).split("\n").filter(Boolean)) {
+    if (escapes(name) || !inside(targetDir, name.replace(/\/$/, ""))) throw new Error(`unsafe path in the working-tree snapshot: ${name}`);
   }
-  rmSync(snap, { recursive: true, force: true });
+  for (const line of tar(["-t", "-v", "-f", tarFile]).split("\n")) {
+    if (!/^[lh]/.test(line)) continue;
+    const t = line.split(/ -> | link to /).at(-1);
+    if (t === line || escapes(t)) throw new Error(`unsafe link in the working-tree snapshot: ${line.slice(0, 200)}`);
+  }
+}
+
+export function restoreTarget(dataDir, targetDir) {
+  const tarFile = join(dataDir, TAR);
+  let n = 0;
+  if (existsSync(tarFile)) {
+    checkArchive(tarFile, targetDir);
+    mkdirSync(targetDir, { recursive: true });
+    n = tar(["-t", "-f", tarFile]).split("\n").filter((x) => x && !x.endsWith("/")).length;
+    tar(["-x", "-p", "-f", tarFile, "-C", targetDir]);
+  }
+  let deleted = [];
+  try { deleted = JSON.parse(readFileSync(join(dataDir, DELETED), "utf8")); } catch { /* none */ }
+  for (const p of deleted) { const d = inside(targetDir, String(p)); if (d) rmSync(d, { force: true, recursive: true }); }
+  rmSync(tarFile, { force: true });
+  rmSync(join(dataDir, DELETED), { force: true });
   return { files: n };
 }
 

@@ -447,6 +447,7 @@ jobs:
           name: uwf-state-pr-${{ github.event.pull_request.number }}
           path: ${{ runner.temp }}/uwf-${{ github.run_id }}
           overwrite: true
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
@@ -466,6 +467,7 @@ jobs:
           name: uwf-state-pr-${{ github.event.pull_request.number }}
           path: ${{ runner.temp }}/uwf-state-done/done.json
           overwrite: true
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
@@ -499,7 +501,9 @@ jobs:
     if: ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/uwf ') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Answers to one PR are applied one at a time and never dropped; they do not touch the run's own group.
+    # The group serialises the read-modify-write of the state artifact. GitHub keeps only one pending job per group, so a
+    # newer comment can cancel an older pending job; nothing is lost, because every job collects all trusted `/uwf `
+    # comments since the pause that are not yet in paused.json `appliedComments` (answer.mjs), not only its own trigger.
     concurrency:
       group: uwf-answer-pr-${{ github.event.issue.number }}
       cancel-in-progress: false
@@ -559,6 +563,7 @@ jobs:
           PR_NUMBER: ${{ github.event.issue.number }}
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_CREATED_AT: ${{ github.event.comment.created_at }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # A label added with the job token starts no workflow; the bot token's does, which is how a resume begins.
           LABEL_TOKEN: ${{ secrets.UWF_BOT_TOKEN }}
@@ -568,18 +573,19 @@ jobs:
             node uwf/scripts/uwf-on-pr/answer.mjs apply
 
       - name: Save the updated state
-        if: ${{ steps.apply.outputs.applied != '' && steps.apply.outputs.applied != '0' }}
+        if: ${{ steps.apply.outputs.changed == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: uwf-state-pr-${{ github.event.issue.number }}
           path: ${{ runner.temp }}/uwf-answer-${{ github.run_id }}
           overwrite: true
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
       # After the upload, so the resume run that the label starts finds the answers.
       - name: Release the run
-        if: ${{ steps.apply.outputs.applied != '' && steps.apply.outputs.applied != '0' && steps.apply.outputs.resume == 'true' }}
+        if: ${{ steps.apply.outputs.changed == 'true' && steps.apply.outputs.resume == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

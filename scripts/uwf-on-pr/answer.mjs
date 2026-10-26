@@ -96,27 +96,68 @@ function readPausedFile(dir) {
   try { return JSON.parse(readFileSync(join(dir, "paused.json"), "utf8")); } catch { return {}; }
 }
 
+const TRUSTED = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+/**
+ * The comments one answer job must process, in creation order: every trusted `/uwf ` comment created at or after the
+ * pause that is not yet in `applied`, plus the triggering comment (already vetted by the job's `if`). A cancelled
+ * pending job loses only its trigger; the next job still finds that comment here.
+ */
+export function collectComments({ comments, triggering, applied = [], pausedAt }) {
+  const done = new Set(applied.map(Number));
+  const byId = new Map();
+  for (const c of comments ?? []) {
+    if (!c || c.id == null || done.has(Number(c.id))) continue;
+    if (!TRUSTED.has(c.author_association) || !String(c.body ?? "").startsWith("/uwf ")) continue;
+    if (pausedAt && String(c.created_at ?? "") < pausedAt) continue;
+    byId.set(Number(c.id), { id: Number(c.id), created_at: String(c.created_at ?? ""), body: String(c.body) });
+  }
+  if (triggering && triggering.id != null && !done.has(Number(triggering.id)) && !byId.has(Number(triggering.id))) {
+    byId.set(Number(triggering.id), { id: Number(triggering.id), created_at: String(triggering.created_at ?? "9999"), body: String(triggering.body ?? "") });
+  }
+  return [...byId.values()].sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : a.id - b.id));
+}
+
+/** The PR's issue comments since the pause (a listing failure is not fatal: the trigger still gets processed). */
+export function listPrComments(gh, repo, pr, since) {
+  const q = since ? `?since=${encodeURIComponent(since)}&per_page=100` : "?per_page=100";
+  const jq = ".[] | {id, created_at, body, author_association}";
+  const out = gh(["api", `repos/${repo}/issues/${pr}/comments${q}`, "--paginate", "--jq", jq]);
+  return String(out).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
 function apply() {
   const { repo, pr, dir, cli } = need();
   if (!dir || !cli) { console.error("answer: UWF_DATA_DIR and QUESTIONS_CLI are required"); process.exit(2); }
   const gh = makeGh();
-  const { commands, rejected } = parseCommands(process.env.COMMENT_BODY);
+  const paused = readPausedFile(dir);
+  const log = (what, fn) => { try { return fn(); } catch (e) { console.error(`::warning::answer: ${what}: ${e.message}`); return undefined; } };
+  const listing = log("comment listing", () => listPrComments(gh, repo, pr, paused.pausedAt)) ?? [];
+  const batch = collectComments({
+    comments: listing, applied: paused.appliedComments, pausedAt: paused.pausedAt,
+    triggering: { id: process.env.COMMENT_ID, body: process.env.COMMENT_BODY, created_at: process.env.COMMENT_CREATED_AT },
+  });
+  const commands = [];
+  const rejected = [];
+  for (const c of batch) { const p = parseCommands(c.body); commands.push(...p.commands); rejected.push(...p.rejected); }
   const before = listQuestions(cli, dir);
   const { applied, ignored } = applyCommands(commands, before.filter((q) => q.status === "pending").map((q) => q.id), (args) => runQuestions(cli, dir, args));
   const questions = listQuestions(cli, dir);
   const resume = canResume(questions);
-  const paused = readPausedFile(dir);
-  if (applied.length || paused.resume !== resume) writeFileSync(join(dir, "paused.json"), JSON.stringify({ ...paused, resume }, null, 2) + "\n");
-  const log = (what, fn) => { try { fn(); } catch (e) { console.error(`::warning::answer: ${what}: ${e.message}`); } };
-  if (!applied.length && !rejected.length && !ignored.length) { setOutput("applied", 0); setOutput("resume", "false"); return; }
+  const changed = batch.length > 0;
+  if (changed || paused.resume !== resume) {
+    writeFileSync(join(dir, "paused.json"), JSON.stringify({ ...paused, resume, appliedComments: [...(paused.appliedComments ?? []), ...batch.map((c) => c.id)] }, null, 2) + "\n");
+  }
+  setOutput("changed", String(changed));
+  setOutput("resume", String(resume));
+  if (!applied.length && !rejected.length && !ignored.length) { setOutput("applied", 0); return; }
   log("questions comment", () => upsertQuestionsComment(gh, { repo, pr, body: buildQuestionsBody({ questions, stage: paused.stage, runUrl: process.env.RUN_URL, ready: resume }) }));
   // With a bot token the label (and so the resume) follows in `activate`; the reply is posted there.
   if (!resume || !process.env.LABEL_TOKEN) {
     log("reply", () => postComment(gh, { repo, pr, body: replyBody({ applied, ignored, rejected, questions, resume, activated: false }) }));
   }
   setOutput("applied", applied.length);
-  setOutput("resume", String(resume));
-  console.log(`answer: applied ${applied.length}, ignored ${ignored.length}, rejected ${rejected.length}, resume=${resume}`);
+  console.log(`answer: ${batch.length} comment(s), applied ${applied.length}, ignored ${ignored.length}, rejected ${rejected.length}, resume=${resume}`);
 }
 
 function activate() {

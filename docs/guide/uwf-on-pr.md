@@ -166,6 +166,13 @@ Requirements and limits:
   the question CLI as separate argv elements, never through a shell. An answer that starts with `--` is rejected.
 - The state stays in the artifact for 14 days; after that a `uwf:run` label starts a fresh run. Answers and the data dir
   are scrubbed with the same patterns as the other artifacts, so do not put secrets in answers.
+- **The working-tree snapshot is not scrubbed.** It travels as one tar archive (`target-snapshot.tar`, so dotfiles and
+  file modes survive the artifact upload), which `scrub.mjs` skips as binary. That is intended: it holds exactly what
+  a successful resume would commit as the bot, and rewriting it would corrupt source files that contain secret-shaped
+  test strings. On restore every archive member must be a relative path inside the checkout, or the restore is refused.
+- **Several answers at once.** GitHub keeps one pending job per concurrency group, so a newer `/uwf` comment can
+  cancel an older pending answer job. Nothing is lost: each job applies every trusted `/uwf ` comment created since the
+  pause that `paused.json` (`appliedComments`) does not list yet, in creation order, then records them.
 - Fork PRs never run, so they never pause.
 
 ## Commits under the bot identity

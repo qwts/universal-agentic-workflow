@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyCommands, canResume, parseCommands, replyBody } from "../../uwf-on-pr/answer.mjs";
+import { applyCommands, canResume, collectComments, parseCommands, replyBody } from "../../uwf-on-pr/answer.mjs";
 import { listQuestions, runQuestions } from "../../uwf-on-pr/questions.mjs";
-import { decideResume, pickArtifact, restoreTarget, snapshotTarget } from "../../uwf-on-pr/state.mjs";
+import { checkArchive, decideResume, pickArtifact, restoreTarget, snapshotTarget } from "../../uwf-on-pr/state.mjs";
 import { execFileSync } from "node:child_process";
 
 // parsing: several lines, noise ignored, CRLF tolerated
@@ -40,6 +40,26 @@ assert.match(replyBody({ applied: [{ action: "answer", id: 1 }], ignored: [], re
 assert.match(replyBody({ applied: [], ignored: [], rejected: ["/uwf answer x y"], questions: [], resume: true, activated: true }), /Could not parse/);
 assert.match(replyBody({ applied: [], ignored: [], rejected: [], questions: [], resume: true, activated: false }), /Add the `uwf:run` label/);
 
+// collecting comments: eligible, non-collaborator, already applied, before the pause; the trigger is deduplicated
+const cm = (id, at, assoc, body) => ({ id, created_at: at, author_association: assoc, body });
+const batch = collectComments({
+  comments: [
+    cm(10, "2026-10-26T10:05:00Z", "COLLABORATOR", "/uwf answer 1 yes"),
+    cm(11, "2026-10-26T10:06:00Z", "NONE", "/uwf answer 2 evil"),
+    cm(12, "2026-10-26T10:07:00Z", "OWNER", "/uwf skip 3"),
+    cm(13, "2026-10-26T10:01:00Z", "OWNER", "/uwf answer 9 before the pause"),
+    cm(14, "2026-10-26T10:08:00Z", "MEMBER", "just chatting"),
+    cm(15, "2026-10-26T10:09:00Z", "MEMBER", "/uwf skip 4"),
+  ],
+  applied: [12],
+  pausedAt: "2026-10-26T10:02:00Z",
+  triggering: { id: "15", body: "/uwf skip 4", created_at: "2026-10-26T10:09:00Z" },
+});
+assert.deepEqual(batch.map((c) => c.id), [10, 15], "eligible, in creation order, trigger not duplicated");
+const lone = collectComments({ comments: [], applied: [], pausedAt: "x", triggering: { id: "20", body: "/uwf skip 1" } });
+assert.deepEqual(lone.map((c) => c.id), [20], "the trigger is processed even when the listing misses it");
+assert.deepEqual(collectComments({ comments: [], applied: [20], triggering: { id: "20", body: "/uwf skip 1" } }), [], "an applied trigger is not repeated");
+
 // state: artifact choice, resume decision, working-tree snapshot
 assert.deepEqual(pickArtifact({ artifacts: [{ id: 3, name: "n", expired: true }, { id: 2, name: "n", expired: false }] }), { id: 2, name: "n" });
 assert.equal(pickArtifact({ artifacts: [] }), null);
@@ -62,6 +82,14 @@ try {
   rmSync(join(t1, "gone.txt"));
   mkdirSync(join(t1, "src"));
   writeFileSync(join(t1, "src", "new.js"), "x\n");
+  writeFileSync(join(t1, ".hidden"), "dot\n");
+  mkdirSync(join(t1, ".github"));
+  writeFileSync(join(t1, ".github", "ci.yml"), "a: 1\n");
+  // a secret-shaped string in a source file must come back byte for byte (the snapshot is not scrubbed)
+  const secretish = "const t = 'Bearer abcdefghijklmnopqrstuvwxyz0123456789';\n";
+  writeFileSync(join(t1, "src", "secret-fixture.js"), secretish);
+  writeFileSync(join(t1, "run.sh"), "#!/bin/sh\necho hi\n");
+  chmodSync(join(t1, "run.sh"), 0o755);
   mkdirSync(join(t1, "tmp", "workflow-artifacts"), { recursive: true });
   writeFileSync(join(t1, "tmp", "workflow-artifacts", "req.md"), "req\n");
   const data = join(tmp, "data");
@@ -76,6 +104,18 @@ try {
   assert.equal(readFileSync(join(t2, "keep.txt"), "utf8"), "two\n");
   assert.ok(!existsSync(join(t2, "gone.txt")));
   assert.equal(readFileSync(join(t2, "src", "new.js"), "utf8"), "x\n");
+  assert.equal(readFileSync(join(t2, ".hidden"), "utf8"), "dot\n");
+  assert.equal(readFileSync(join(t2, ".github", "ci.yml"), "utf8"), "a: 1\n");
+  assert.equal(readFileSync(join(t2, "src", "secret-fixture.js"), "utf8"), secretish);
+  assert.equal(statSync(join(t2, "run.sh")).mode & 0o777, 0o755, "executable bit preserved");
+  assert.equal(statSync(join(t2, "keep.txt")).mode & 0o111, 0, "plain file stays non-executable");
+  assert.ok(!existsSync(join(data, "target-snapshot.tar")), "archive consumed");
+  // an archive member that leaves the target is refused
+  const evilDir = join(tmp, "evil", "inner");
+  mkdirSync(evilDir, { recursive: true });
+  writeFileSync(join(tmp, "evil", "out.txt"), "x");
+  execFileSync("tar", ["-c", "-P", "-f", join(tmp, "evil.tar"), "../out.txt"], { cwd: evilDir });
+  assert.throws(() => checkArchive(join(tmp, "evil.tar"), t2), /unsafe path/);
   assert.equal(readFileSync(join(t2, "tmp", "workflow-artifacts", "req.md"), "utf8"), "req\n");
 
   // end to end with the real question CLI when its dependencies are installed
