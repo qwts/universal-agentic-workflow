@@ -53,6 +53,12 @@ assert_lacks "$MAC" "sudo" "macOS plan needs no sudo"
 "$BASH_BIN" "$RH/provision.sh" --dry-run --name x >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 2 ] && pass "scope (--repo/--org) is required" || bad "scope required (got $rc)"
 
+mkdir -p "$TMP/rootid"; printf '#!/bin/sh\n[ "$1" = -u ] && echo 0 || /usr/bin/id "$@"\n' >"$TMP/rootid/id"; chmod +x "$TMP/rootid/id"
+OUT="$(PATH="$TMP/rootid:$PATH" "$BASH_BIN" "$RH/provision.sh" --repo a/b --name r 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && pass "real run as root is refused" || bad "root refusal (got $rc)"
+assert_has "$OUT" "refusing to run as root" "root refusal message"
+[ ! -d "$HOME/actions-runner-r" ] && pass "root refusal changed nothing" || bad "root refusal created runner dir"
+
 echo "doctor with stub CLIs"
 # Hermetic PATH: only stubs plus symlinks to the basic tools doctor needs.
 make_path() { # make_path DIR [omit-cli]

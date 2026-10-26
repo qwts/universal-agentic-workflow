@@ -93,11 +93,27 @@ show() {
   done
   printf '%s\n' "$out"
 }
-run() { show "$@"; [ "$DRY" -eq 1 ] || "$@"; }
+# nvm is a shell function that assumes neither errexit nor nounset; run it with both off.
+run() {
+  show "$@"
+  [ "$DRY" -eq 1 ] && return 0
+  if [ "$1" = nvm ]; then
+    local rc; set +eu; "$@"; rc=$?; set -eu
+    [ "$rc" -eq 0 ] || { echo "failed (exit $rc): $*" >&2; exit "$rc"; }
+  else
+    "$@"
+  fi
+}
 run_sh() { printf '+ %s\n' "$1"; [ "$DRY" -eq 1 ] || bash -c "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+
+# The runner's config.sh refuses to run as root, so fail early instead of after the installs.
+if [ "$DRY" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+  echo "refusing to run as root: the Actions runner will not register as root. Run as a normal user with sudo access." >&2
+  exit 1
+fi
 
 node_major() { have node && node --version | sed 's/^v//; s/\..*//' || echo 0; }
 
@@ -174,7 +190,7 @@ if [ "$DRY" -eq 0 ] && have gh; then
 elif [ "$OS" = Darwin ]; then
   run brew install gh
 elif [ "$DRY" -eq 0 ] && have dnf; then
-  run $SUDO dnf install -y gh
+  run_sh "sudo dnf install -y 'dnf-command(config-manager)' && { sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo || sudo dnf config-manager addrepo --from-repofile=https://cli.github.com/packages/rpm/gh-cli.repo; } && sudo dnf install -y gh --repo gh-cli"
 else
   run_sh '(type -p wget >/dev/null || (sudo apt-get update && sudo apt-get install -y wget)) && sudo mkdir -p -m 755 /etc/apt/keyrings && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null && sudo apt-get update && sudo apt-get install -y gh'
 fi
