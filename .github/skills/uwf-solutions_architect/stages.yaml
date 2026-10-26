@@ -219,19 +219,35 @@ stages:
           label: "design-sdd.md"
         - type: require_contains
           path: "{{output_path}}/design-sdd.md"
-          text: "## Components"
+          heading: "## Overview"
+          label: "design-sdd.md contains Overview section"
+        - type: require_contains
+          path: "{{output_path}}/design-sdd.md"
+          heading: "## Components"
           label: "design-sdd.md contains Components section"
         - type: require_contains
           path: "{{output_path}}/design-sdd.md"
-          text: "## Interface Contracts"
+          heading: "## Interface Contracts"
           label: "design-sdd.md contains Interface Contracts section"
         - type: require_contains
           path: "{{output_path}}/design-sdd.md"
-          text: "## Non-Functional Requirements"
+          heading: "## Non-Functional Requirements"
           label: "design-sdd.md contains Non-Functional Requirements section"
         - type: require_contains
           path: "{{output_path}}/design-sdd.md"
-          text: "## Traceability"
+          heading: "## ADR Elaborations"
+          label: "design-sdd.md contains ADR Elaborations section"
+        - type: require_contains
+          path: "{{output_path}}/design-sdd.md"
+          heading: "## Component Dependency Graph"
+          label: "design-sdd.md contains Component Dependency Graph section"
+        - type: require_contains
+          path: "{{output_path}}/design-sdd.md"
+          heading: "## Cross-Domain Risk Mapping"
+          label: "design-sdd.md contains Cross-Domain Risk Mapping section"
+        - type: require_contains
+          path: "{{output_path}}/design-sdd.md"
+          heading: "## Traceability"
           label: "design-sdd.md contains Traceability section"
 
   - name: review
