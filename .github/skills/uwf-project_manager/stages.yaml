@@ -238,6 +238,10 @@ stages:
     agent: uwf-project_manager-reviewer
     max_retries: 3
     on_gate_failure: retry
+    # changes_requested routes back to the stage that produced the reviewed artifacts:
+    # timeline-planning produces both issues-backlog.md and project-roadmap.md.
+    on_verdict:
+      changes_requested: { route_to: timeline-planning, max_round_trips: 2 }
     run_as_subagent: true
     inputs:
       - "{{output_path}}/issues-backlog.md"
