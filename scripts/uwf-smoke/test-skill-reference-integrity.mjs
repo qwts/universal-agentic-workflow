@@ -43,7 +43,9 @@ const REFERENCE_SCOPES = [
   ".github/agents",
   ".github/skills",
   ".github/instructions",
+  ".github/prompts",
   ".github/copilot-instructions.md",
+  "docs/guide/copilot-orchestrator.md",
 ];
 const SKIPPED_DIRECTORIES = new Set([".git", "node_modules"]);
 const SKIPPED_FILE_SUFFIXES = [
@@ -331,8 +333,7 @@ function collectTraitFindings(repoRoot) {
     }
 
     traitDefinitions.set(traitId, {
-      source: repoPath(repoRoot, traitFile),
-      value: parsed.value,
+      source: repoPath(repoRoot, traitFile),\n      value: parsed.value,
     });
 
     if (
@@ -407,6 +408,7 @@ function runNegativeFixture() {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "uwf-reference-integrity-"));
   try {
     const agentsRoot = join(fixtureRoot, ".github/agents");
+    const docsGuideRoot = join(fixtureRoot, "docs/guide");
     const contractsRoot = join(
       fixtureRoot,
       ".github/skills/uwf-orchestration-engine/stage-contracts",
@@ -414,6 +416,7 @@ function runNegativeFixture() {
     const personaRoot = join(fixtureRoot, ".github/skills/uwf-fixture");
     const traitsRoot = join(fixtureRoot, ".github/skills/uwf-traits/traits");
     mkdirSync(agentsRoot, { recursive: true });
+    mkdirSync(docsGuideRoot, { recursive: true });
     mkdirSync(contractsRoot, { recursive: true });
     mkdirSync(personaRoot, { recursive: true });
     mkdirSync(traitsRoot, { recursive: true });
@@ -421,6 +424,10 @@ function runNegativeFixture() {
     writeFileSync(
       join(agentsRoot, "fixture.agent.md"),
       "Read `.github/skills/uwf-missing-fixture/SKILL.md`.\n",
+    );
+    writeFileSync(
+      join(docsGuideRoot, "copilot-orchestrator.md"),
+      "Read `.github/skills/uwf-missing-doc-fixture/SKILL.md`.\n",
     );
     writeFileSync(
       join(contractsRoot, "fixture.yaml"),
@@ -531,6 +538,15 @@ assert(
     (finding) =>
       finding.code === "missing-skill" &&
       finding.subject === "uwf-missing-fixture",
+  ),
+);
+assert(
+  "missing skill in relocated copilot-orchestrator guide is rejected",
+  fixtureFindings.some(
+    (finding) =>
+      finding.code === "missing-skill" &&
+      finding.subject === "uwf-missing-doc-fixture" &&
+      finding.detail.includes("docs/guide/copilot-orchestrator.md"),
   ),
 );
 assert(

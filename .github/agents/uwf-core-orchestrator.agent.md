@@ -1,6 +1,6 @@
 ---
 name: uwf-core-orchestrator
-description: "Generic persona-driven orchestrator. Bootstrap with a workflow skill to drive any UWF workflow sequence."
+description: "Generic persona-driven chat orchestrator. Bootstrap with a workflow skill to drive any UAW workflow sequence in Copilot Chat."
 tools:
   - agent
   - todo
@@ -38,6 +38,6 @@ agents:
   - uwf-solutions_architect-reviewer
 ---
 
-# UWF Core Orchestrator
+# UAW Core Chat Orchestrator
 
-Read `.github/skills/uwf-orchestration-engine/SKILL.md` and `.github/skills/uwf-{workflow}/SKILL.md`. All behavior is defined there.
+Read `docs/guide/copilot-orchestrator.md`, `.github/skills/uwf-orchestration-engine/SKILL.md`, and `.github/skills/uwf-{workflow}/SKILL.md`. All chat-orchestrator loop discipline and engine behavior are defined there.

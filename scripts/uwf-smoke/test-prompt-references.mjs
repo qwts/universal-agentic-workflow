@@ -1,16 +1,17 @@
 /**
- * Smoke test: stage prompts (agents and skill docs) reference only what exists and what the
- * runner provides.
+ * Smoke test: stage prompts (agents, skill docs, and relocated orchestrator guide)
+ * reference only what exists and what the runner provides.
  *
  * The runner materializes each stage's required outputs and context into the prompt, so a prompt
  * must not hardcode the default artifact directory, ship an unreplaced `{placeholder}`, or point at
- * a skill, agent, or script that does not exist.
+ * a skill, agent, guide, or script that does not exist.
  *
- * For every `.github/agents/*.md` and `.github/skills/*\/SKILL.md` it fails on:
+ * For every `.github/agents/*.md`, `.github/skills/*\/SKILL.md`, and
+ * `docs/guide/copilot-orchestrator.md` it fails on:
  *   (a) a single-brace `{identifier}` placeholder outside a code fence (`{{...}}` runner templates are fine)
  *   (b) a literal `tmp/workflow-artifacts` path
  *   (c) a `uwf-<name>` skill or agent reference with no matching skill directory or agent file
- *   (d) a `.github/...` or `scripts/...` path that does not exist
+ *   (d) a `.github/...`, `scripts/...`, or `docs/guide/...` path that does not exist
  *
  * Usage: node scripts/uwf-smoke/test-prompt-references.mjs
  */
@@ -22,12 +23,15 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const agentsDir = join(root, ".github", "agents");
 const skillsDir = join(root, ".github", "skills");
+const copilotOrchestratorGuide = join(root, "docs", "guide", "copilot-orchestrator.md");
 
 // Files that may name the literal default artifact directory because documenting that default is
 // their job. Each entry needs a reason.
 const LITERAL_PATH_ALLOWED = new Map([
   // The engine contract documents the `--output-path` flag default and the CLI examples.
   [".github/skills/uwf-orchestration-engine/SKILL.md", "documents the CLI default and example invocations"],
+  // The relocated Copilot chat-orchestrator guide documents the legacy/chat context block defaults.
+  ["docs/guide/copilot-orchestrator.md", "documents the Copilot chat-orchestrator context block default paths"],
 ]);
 
 // Single-brace names that are not unreplaced placeholders.
@@ -45,13 +49,12 @@ const NON_REFERENCE_TOKENS = new Map([
   ["uwf-requirements-db", "the uwf-requirements.db file name, not a skill"],
   // Build-record artifact names (Canonical Build Spec, Build Record, Decision Record Snapshot, changelog, traceability).
   ...["uwf-br", "uwf-drs", "uwf-changelog", "uwf-tm"].map((n) => [n, "build-record artifact name, not a skill"]),
-  // The orchestration-engine contract lists this as an example of an invented subagent name to avoid.
+  // docs/guide/copilot-orchestrator.md lists this as an example of an invented subagent name to avoid.
   ["uwf-project_manager-initiate", "deliberate counter-example of a fabricated agent name"],
 ]);
 
 // Paths that are legitimately absent from this checkout.
-const PATH_ALLOWED = new Map([
-  [".github/adr", "an ADR location in the repository being audited, not this one"],
+const PATH_ALLOWED = new Map([\n  [".github/adr", "an ADR location in the repository being audited, not this one"],
 ]);
 
 const files = [];
@@ -60,6 +63,7 @@ for (const d of readdirSync(skillsDir, { withFileTypes: true }).filter((e) => e.
   const p = join(skillsDir, d.name, "SKILL.md");
   if (existsSync(p)) files.push(p);
 }
+if (existsSync(copilotOrchestratorGuide)) files.push(copilotOrchestratorGuide);
 
 const skillNames = new Set(readdirSync(skillsDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name));
 const agentNames = new Set(readdirSync(agentsDir).filter((n) => n.endsWith(".agent.md")).map((n) => n.replace(/\.agent\.md$/, "")));
@@ -104,7 +108,7 @@ for (const file of files) {
       if (!skillNames.has(name) && !agentNames.has(name)) findings.push(`${at}: ${name} is not an existing skill or agent`);
     }
 
-    for (const m of line.matchAll(/(?<![\w./-])((?:\.github|scripts)\/[A-Za-z0-9_./-]*[A-Za-z0-9_])/g)) {
+    for (const m of line.matchAll(/(?<![\w./-])((?:\.github|scripts|docs\/guide)\/[A-Za-z0-9_./-]*[A-Za-z0-9_])/g)) {
       const p = m[1];
       if (/[*<>]/.test(p) || PATH_ALLOWED.has(p)) continue;
       if (/\.db$/.test(p)) continue; // SQLite stores created at run time and gitignored

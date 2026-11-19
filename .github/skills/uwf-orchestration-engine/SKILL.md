@@ -1,422 +1,248 @@
-# Skill: uwf-orchestration-engine
-
-## When to use
-Load this skill at orchestrator startup. It governs **how** any persona-driven orchestrator operates — stage sequencing discipline, gate enforcement, retry logic, and the fix-loop. The **what** (stage list, gate definitions, subagent roster) comes from the persona skill loaded alongside it.
-
+---
+name: uwf-orchestration-engine
+description: "Host-neutral UAW orchestration engine contract: declarative stages.yaml schema, stage-tracker.mjs CLI, gate check types and prescriptions, structured stage-result verdicts, on_verdict review routing, and artifact handoffs across CLI, PR runner, IDE/browser plugins, and standalone MCP surfaces."
 ---
 
-## Invocation Contract
+# UAW Orchestration Engine (`uwf-orchestration-engine`)
 
-> ### ⚠️ CRITICAL — Two separate mechanisms; never confuse them
->
-> | Mechanism | What it is | How to invoke |
-> |---|---|---|
-> | **`runSubagent`** | A VS Code Copilot **tool call** that runs another agent | Use the tool-call infrastructure (same as `read_file`, `run_in_terminal`, etc.) — **never a shell command** |
-> | **`run.mjs`** | A Node.js script for gate checks and stage listing | `node .github/skills/uwf-{workflow}/run.mjs --list-stages` or `--check-gate <stage>` |
->
-> `run.mjs` has **no** `--run-stage`, `--execute`, or `--invoke` flag. Attempting to run a subagent via terminal is a hard violation. If you find yourself typing `node ... --run-stage`, stop — use the `runSubagent` tool call.
+The orchestration engine defines the host-neutral state machine, declarative workflow graph (`stages.yaml`), deterministic gate evaluator, structured verdict schema, and SQLite stage-tracking CLI (`stage-tracker.mjs`) for Universal Agentic Workflow (`UAW`).
 
-Every `runSubagent` call **must** embed the following context block inside the `prompt` string so subagents know their operating environment.
+## Execution Surfaces and Related Guides
 
-> **CRITICAL — tool call structure:** The `runSubagent` tool takes three separate parameters:
-> - `agentName` (string) — the subagent to invoke, e.g. `"uwf-stage-intake"`
-> - `description` (string) — a short 3-5 word task label, e.g. `"Run sw_dev intake stage"`
-> - `prompt` (string) — **always a plain string**; the JSON context block below must be embedded *inside* this string
->
-> ❌ **Wrong** — passing raw JSON as the entire prompt:
-> ```
-> prompt: '{"role":"project"}'
-> ```
-> This gives the subagent no instructions; it will fall back to listing stages instead of executing them.
->
-> ✅ **Correct** — embedding the context block inside a descriptive prompt string:
-> ```
-> agentName: "uwf-stage-intake"
-> description: "Run sw_dev intake stage"
-> prompt: |
->   Run the intake stage for the sw_dev workflow.
->
->   Context:
->   {
->     "workflow":   "sw_dev",
->     "role":       "issues",
->     "phase":      "intake",
->     "outputPath": "./tmp/workflow-artifacts",
->     "statePath":  "./tmp/uwf-state.json"
->   }
->
->   <goal / issue description goes here>
-> ```
+`UAW` decouples workflow state and gate evaluation from how a host runtime invokes individual stage agents. Every surface consumes the same `stages.yaml` definitions and `stage-tracker.mjs` CLI:
 
-The context fields the prompt string must always include:
+- **Deterministic CLI runner** ([`scripts/uwf-runner/README.md`](../../../scripts/uwf-runner/README.md)): `scripts/uwf-runner/runner.mjs` owns the stage loop in Node.js and invokes one isolated stage session per attempt through harness adapters (`claude-code`, `codex`, `grokbot`, `fake`) using prompts materialized by `scripts/uwf-runner/prompt.mjs`.
+- **Pull-request workflow runner** ([`docs/guide/uwf-on-pr.md`](../../../docs/guide/uwf-on-pr.md)): Runs the deterministic CLI runner inside reusable GitHub Actions workflows on self-hosted runners ([`docs/guide/self-hosted-runner.md`](../../../docs/guide/self-hosted-runner.md)).
+- **IDE / dev-tool plugins, browser plugins, and standalone MCP servers**: Query `stage-tracker.mjs` (directly or behind MCP tools) to resolve stage contracts, persist per-run SQLite state in `--data-dir`, evaluate deterministic gates, and route `on_verdict` round trips without depending on VS Code chat tools.
+- **GitHub Copilot chat-orchestrator fallback** ([`docs/guide/copilot-orchestrator.md`](../../../docs/guide/copilot-orchestrator.md)): Single-session chat fallback (`uwf-core-orchestrator`) and Round 1 / Round 2 control reference for hosts that delegate stages interactively inside a single chat session.
+- **Target-repo verification gate** ([`docs/guide/verify-gate.md`](../../../docs/guide/verify-gate.md)): Configures `.github/skills/uwf-orchestration-engine/verify.mjs` (`UWF_VERIFY_CMDS` or `.github/uwf-verify.yaml`) for build, lint, and test gates.
 
-```jsonc
-{
-  "workflow":   "<persona_name>",      // e.g. "project_manager", "sw_dev", "book_writer"
-  "role":       "<role>",              // from the persona skill, e.g. "project" or "issues"
-  "phase":      "<current_phase>",     // from uwf-state.json
-  "outputPath": "./tmp/workflow-artifacts",
-  "statePath":  "./tmp/uwf-state.json"
-}
-```
-
-The `workflow` and `role` values are provided by the persona skill. The `phase` value is read from `uwf-state.json` via `node .github/skills/uwf-state-manager/state.mjs read` before every stage transition.
-
----
-
-## Non-negotiable Principles
-
-1. The orchestrator does **not** produce, edit, or delete any artifact file. Every artifact is produced by a subagent.
-2. After **every** stage transition, call `node .github/skills/uwf-orchestration-engine/stage-tracker.mjs stage-start --workflow <w> --stage <stageName>` to advance the phase and record the hand-off in the stage DB.
-3. After **every** subagent completes, run the **Gate Check** for that stage (defined in the persona skill). If the gate fails, re-invoke the same subagent with the failure details — up to **2 retries**. If still failing after retries, halt and report the blocked gate to the user.
-4. Do **not** skip stages. Conditional stages (ADR, Security, etc.) may be marked `PASS — not required` in the gate log but must be explicitly evaluated.
-5. All user questions flow through the orchestrator via `vscode/askQuestions`. Subagents must return structured requests upward; the orchestrator relays them and passes responses back down.
-6. **DO NOT yield back to the user between stages.** After a subagent returns and its gate passes, immediately invoke the next stage subagent. The orchestrator must run the full stage sequence to completion in a single turn. The only permitted user-visible output between stages is a one-line trace (e.g. `[Stage N] <stageName> → starting`). Never pause, ask for permission, summarize completed work, or wait for acknowledgement between stage transitions. Only stop when: a gate fails permanently after retries, a `vscode/askQuestions` call is needed, or the workflow is fully complete.
-
----
-
-## FORBIDDEN Behaviors — Orchestrator
-
-The following are **hard violations**. If you are about to do any of these, stop and correct course:
-
-- ❌ **Narrating or simulating stage execution in text** without calling `runSubagent`. Writing "I invoked uwf-X" or a bullet list of what each stage did is not the same as calling the tool. If the tool was not called, the stage did not run.
-- ❌ **Invoking subagents via terminal commands.** `runSubagent` is a tool call, not a shell command. Never use `node run.mjs --run-stage` or any terminal variant to attempt to run a subagent.
-- ❌ **Inventing subagent names.** Only use agent names present in the persona skill's Subagent Roster and listed in the orchestrator's `agents:` frontmatter. Never fabricate names like `uwf-project_manager-initiate`.
-- ❌ **Producing a completion summary** without having called `runSubagent` for every stage in the sequence.
-- ❌ **Emitting `Current Stage/Phase:` / `Recommended Next Stage/Phase:` blocks.** Those are for subagents only. The orchestrator never emits them.
-- ❌ **Using stage names not in the persona SKILL.md Stage Sequence table.** Read the table first; use only those exact stage names and subagent names.
-
----
-
-## Startup Procedure
-
-When the orchestrator is invoked:
-
-1. Read and internalize **this skill** (`uwf-orchestration-engine`) to load engine behavior.
-2. Read and internalize the **persona skill** at `.github/skills/uwf-{workflow}/SKILL.md` to load:
-   - The `role` value for the invocation contract
-   - The subagent roster
-   - Persona-specific operating rules
-3. **Resolve the model profile** (once; persisted for all stages):
-   ```sh
-   node .github/skills/uwf-model-adaptation/resolve.mjs detect [--profile <profile>] [--model <model_name>]
-   ```
-   Capture the JSON output (`profile`, `model_name`, `steering_policy`). Store to workflow state:
-   ```sh
-   node .github/skills/uwf-state-manager/state.mjs set-model-profile \
-     --profile <profile> [--model <model_name>]
-   ```
-   Pass `--profile <profile>` to every subsequent `--list-stages` call via `--model-profile <profile>`.
-4. **Run the stage-list script to obtain the authoritative stage sequence:**
-   ```sh
-   node .github/skills/uwf-{workflow}/run.mjs --list-stages [--model-profile <profile>]
-   ```
-   Parse the JSON output and record every stage name in order. **This script output is your sole authoritative stage list.** The SKILL.md Stage Sequence table is human-readable documentation only — it may be incomplete or stale. You MUST execute every stage returned by the script in order. Skipping, reordering, or substituting stages based on memory, summarization, or reading the table is a **hard violation**. Conditional stages (ADR, security, test-plan, etc.) are **never skipped** — their gate script auto-passes when not applicable, but you must still invoke the subagent for every stage the script returns.
-5. Initialize state: `node .github/skills/uwf-state-manager/state.mjs init --workflow <workflow>`. Read the current phase to determine the resume point.
-6. Begin executing every stage from the script-supplied list in order, starting from the current phase.
-
-### New-style stage context injection
-
-For any stage in the list that has `stage_type` set (new-style stage), embed the additional fields
-in the `runSubagent` prompt context block:
-
-```jsonc
-{
-  "workflow":        "<persona_name>",
-  "role":            "<role>",
-  "phase":           "<current_phase>",
-  "outputPath":      "./tmp/workflow-artifacts",
-  "statePath":       "./tmp/uwf-state.json",
-  "stage_type":      "<stage_type>",
-  "trait_ids":       ["<trait_id>", ...],
-  "model_profile":   "<profile>",
-  "behavior_policy": { /* from stage list output */ },
-  "steering_policy": { /* from stage list output */ }
-}
-```
-
-Legacy stages (`stage_type: null`) use the original context block without these additional fields.
-
----
-
-## Per-Stage Execution Loop
-
-This is the canonical loop the orchestrator runs for **every stage**. Read it once; apply it to all stages.
-
-```
-FOR EACH stage in the stage sequence:
-
-  ┌─── PRE-FLIGHT ─────────────────────────────────────────────────────────┐
-  │ 1. Resolve stage metadata                                               │
-  │    node .github/skills/uwf-{workflow}/run.mjs --list-stages             │
-  │    → record inputs[], outputs[], runAsSubagent for this stage           │
-  │                                                                         │
-  │ 2. Check for outstanding question dependencies                          │
-  │    node .github/skills/uwf-question-protocol/questions.mjs \            │
-  │         check --stage <stageName>                                       │
-  │    → exit 1 (pending required questions)?                               │
-  │      YES → ask user via vscode/askQuestions                             │
-  │            answer each: questions.mjs answer --id <n> --answer "..."   │
-  │            REPEAT from step 2 until gate passes (exit 0)               │
-  │      NO  → continue                                                     │
-  └─────────────────────────────────────────────────────────────────────────┘
-
-  ┌─── INVOKE ─────────────────────────────────────────────────────────────┐
-  │ IF runAsSubagent = true:                                                │
-  │   3. Claim agent token                                                  │
-  │      node .github/skills/uwf-state-manager/state.mjs \                 │
-  │           set-agent --agent uwf-core-orchestrator                      │
-  │      node .github/skills/uwf-orchestration-engine/stage-tracker.mjs \  │
-  │           stage-start --workflow <w> --stage <stageName>               │
-  │                                                                         │
-  │   4. Emit progress trace (one line only):                               │
-  │      [Stage N/Total] <stageName> → invoking <agentName>                │
-  │                                                                         │
-  │   5. Call runSubagent with resolved inputs/outputs in prompt:           │
-  │      agentName: <agentName>                                             │
-  │      prompt: "Run the <stageName> stage.\n\nContext:\n{ ... }\n\n      │
-  │               inputs: [...]\noutputs: [...]"                            │
-  │                                                                         │
-  │ ELSE (runAsSubagent = false):                                           │
-  │   4. Execute inline — do not use runSubagent                            │
-  └─────────────────────────────────────────────────────────────────────────┘
-
-  ┌─── POST-INVOKE ────────────────────────────────────────────────────────┐
-  │ 6. Release agent token                                                  │
-  │    node .github/skills/uwf-state-manager/state.mjs release-agent       │
-  │                                                                         │
-  │ 7. Did the subagent response contain QUESTIONS_NEEDED?                  │
-  │    YES → log each question to SQLite and get IDs back:                  │
-  │           questions.mjs log --stage <stageName> --group "..." \         │
-  │                              --question "..." --required true/false     │
-  │           → capture question_id for each                                │
-  │           → ask user via vscode/askQuestions                            │
-  │           → answer each: questions.mjs answer --id <n> --answer "..."  │
-  │           → GOTO step 2 (re-check, then re-invoke with answered ctx)   │
-  │    NO  → continue                                                       │
-  └─────────────────────────────────────────────────────────────────────────┘
-
-  ┌─── GATE ───────────────────────────────────────────────────────────────┐
-  │ 8. Run gate check                                                       │
-  │    node .github/skills/uwf-{workflow}/run.mjs --check-gate <stageName> │
-  │    exit 0 → record stage-complete; advance to next stage               │
-  │             stage-tracker.mjs stage-complete --workflow <w>            │
-  │                               --stage <stageName>                      │
-  │    exit 1 → apply Gate Failure Protocol (max 2 retries)               │
-  │             stage-tracker.mjs stage-fail --workflow <w>               │
-  │                               --stage <stageName>                      │
-  └─────────────────────────────────────────────────────────────────────────┘
-```
-
-**The GOTO at step 7** means questions unblock the loop from the inside — the orchestrator never advances past a stage until both questions and the gate are fully satisfied. No half-answers, no partial outputs.
-
----
-
-## Gate Enforcement
-
-For every stage, after the designated subagent returns, run the persona's gate script (see **Script-Driven Gate Enforcement** below):
-
-```sh
-node .github/skills/uwf-<workflow>/run.mjs --check-gate <stageName>
-```
-
-- Exit `0` → log `GATE PASS: <stageName>` and advance to the next stage.
-- Exit `1` → parse the JSON failure list from stdout and execute the Gate Failure Protocol below.
-
-Do **not** evaluate gate conditions through reasoning or artifact inspection in the conversation loop — the script is the authoritative gate.
-
----
-
-## Gate Failure Protocol
-
-When a gate check fails:
-1. Log which check(s) failed and the missing artifact path(s).
-2. Re-invoke the responsible subagent with an explicit note: `"Gate failure: <artifact> missing or empty. Please produce it."`.
-3. Re-check the gate after the subagent returns.
-4. Allow up to **2 retries** per gate. After 2 failures, **halt** the sequence and report the blockage to the user with: gate name, missing artifacts, and the subagent's last response.
-
-**Prescriptions.** The `--check-gate` JSON carries `failures` (what is wrong) and a parallel `prescriptions: string[]` (one imperative sentence per failed check saying exactly what to produce, e.g. `Include the text "verdict: approved" in <path>.`), plus the gate's `on_gate_failure` and `max_retries`. Use the prescriptions as the retry instruction; the deterministic runner composes them into its retry prompt (`scripts/uwf-runner/runner.mjs`). `runner.mjs gates --workflow <w>` prints every stage's prescriptions for audit.
-
----
-
-## Review Fix-Loop Protocol
-
-When a reviewer subagent returns findings:
-1. Parse the fix list. Group fixes by responsible subagent.
-2. Re-invoke each responsible subagent with context: `"Review fix request: <fix description>"`.
-3. After all fixes are applied, re-invoke the reviewer for re-review.
-4. If clean → advance. If still dirty → repeat.
-5. Allow a maximum of **3 total review cycles**. After 3 dirty cycles, halt and surface the remaining issues to the user.
-
----
-
-## Operating Principles
-
-- **Run the full stage sequence without stopping.** After each gate passes, immediately invoke the next subagent. Do not pause, summarize, or yield between stages.
-- Emit a single-line progress trace before each `runSubagent` call (e.g. `[Stage 3/14] discovery → invoking uwf-stage-discovery`). This is the only output allowed mid-sequence.
-- **Subagent hand-off blocks are internal signals, not stopping points.** When a subagent ends with `Current Stage/Phase:` / `Recommended Next Stage/Phase:`, consume that signal internally and immediately invoke the next stage. Never echo it to the user. Never treat it as a reason to pause or yield.
-- The orchestrator itself **never** emits `Current Stage/Phase:` / `Recommended Next Stage/Phase:` blocks. Those blocks are for subagents only.
-- Never start a dependent stage without its prerequisite artifacts confirmed present (per gate definitions).
-- Do not invent facts; use `uwf-stage-discovery` to inspect the workspace when uncertain.
-- On queue empty or workflow completion, summarize completion status and offer a retrospective via `uwf-core-retro` if appropriate.
-
----
-
-## Script-Driven Gate Enforcement
-
-Gate enforcement is implemented in a central, deterministic script — not in the orchestrator's reasoning loop and not duplicated per persona.
-
-### Architecture
+## Engine File Map and Two-Root Resolution
 
 | File | Purpose |
 |---|---|
-| `.github/skills/uwf-orchestration-engine/stage-tracker.mjs` | **Central** stage tracking and gate evaluation CLI |
-| `.github/skills/uwf-orchestration-engine/stage-schema.yaml` | SQLite table definitions for `stage_runs` and `stage_history` |
-| `.github/skills/uwf-orchestration-engine/uwf-stages.db` | Shared SQLite DB (all workflows, one file; in `.gitignore`) |
-| `.github/skills/uwf-{workflow}/stages.yaml` | **Per-persona** stage definitions (name, agent, gate conditions, retries) |
-| `.github/skills/uwf-{workflow}/run.mjs` | Thin shim — translates legacy `--list-stages` / `--check-gate` flags to `stage-tracker.mjs` |
+| `.github/skills/uwf-orchestration-engine/stage-tracker.mjs` | Central stage resolution, deterministic gate evaluation, prescription audit, and SQLite tracking CLI |
+| `.github/skills/uwf-orchestration-engine/stage-schema.yaml` | SQLite table definitions (`stage_runs` and append-only `stage_history`), auto-migrated on open |
+| `.github/skills/uwf-orchestration-engine/uwf-stages.db` | Default SQLite stage database when `--db-path` / `--data-dir` / `UWF_DATA_DIR` are unset (gitignored) |
+| `.github/skills/uwf-orchestration-engine/stage-contracts/*.yaml` | Canonical stage contracts (`intake.yaml`, `discovery.yaml`) defining `default_agent`, `supported_traits`, and `default_behavior_policy` |
+| `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json` | Draft-07 JSON Schema for machine-readable review and acceptance stage verdicts (`<prefix>-<stage>.result.json`) |
+| `.github/skills/uwf-orchestration-engine/verify.mjs` | Target-repository verification runner invoked by `run_script` checks on implementation stages |
+| `.github/skills/uwf-orchestration-engine/skill-runner.mjs` | Legacy JS gate helpers kept for custom script compatibility |
+| `.github/skills/uwf-{workflow}/stages.yaml` | Per-workflow declarative stage graph, inputs/outputs, retry policy, `on_verdict` routes, and gate checks |
+| `.github/skills/uwf-{workflow}/run.mjs` | Thin per-workflow CLI shim forwarding `--list-stages` and `--check-gate <stage>` to `stage-tracker.mjs` |
 
-The orchestrator's call convention (`run.mjs --list-stages`, `run.mjs --check-gate <stage>`) is **unchanged**. The shims forward those calls transparently to `stage-tracker.mjs`.
+### Skills Root vs Target Repository Root
 
-### Orchestrator gate-check protocol
+`stage-tracker.mjs` separates workflow definitions from the repository under modification:
 
-Before advancing past any stage, the orchestrator **must** run the gate check via terminal:
+- **Skills root** (`--skills-root <dir>` or `UWF_SKILLS_ROOT`): Directory containing `.github/skills` and `.github/agents`. When a consumer repository carries its own `.github/skills/uwf-{workflow}/stages.yaml`, target-local files take precedence and missing engine scripts or agents fall back to the `UAW` checkout.
+- **Target repository root** (`process.cwd()`): Working directory against which `{{cwd}}`, stage `outputs`, and `run_script` checks execute.
 
-```sh
-node .github/skills/uwf-<workflow>/run.mjs --check-gate <stageName> \
-  --output-path ./tmp/workflow-artifacts \
-  --state-path ./tmp/uwf-state.json
-```
+### Path Template Variables and Data Directory Precedence
 
-**Exit codes:**
-| Code | Meaning |
-|---|---|
-| `0` | Gate passed — advance to next stage |
-| `1` | Gate failed — stdout contains JSON `{ stage, passed, failures[] }` |
-| `2` | Usage error (bad stage name / missing args) |
-
-On exit code `1`, apply the Gate Failure Protocol (re-invoke responsible subagent with failure details, up to `maxRetries` times). Retrieve `maxRetries`, `onGateFailure` and `retryMode` (`resume` = reuse the previous attempt's session, `fresh` = start a new one; the session id of each attempt is stored in `stage_runs.session_id`, `stage-start|stage-complete|stage-fail|stage-skip --session-id <id>`) for any stage via:
-
-```sh
-node .github/skills/uwf-<workflow>/run.mjs --list-stages
-```
-
-### Stage execution tracking (optional but recommended)
-
-The orchestrator may optionally record stage lifecycle events for observability:
-
-```sh
-# Mark stage active when subagent is invoked
-node .github/skills/uwf-orchestration-engine/stage-tracker.mjs stage-start \
-  --workflow <name> --stage <stageName>
-
-# Mark stage passed after gate clears
-node .github/skills/uwf-orchestration-engine/stage-tracker.mjs stage-complete \
-  --workflow <name> --stage <stageName>
-
-# Record a gate failure + increment retry count
-node .github/skills/uwf-orchestration-engine/stage-tracker.mjs stage-fail \
-  --workflow <name> --stage <stageName> [--note "<reason>"]
-
-# Mark stage skipped
-node .github/skills/uwf-orchestration-engine/stage-tracker.mjs stage-skip \
-  --workflow <name> --stage <stageName>
-
-# Read full execution state for a workflow
-node .github/skills/uwf-orchestration-engine/stage-tracker.mjs read \
-  --workflow <name>
-
-# Reset tracking for a fresh run
-node .github/skills/uwf-orchestration-engine/stage-tracker.mjs init \
-  --workflow <name>
-```
-
-### Shared utilities (skill-runner.mjs)
-
-`skill-runner.mjs` remains available for any JS that still needs direct helper functions:
-- `requireNonEmptyFile(path, label)`
-- `requireFileContains(path, needle, label)`
-- `requireFilesWithPrefix(dir, prefix, label)`
-- `requireFileMatchingPattern(baseDir, regex, label)`
-- `gatePass(stageName)` / `gateFail(stageName, failures[])`
-- `runCLI(stages)` — legacy CLI dispatcher (still valid for custom JS gates)
-
----
-
-## Adding a New Workflow (for workflow authors)
-
-Creating a new persona requires **only two files** in the new skill directory — no JS gate code needed:
-
-1. **`stages.yaml`** — declares every stage with gate conditions (see format below).
-2. **`run.mjs`** — a thin shim (copy from `uwf-sw_dev/run.mjs`, change the workflow name).
-3. Create stage agent files: `.github/agents/uwf-{name}-{stage}.agent.md`.
-4. Add all new stage agents to the `agents:` list in `uwf-core-orchestrator.agent.md`.
-5. Bootstrap the orchestrator with `workflow={name}`.
-
-### stages.yaml format
-
-```yaml
-workflow: <name>
-artifact_prefix: <prefix>          # e.g. "issues" or "project"
-output_path: ./tmp/workflow-artifacts
-
-stages:
-  - name: <stage-name>
-    agent: <subagent-id>
-    max_retries: 2                 # retries before gate failure escalates
-    on_gate_failure: retry         # retry | abort | skip
-    retry_mode: resume             # resume (default) = retries continue the previous adapter session; fresh = new session per attempt
-    max_turns: 20                  # positive integer; cap on agent turns per attempt (default 20, implementation 30). Hitting it is a gate failure
-    gated: true                    # false = always passes (best-effort stages)
-    conditional: true              # optional; gate auto-passes if condition is false
-    condition:                     # evaluated only when conditional: true
-      type: file_contains          # file_contains | file_contains_any
-      path: "{{output_path}}/..."
-      text: "MARKER"
-    gate:
-      checks:                      # all checks must pass for gate to clear
-        - type: require_non_empty
-          path: "{{output_path}}/artifact.md"
-          label: "artifact.md"
-        - type: require_contains
-          path: "{{output_path}}/artifact.md"
-          text: "APPROVED"
-          label: "artifact.md"
-        - type: require_files_with_prefix
-          dir: "{{cwd}}/docs/adr"
-          prefix: "ADR-"
-          label: "ADR-*.md"
-        - type: require_file_matching_pattern
-          dir: "{{cwd}}/tmp/state"
-          pattern: "/open/.*\\.md$"
-          label: "open issue files"
-        - type: require_json_field   # structured verdict; exactly one of equals | in | exists
-          path: "{{output_path}}/prefix-review.result.json"
-          pointer: /verdict          # RFC 6901 JSON pointer
-          equals: approved
-          schema: stage-result       # optional; validates against schemas/stage-result.schema.json
-          label: "prefix-review.result.json"
-```
-
-`require_json_field` fails with `<label> (<path>) pointer <pointer>: observed <value>, expected ...`, or `file missing` / `invalid JSON` / `does not match stage-result schema: ...`. Review and acceptance stages write `<prefix>-<stage>.result.json` (`{ verdict: approved|changes_requested|blocked, findings: [{severity: high|medium|low, summary, location?}], notes? }`) beside their markdown.
-
-**Template variables** available in any `path` or `dir` value:
+Gate paths, directories, and `run_script` `args` support three template variables:
 
 | Variable | Resolves to |
 |---|---|
-| `{{output_path}}` | `--output-path` flag value (default `./tmp/workflow-artifacts`) |
-| `{{state_path}}` | `--state-path` flag value (default `./tmp/uwf-state.json`) |
-| `{{cwd}}` | `process.cwd()` at runtime |
+| `{{output_path}}` | `--output-path` flag value; defaults to `<data-dir>/workflow-artifacts` when `--data-dir` or `UWF_DATA_DIR` is set, otherwise `./tmp/workflow-artifacts` |
+| `{{cwd}}` | Target repository working directory (`process.cwd()`) at evaluation time |
+| `{{skills_root}}` | Resolved `--skills-root` / `UWF_SKILLS_ROOT`, or `process.cwd()` when unset |
 
-### Required sections in a persona SKILL.md
+SQLite databases (`uwf-stages.db` and sibling skill stores) resolve in strict order:
+1. `--db-path <file>`
+2. `--data-dir <dir>` (`<dir>/uwf-stages.db`)
+3. `UWF_DATA_DIR` environment variable (`$UWF_DATA_DIR/uwf-stages.db`)
+4. The skill's own directory (`.github/skills/uwf-orchestration-engine/uwf-stages.db`)
 
-| Section | Content |
-|---|---|
-| `mode` | The string passed as `mode` in the invocation contract |
-| `Stage Sequence` | Ordered table: `# \| Stage \| Subagent \| Purpose` — gate logic lives in `stages.yaml` |
-| `Subagent Roster` | List of all subagent names this persona uses |
-| `Artifact Prefix` | The filename prefix for all generated artifacts |
+Concurrent workflow fronts against the same repository must pass distinct `--data-dir` and `--output-path` directories so SQLite stores and stage artifacts stay isolated.
 
-## Data directory
+## `stages.yaml` Schema Reference
 
-Databases resolve in this order: `--db-path <file>`, then `--data-dir <dir>`, then the `UWF_DATA_DIR` environment variable, then the skill's own folder. The data directory is created if it does not exist.
+Each workflow persona declares its stage graph in `.github/skills/uwf-{workflow}/stages.yaml`:
+
+```yaml
+workflow: sw_dev
+artifact_prefix: issues              # filename stem prefix (e.g. "issues", "project", "arch", "forensic")
+output_path: ./tmp/workflow-artifacts
+
+stages:
+  - name: discovery
+    stage_type: discovery            # mutually exclusive with `agent:`
+    traits:                          # required non-empty list when `stage_type` is set
+      - codebase_scanning
+    advances_phase_to: discovery     # optional phase transition in uwf-state-manager
+    inputs:
+      - "{{output_path}}/issues-intake.md"
+    outputs:
+      - "{{output_path}}/issues-discovery.md"
+    run_as_subagent: true            # default true; false runs inline in hosts that support it
+    max_retries: 2                   # default 2 retries after initial attempt
+    on_gate_failure: retry           # retry (default) | abort | skip
+    retry_mode: resume               # resume (default) | fresh
+    max_turns: 20                    # positive integer; default 20 (implementation defaults to 30)
+    max_cost_usd: 2.50               # optional positive number; per-stage attempt cost cap in USD
+    model: claude-sonnet-5-5         # optional per-stage model override (--model CLI flag wins)
+    gated: true                      # default true; false auto-passes best-effort stages
+    conditional: true                # optional; when true, evaluates `condition` before gate checks
+    condition:
+      type: file_contains            # file_contains | file_contains_any
+      path: "{{output_path}}/issues-requirements.md"
+      text: "ADR_REQUIRED"           # use `texts: [...]` for `file_contains_any`
+    on_verdict:                      # optional map: observed /verdict -> earlier stage route
+      changes_requested:
+        route_to: implementation     # must name an earlier stage in this workflow
+        max_round_trips: 2           # positive integer; default 2
+    gate:
+      checks:
+        - type: require_non_empty
+          path: "{{output_path}}/issues-discovery.md"
+          label: "issues-discovery.md"
+```
+
+### Stage Definition Fields
+
+| Field | Type / Default | Semantics |
+|---|---|---|
+| `name` | `string` (required) | Unique stage identifier within the workflow |
+| `agent` | `string` | Explicit `.github/agents/<agent>.agent.md` name (legacy stage; mutually exclusive with `stage_type`) |
+| `stage_type` + `traits` | `string` + `string[]` | Canonical stage contract in `stage-contracts/<stage_type>.yaml` merged with ordered trait policies from `.github/skills/uwf-traits/traits/<trait>.yaml` and model steering from `.github/skills/uwf-model-adaptation/profiles.yaml` |
+| `inputs` / `outputs` | `string[]` (`[]`) | Templated artifact paths materialized into stage prompts and permission scopes |
+| `advances_phase_to` | `string \| null` (`null`) | Target phase emitted in `state_actions` when `stage-complete` or `stage-skip` succeeds |
+| `run_as_subagent` | `boolean` (`true`) | Exposes `runAsSubagent` in `list-stages` and `stage_runs.run_as_subagent` |
+| `max_retries` | `integer` (`2`) | Maximum retry attempts before a failing gate escalates |
+| `on_gate_failure` | `retry \| abort \| skip` (`retry`) | Policy returned on gate failure (`skip` and `abort` act on the first failure) |
+| `retry_mode` | `resume \| fresh` (`resume`) | `resume` reuses `stage_runs.session_id` across retries; `fresh` starts a new adapter session |
+| `max_turns` | `integer` (`20`, `implementation`: `30`) | Per-attempt turn ceiling exposed as `maxTurns` |
+| `max_cost_usd` | `number \| null` (`null`) | Optional per-stage summed USD cap exposed as `maxCostUsd` |
+| `model` | `string \| undefined` | Optional stage-level model selection (overridden by runner `--model`) |
+| `on_verdict` | `map \| null` (`null`) | Maps an observed JSON `/verdict` value to `{ route_to, max_round_trips }` (default `2`), exposed as `onVerdict: { <verdict>: { routeTo, maxRoundTrips } }` |
+| `gated` | `boolean` (`true`) | When `false`, `check-gate` always exits `0` (`note: "ungated — always passes"`) |
+| `conditional` + `condition` | `boolean` + `object` | When `conditional: true` and `condition` (`file_contains` with `text`, or `file_contains_any` with `texts[]`) evaluates `false`, `check-gate` exits `0` (`note: "conditional — not required"`) |
+
+When merging `stage_type` + `traits`, `stage-tracker.mjs` computes `behavior_policy` by taking the ordered union of `priority_order`, `must_address`, and `risk_focus`, and selecting the stricter `question_policy` (`minimal < standard < aggressive`) and `evidence_threshold` (`low < standard < high`).
+
+## Gate Check Types and Prescriptions
+
+Every entry under `gate.checks` is evaluated deterministically by `evaluateCheck` in `stage-tracker.mjs`:
+
+| `type` | Required keys | Pass condition and prescription behavior |
+|---|---|---|
+| `require_non_empty` | `path` (`label` optional) | File exists at templated `path` and size `> 0`. Prescribes: `Write a non-empty file at <path>.` |
+| `require_contains` | `path`, plus `text` or `heading` (`label` optional) | With `text`: file contains exact substring `text`. With `heading` (e.g. `"## Overview"`): line-anchored case-insensitive heading match tolerating optional numeric prefixes such as `## 1. Overview` or `## 3.1) Overview`. Missing files return `null` so `require_non_empty` reports absence once. |
+| `require_files_with_prefix` | `dir`, `prefix` (`label` optional) | Directory exists and contains at least one entry starting with `prefix`. |
+| `require_file_matching_pattern` | `dir`, `pattern` (`label` optional) | Directory exists and recursive walk finds a path matching `new RegExp(pattern)`. |
+| `run_script` | `cmd` (`args` array and `label` optional) | Runs `cmd` with `UWF_DATA_DIR` forwarded when `--data-dir` is set. When `args` is provided, executes `execFileSync(cmd, args)` directly without a shell; templated values (`{{...}}`) **must** be passed via `args` (templating inside a shell-form `cmd` without `args` is rejected). Relative `.github/skills/...` and `.github/agents/...` paths resolve to the target repo when present, otherwise to `--skills-root` / the `UAW` checkout. |
+| `require_json_field` | `path`, `pointer`, and **exactly one** of `equals`, `in`, or `exists` (`schema` and `label` optional) | Parses JSON at `path`, optionally validates `schema: stage-result` against `schemas/stage-result.schema.json`, resolves RFC 6901 `pointer` (e.g. `/verdict`), and checks `equals`, `in` (`array`), or `exists` (`boolean`). |
+
+### Gate Output and Verdict-Outcome Prescriptions
+
+`check-gate` writes JSON to stdout and persists it to `stage_runs.gate_result`:
+
+```json
+{
+  "stage": "review",
+  "passed": false,
+  "failures": [
+    "issues-review.result.json (./tmp/workflow-artifacts/issues-review.result.json) pointer /verdict: observed \"changes_requested\", expected equals \"approved\""
+  ],
+  "prescriptions": [
+    "./tmp/workflow-artifacts/issues-review.result.json records verdict \"changes_requested\" (wanted \"approved\"); the verdict is a review outcome, not something to rewrite, so do not change it to pass the gate."
+  ],
+  "verdict": "changes_requested",
+  "on_gate_failure": "retry",
+  "max_retries": 2
+}
+```
+
+- **Retry prescriptions**: Parallel `prescriptions[]` give one imperative repair instruction per failed check (used directly in retry prompts by `scripts/uwf-runner/runner.mjs` and inspectable via `stage-tracker.mjs gate-prescriptions --workflow <name>`).
+- **Verdict non-rewrite protection**: When a `verdict:` markdown line or `/verdict` JSON pointer already records a valid non-matching verdict (and `stage-result` schema validation passes), `prescribeCheck` explicitly states that the verdict is a review outcome rather than asking the agent to overwrite it, and `evaluateGate` attaches top-level `"verdict"` whenever no other non-verdict check failed.
+
+## Structured Stage Results, Verdict Routing, and Question Pauses
+
+### Structured Stage Result Schema (`schemas/stage-result.schema.json`)
+
+Review and acceptance stages write `<prefix>-<stage>.result.json` alongside `<prefix>-<stage>.md`. When a gate specifies `schema: stage-result`, `stage-tracker.mjs` validates the JSON document against `.github/skills/uwf-orchestration-engine/schemas/stage-result.schema.json`:
+
+```json
+{
+  "verdict": "changes_requested",
+  "findings": [
+    {
+      "severity": "high",
+      "summary": "Missing rollback transaction on stage reset",
+      "location": "src/tracker.mjs:142"
+    }
+  ],
+  "notes": "1 blocking defect requires an implementation round trip."
+}
+```
+
+- **Required top-level fields**: `verdict` (`"approved"` | `"changes_requested"` | `"blocked"`) and `findings` (`array`; use `[]` when clean). Optional: `notes` (`string`).
+- **Finding item fields**: required `severity` (`"high"` | `"medium"` | `"low"`) and `summary` (`string`); optional `location` (`string`). Review database severities map `critical` -> `high`, `major` -> `medium`, and `minor` -> `low`; database `rejected` maps to `blocked`.
+- **Agreement invariant**: The JSON `/verdict` value and the markdown `verdict: <value>` line must agree.
+
+### Verdict Routing (`on_verdict` Fix-Loop Contract)
+
+Workflows with review loops (`*(fix-loop — see engine skill)*` in persona `SKILL.md` tables) declare `on_verdict` on the reviewer stage:
+
+1. **Trigger**: A gated stage fails *only* because its `/verdict` check observed a valid schema-compliant verdict listed in `on_verdict` (for example, `changes_requested`), causing `check-gate` to emit `"verdict": "changes_requested"`. Malformed JSON or missing files omit `"verdict"` and use normal `on_gate_failure` retries instead.
+2. **Rollback and reset**: Instead of retrying the reviewer, the host rolls workflow state back to the phase preceding `route_to` (`state.mjs rollback`) and resets `route_to` plus all downstream stages to `pending` via `stage-tracker.mjs reset-from --workflow <name> --stage <route_to>`.
+3. **Findings handoff**: The reviewer's primary output (such as `issues-review.md`) is injected as an extra input into `route_to` and every stage up to the reviewer, and the reviewer runs in a fresh session on re-entry. `scripts/uwf-runner/runner.mjs` persists active round-trip counts and findings in `<data-dir>/runner-routing.json` across `resume` and `--from-stage`.
+4. **Budget enforcement**: Once `max_round_trips` (default `2`) for that verdict is exhausted, the stage is marked `failed` and execution halts with exit `1`.
+
+### Pending Questions and `needs-user-decision` Pauses
+
+Ambiguity and human decisions are tracked through `.github/skills/uwf-question-protocol/questions.mjs` (see `.github/skills/uwf-question-protocol/SKILL.md`):
+
+- **Pre-stage check**: `node .github/skills/uwf-question-protocol/questions.mjs check --stage <stage>` exits `0` when clear and `1` when required questions for `<stage>` remain unanswered.
+- **Stage question emission**: Stages emit a `QUESTIONS_NEEDED` block, a non-empty `questions` array in JSON output, or a `needs-user-decision: <text>` line in markdown output. Runner surfaces log each item via `questions.mjs log` and pause (exit `3` in `runner.mjs`) until answered via `questions.mjs answer --id <n> --answer "..."`.
+
+## `stage-tracker.mjs` CLI Reference
+
+```sh
+node .github/skills/uwf-orchestration-engine/stage-tracker.mjs <command> [options]
+```
+
+| Command | Required flags | Optional flags | Behavior & JSON stdout |
+|---|---|---|---|
+| `list-stages` | `--workflow <w>` | `--model-profile <p>`, `--skills-root <dir>`, `--output-path <p>`, `--data-dir <d>` | Validates `stages.yaml`, resolves `stage_type` + `traits` + steering policies, and prints the ordered JSON array of stage descriptors |
+| `check-gate` | `--workflow <w> --stage <s>` | `--output-path <p>`, `--data-dir <d>`, `--db-path <f>`, `--skills-root <dir>` | Evaluates stage gate, updates `stage_runs.gate_result` if seeded, prints gate JSON, and exits `0` (`passed: true`) or `1` (`passed: false`) |
+| `gate-prescriptions` | `--workflow <w>` | `--output-path <p>`, `--data-dir <d>`, `--skills-root <dir>` | Prints `{ workflow, stages[] }` with every stage's policy fields and audit prescriptions |
+| `init` | `--workflow <w>` | `--data-dir <d>`, `--db-path <f>`, `--skills-root <dir>` | Replaces `stage_runs` rows for `<w>` with `pending` rows in YAML order and logs `"Workflow initialized"` in `stage_history` |
+| `read` | `--workflow <w>` | `--data-dir <d>`, `--db-path <f>` | Prints `{ ok: true, procedure: "read", workflow, state: stage_runs[] }` |
+| `stage-start` | `--workflow <w> --stage <s>` | `--session-id <id>`, `--note <t>`, `--data-dir <d>`, `--db-path <f>` | Marks stage `active`, sets `started_at`, and returns `pre_flight_check` + `state_actions` |
+| `stage-complete` | `--workflow <w> --stage <s>` | `--session-id <id>`, `--note <t>`, `--data-dir <d>`, `--db-path <f>` | Marks stage `passed`, sets `completed_at`, and returns `state_actions` (`release-agent` and `advance` when `advances_phase_to` is set) |
+| `stage-fail` | `--workflow <w> --stage <s>` | `--note <t>`, `--session-id <id>`, `--data-dir <d>`, `--db-path <f>` | Marks stage `failed`, increments `retry_count`, coalesces `session_id`, and returns `retry_count` + `state_actions` |
+| `stage-skip` | `--workflow <w> --stage <s>` | `--session-id <id>`, `--note <t>`, `--data-dir <d>`, `--db-path <f>` | Marks stage `skipped`, sets `completed_at`, and returns `state_actions` |
+| `stage-session` | `--workflow <w> --stage <s> --session-id <id>` | `--data-dir <d>`, `--db-path <f>` | Persists adapter `session_id` without changing `status` so crash recovery can resume |
+| `reset-from` | `--workflow <w> --stage <s>` | `--note <t>`, `--data-dir <d>`, `--db-path <f>` | Resets `<s>` and all subsequent YAML stages to `pending` (`retry_count = 0`, `session_id = NULL`) and appends `stage_history` rows |
+| `reset` | *(none)* | `--data-dir <d>`, `--db-path <f>` | Deletes the resolved `uwf-stages.db` file and prints `{ ok: true, procedure: "reset", deleted }` |
+
+**Exit codes**: `0` = command succeeded (or gate passed for `check-gate`); `1` = gate failed or operational validation error (`{ ok: false, error }` on stdout); `2` = CLI usage error on stderr (`Usage error: ...`).
+
+## Artifact Handoffs, Stage Context, and Adding a Workflow
+
+### Materialized Stage Context Contract
+
+When a runner or plugin invokes a stage agent, it supplies the resolved stage context alongside templated `inputs` and required `outputs` (see `scripts/uwf-runner/prompt.mjs`):
+
+- **Base context**: `workflow`, `role` (artifact/DB namespace from the persona skill), `phase`, and resolved `outputPath`.
+- **Canonical stage policy context** (when `stage_type` is non-null): `stage_type`, `trait_ids`, `model_profile`, `behavior_policy`, and `steering_policy` from `list-stages`.
+- **Skipped-stage inputs**: When an upstream conditional or `on_gate_failure: skip` stage is skipped, downstream stages treat its declared outputs as unavailable optional inputs rather than missing prerequisites.
+
+### Adding a New Workflow
+
+1. Create `.github/skills/uwf-{name}/stages.yaml` declaring `workflow`, `artifact_prefix`, `output_path`, and `stages` (using canonical `stage_type` + `traits` where a contract exists, or `agent` for persona-specific agents).
+2. Create `.github/skills/uwf-{name}/run.mjs` forwarding `--list-stages` and `--check-gate` to `../uwf-orchestration-engine/stage-tracker.mjs` with `--workflow <name>`.
+3. Document `mode` / `role`, `Artifact Prefix`, `Stage Sequence`, and `Subagent Roster` in `.github/skills/uwf-{name}/SKILL.md`.
+4. Create any new `.github/agents/uwf-{name}-{stage}.agent.md` definitions (and if supporting the Copilot Chat fallback, list them under `agents:` in `.github/agents/uwf-core-orchestrator.agent.md` per [`docs/guide/copilot-orchestrator.md`](../../../docs/guide/copilot-orchestrator.md)).
+5. Verify reference and gate integrity:
+   ```sh
+   node scripts/uwf-smoke/test-skill-reference-integrity.mjs
+   node scripts/uwf-smoke/test-prompt-references.mjs
+   ```
+   Expected output: `0 failed` in `test-skill-reference-integrity.mjs` and `prompt files OK` in `test-prompt-references.mjs`.
+
+### Legacy `skill-runner.mjs` Helpers
+
+`.github/skills/uwf-orchestration-engine/skill-runner.mjs` remains available for standalone Node scripts that call imperative file-check helpers directly (`requireNonEmptyFile`, `requireFileContains`, `requireFilesWithPrefix`, `requireFileMatchingPattern`, `gatePass`, `gateFail`, `runCLI`). Declarative `stages.yaml` workflows should use `stage-tracker.mjs` instead.
