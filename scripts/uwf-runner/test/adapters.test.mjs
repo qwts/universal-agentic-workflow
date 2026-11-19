@@ -22,7 +22,7 @@ function cliAvailable(bin) {
   try { execFileSync(bin, ["--version"], { stdio: "ignore" }); return true; } catch { return false; }
 }
 
-async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase }) {
+async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase, extraOpts }) {
   console.log(`# adapter: ${adapterName}`);
   const adapter = await loadAdapter(adapterName);
   const root = mkdtempSync(join(tmpdir(), `uwf-adapter-${adapterName}-`));
@@ -30,7 +30,7 @@ async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase })
   const dataDir = join(root, "data");
   mkdirSync(cwd);
   try {
-    const base = { prompt, cwd, dataDir, model, permissions: "read-only", timeoutMs: 180000 };
+    const base = { prompt, cwd, dataDir, model, permissions: "read-only", timeoutMs: 180000, ...extraOpts };
     const extraFor = (n) => (fixtureFor ? { fixture: fixtureFor(root, n) } : undefined);
 
     const r1 = await adapter.invokeStage({ ...base }, extraFor(1));
@@ -80,6 +80,24 @@ async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase })
   });
   check("fake: sessionId from fixture", r.sessionId === "fake-sess-1");
   check("fake: usage is null", r.usage === null);
+}
+
+// --- monolith adapter (offline: delegates to fake backend) ---
+{
+  const r = await contract("monolith", {
+    prompt: "Run the monolith stage for the sw_dev workflow.",
+    timeoutCase: { timeoutMs: 50 },
+    extraOpts: { backend: "fake" },
+    fixtureFor: (root, n) => {
+      const p = join(root, `monolith-fixture-${n}.json`);
+      writeFileSync(p, JSON.stringify(n === "slow"
+        ? { transcript: "slow", delayMs: 2000 }
+        : { files: { "out/result.md": "# done\n" }, transcript: "OK", sessionId: "monolith-sess-1" }));
+      return p;
+    },
+  });
+  check("monolith: sessionId from backend fixture", r.sessionId === "monolith-sess-1");
+  check("monolith: usage is null under fake backend", r.usage === null);
 }
 
 // --- claude-code argv (offline: a fake `claude` on PATH records the argv it was spawned with) ---

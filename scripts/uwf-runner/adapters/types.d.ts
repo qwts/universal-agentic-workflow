@@ -47,4 +47,4 @@ export interface Adapter {
   invokeStage(opts: InvokeStageOptions, extra?: { fixture?: string }): Promise<InvokeStageResult>;
 }
 
-export function loadAdapter(name: "claude-code" | "codex" | "fake" | string): Promise<Adapter>;
+export function loadAdapter(name: "claude-code" | "codex" | "fake" | "grokbot" | "monolith" | string): Promise<Adapter>;

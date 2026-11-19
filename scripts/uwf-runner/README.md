@@ -30,6 +30,7 @@ const r = await adapter.invokeStage({
 | `codex` | `codex exec` | see below |
 | `fake` | none | offline fixture replay for CI |
 | `grokbot` | none (file handoff) | external agent (e.g. Grok Bot) fulfils each stage; see below |
+| `monolith` | delegates via `--backend` | single long-prompt control condition (no CLI state offloading; post-hoc gate evaluation); see below |
 
 ### What a stage inherits from the machine
 
@@ -94,6 +95,41 @@ cat ../my-app-uwf/grokbot/pending.json   # -> request .md + responsePath
 Limitations: no usage/cost reporting (`usage: null`); `permissions` and `maxTurns` are advisory (written into the request,
 not enforced); one pending request at a time per data dir.
 
+### `monolith` adapter (control condition)
+
+Single-session control condition for the CLI state-offload experiment (issue #102; see `docs/research/cli-offload-design.md` §3.1).
+Instead of stepping stage-by-stage through the runner loop, `monolith` assembles one long prompt containing the authoritative
+stage sequence, every stage's materialized instructions, inputs/outputs, and gate criteria, then runs a single session against
+an underlying harness backend (`--backend claude-code|codex|fake|grokbot` or `UWF_MONOLITH_BACKEND`; defaults to `claude-code`,
+or `fake` when `UWF_FAKE_FIXTURE` / `UWF_FAKE_FIXTURE_DIR` is set).
+
+During the session the model must self-track workflow state, phase transitions, retries, and review fix-loops in context
+without invoking `stage-tracker.mjs`, `state.mjs`, `run.mjs`, or `questions.mjs`. Afterward, `evaluateMonolithGates` runs
+`run.mjs --check-gate <stage>` across every stage so first-try pass rate and per-stage results are measured identically to the
+runner condition, recording summary metrics to `<dataDir>/monolith-metrics.json` and the session transcript to
+`<dataDir>/transcripts/`. Pass `--mark-stage-cmd <cmd>` (or `UWF_MONOLITH_MARK_STAGE`) to instruct the model to emit
+stage-completion timestamps for post-hoc telemetry. `resume` is intentionally unsupported (single-session control).
+
+```sh
+node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md \
+  --adapter monolith --backend claude-code --model claude-sonnet-5-5 \
+  --repo-root ../my-app --data-dir ../my-app-monolith
+```
+
+#### Embedded Round 1 / Round 2 orchestrator rules
+
+The control system prompt embeds these explicit rules from `docs/guide/copilot-orchestrator.md` and `docs/research/cli-offload-design.md` (§3.1) (`ROUND1_ROUND2_RULES` in `adapters/monolith.mjs`):
+
+| Rule ID | Source | Control Behavior |
+| --- | --- | --- |
+| `authoritative-stage-order` | `copilot-orchestrator.md` (§Startup Procedure, §Violations to Avoid) | Execute every stage in exact authoritative order; never skip, reorder, merge, or substitute stages from memory. |
+| `self-tracked-state-no-cli` | `cli-offload-design.md` (§3.1); control counterpart to `copilot-orchestrator.md` (§Recorded stage transitions) | Self-track active stage, phase, artifacts, retries, and review round trips in context; do not call `stage-tracker.mjs`, `state.mjs`, `run.mjs`, or `questions.mjs`. |
+| `self-judged-gates-and-retries` | `copilot-orchestrator.md` (§Gate Failure Protocol); `cli-offload-design.md` (§3.1) | Self-verify every listed gate check before advancing; revise and re-check up to `max_retries` honoring `on_gate_failure` (`retry`, `abort`, `skip`). |
+| `explicit-conditional-evaluation` | `copilot-orchestrator.md` (§Chat-Runtime Principles #4) | Explicitly evaluate conditional stage triggers (e.g. `adr`, `security-plan`) against prerequisite artifacts rather than skipping from memory. |
+| `review-fix-loop-routing` | `copilot-orchestrator.md` (§Review Fix-Loop Protocol) | On blocking review findings (`verdict: changes_requested`), do not rewrite the verdict; route back to `route_to`, fix findings, and re-run forward up to `max_round_trips`. |
+| `single-session-continuity-no-simulation` | `copilot-orchestrator.md` (§Chat-Runtime Principles #6, §Violations to Avoid) | Complete the entire workflow in one continuous session without yielding between stages, simulating stage work, emitting internal hand-off footers, or summarizing before required outputs exist on disk. |
+| `stage-completion-marking` *(optional)* | `cli-offload-design.md` (§3.1) | Added when `--mark-stage-cmd` / `UWF_MONOLITH_MARK_STAGE` is configured; instructs the model to invoke `<cmd> <stageName>` on each stage completion. |
+
 ## Adding an adapter
 
 1. Create `adapters/<name>.mjs` exporting `name` and `invokeStage(opts)`.
@@ -104,12 +140,12 @@ not enforced); one pending request at a time per data dir.
 
 ## Tests
 
-`node scripts/uwf-runner/test/adapters.test.mjs` (live: `UWF_TEST_LIVE=1`; claude uses haiku, codex uses its default model unless `UWF_TEST_CODEX_MODEL` is set).
+`node scripts/uwf-runner/test/adapters.test.mjs` (live: `UWF_TEST_LIVE=1`; claude uses haiku, codex uses its default model unless `UWF_TEST_CODEX_MODEL` is set) and `node scripts/uwf-runner/test/monolith.test.mjs`.
 
 ## Runner (`runner.mjs`)
 
 ```sh
-node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapter claude-code|codex|fake|grokbot] \
+node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal "Add X" [--adapter claude-code|codex|fake|grokbot|monolith] [--backend adapter] \
   [--model m] [--data-dir d] [--output-path p] [--from-stage s] [--non-interactive] [--dry-run] [--timeout-ms n] \
   [--max-cost-usd n] [--resume-max-context tokens]
 ```

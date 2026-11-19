@@ -4,7 +4,7 @@
  *
  * Usage:
  *   node scripts/uwf-runner/runner.mjs run --workflow <w> --goal <file|text>
- *     [--adapter claude-code|codex|fake|grokbot] [--model <m>] [--data-dir <d>] [--output-path <p>]
+ *     [--adapter claude-code|codex|fake|grokbot|monolith] [--backend <adapter>] [--model <m>] [--data-dir <d>] [--output-path <p>]
  *     [--from-stage <s>] [--force] [--unlock] [--non-interactive] [--dry-run] [--timeout-ms <n>]
  *     [--repo-root <target repo>] [--skills-root <dir with .github/skills + .github/agents>]
  *     [--max-cost-usd <n>] [--resume-max-context <tokens>]
@@ -243,6 +243,7 @@ async function main(argv) {
 
   const adapterName = flags.adapter ?? (process.env.UWF_FAKE_FIXTURE_DIR ? "fake" : "claude-code");
   if (!ADAPTERS.includes(adapterName)) throw new UsageError(`Unknown adapter "${adapterName}". Available: ${ADAPTERS.join(", ")}`);
+  if (command === "resume" && adapterName === "monolith") throw new UsageError("monolith adapter is a single-session control condition and does not support resume");
   const fixtureDir = process.env.UWF_FAKE_FIXTURE_DIR;
   if (adapterName === "fake" && !fixtureDir) throw new UsageError("fake adapter requires UWF_FAKE_FIXTURE_DIR");
 
@@ -403,6 +404,17 @@ async function main(argv) {
     }
 
     const adapter = await loadAdapter(adapterName);
+    if (adapterName === "monolith") {
+      const res = await adapter.runMonolith({
+        workflow, stages: stages.slice(start), runScript, trackerScript: TRACKER, stateScript: STATE,
+        repoRoot, skillsRoot, outputPath, dataDir, goal, flags, fixtureDir, timeoutMs, maxCostUsd,
+        phaseFlags, cli, log, EXIT,
+      });
+      const msg = res.exitCode === EXIT.OK ? "workflow complete (monolith control)"
+        : res.exitCode === EXIT.COST ? `monolith control exceeded --max-cost-usd $${maxCostUsd}`
+        : `monolith control: ${res.metrics.summary.gatedPassed}/${res.metrics.summary.gatedEvaluated} gated stages passed on first try`;
+      return finish(res.exitCode, res.rows, msg, note);
+    }
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
       repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
@@ -827,6 +839,7 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRo
     log(`[dry-run] gate checks unavailable: ${e.message}`);
   }
   const out = [`workflow: ${workflow}  stages: ${total}  starting at: ${stages[0]?.name}  output-path: ${outputPath}`];
+  if (adapterName === "monolith") out.push(`mode: monolith control (single session via --backend ${flags.backend ?? process.env.UWF_MONOLITH_BACKEND ?? (process.env.UWF_FAKE_FIXTURE_DIR ? "fake" : "claude-code")}; post-hoc gate evaluation)`);
   if (maxCostUsd !== undefined) out.push(COST_CAP_NOTE(maxCostUsd));
   out.push("");
   for (const [j, st] of stages.entries()) {
