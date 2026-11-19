@@ -32,8 +32,10 @@ Status: Accepted
 - **Materialize `uaw-manifest.json` at `snapshot` / `retro` and seal after
   deliverable commit/publication (`provenance.mjs seal` / `uaw_manifest_seal`).**
   During `snapshot` (`phase: snapshot`) and `retro` (`phase: closed`), UAW
-  materializes `{{output_path}}/uaw-manifest.json` (outside the tracked git
-  deliverable tree) serialized per RFC 8785 JSON Canonicalization Scheme (JCS:
+  materializes `<data-dir>/uaw-manifest.json` (always inside the isolated
+  per-run `data_dir`, outside the tracked git deliverable tree and excluded from
+  [`push-as-bot.mjs`](../../scripts/uwf-on-pr/push-as-bot.mjs) commits even when
+  `output_path` points to a tracked directory) serialized per RFC 8785 JSON Canonicalization Scheme (JCS:
   UTF-16 code-unit sorted keys, IEEE 754 numbers, verbatim Unicode code points
   with no normalization pass, and no insignificant whitespace) and upserts a
   matching row into `run_manifests` in `uwf-state.db` (`run_id`, `workflow`,
@@ -48,7 +50,7 @@ Status: Accepted
   run `retro` with `--defer-seal` and invoke `provenance.mjs seal`
   (`uaw_manifest_seal`) immediately after commit/PR/artifact creation—verifying
   the committed `git_tree_sha` matches the post-`retro` tracked worktree state
-  (excluding ignored `<data-dir>` / `{{output_path}}` paths, and allowing
+  (excluding `<data-dir>`, `tmp/`, and `.gitignore`-excluded paths, and allowing
   `head_commit_sha == base_commit_sha` when no tracked files changed), binding
   the shipped `head_commit_sha` / `pr_url` / `release_tag` / `artifact_uris[]`,
   and only then sealing `run_manifests` (`phase: sealed`) and dispatching the
