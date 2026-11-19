@@ -98,8 +98,14 @@ Status: Accepted
     numbers, slugs, statuses, `superseded_by`, and markdown file `sha256`
     digests), `uwf-discoveries.db` (category counts and unresolved `gap` IDs),
     `uwf-reviews.db` (verdicts and `critical|major|minor` finding resolution
-    counts), `uwf-issues.db` (local tracking counts), and `uwf-questions.db`
-    (resolved/skipped decision counts).
+    counts), `uwf-issues.db` (local tracking counts), `uwf-questions.db`
+    (resolved/skipped decision counts), and the Canonical Build Spec store
+    `.github/skills/uwf-cbs/uwf-cbs.db`
+    ([`uwf-cbs/SKILL.md`](../../.github/skills/uwf-cbs/SKILL.md), when
+    `blueprint` ran—`null` otherwise; canonical SHA-256 digest over sorted,
+    scrubbed `components`, `interfaces`, `dependencies`, `sequencing`, and
+    `constraints` rows plus component/interface/dependency/sequencing counts
+    and constraint counts by severity/status).
   - **Architectural state strata (`architecture`):** exact `{ path, sha256,
     schema_version }` plus structural summaries for `{{artifact_prefix}}-drs.json`
     (`components`, `dependency_graph`, `gap_log`, `divergence_log`,
@@ -196,8 +202,8 @@ Status: Accepted
   vectors), (c) skipped conditional stages (`security-plan`) emit
   `outputs: []` while `blueprint` retains its pre-`snapshot` `issues-br.json`
   digest alongside `snapshot`'s stratum-`5` digest, and (d) modifying a stage
-  artifact prior to `stage-complete` changes both its stage/stratum digest and
-  `manifest_sha256` (while unexpected post-stage mutation of an un-superseded
+  artifact or `.github/skills/uwf-cbs/uwf-cbs.db` prior to `stage-complete`
+  changes its stage/stratum or `stores.cbs` digest and `manifest_sha256` (while unexpected post-stage mutation of an un-superseded
   artifact fails manifest verification with exit code `1`).
 - Sink contract test verifies: (a) unset `UAW_CONTEXT_HUB_SINK` makes zero
   outbound requests and records `sink_status = "disabled"`, (b) `webhook` /

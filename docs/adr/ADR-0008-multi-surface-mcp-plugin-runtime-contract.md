@@ -151,9 +151,16 @@ and [#109](https://github.com/qwts/universal-agentic-workflow/issues/109)
   default `<data-dir>/workflow-artifacts/`. When `output_path` is omitted, the
   MCP server and runner resolve it to `<data-dir>/workflow-artifacts` rather
   than shared `./tmp/workflow-artifacts`; if a caller explicitly supplies an
-  `output_path` outside `data_dir`, mutating tools also acquire an atomic
-  `<output-path>/.uaw-output.lock` so two runs can never share an artifact
-  directory. Mutating tools acquire `<data-dir>/run.lock` (`{ runId, attemptId,
+  `output_path` outside `data_dir`, mutating tools both persist durable
+  ownership metadata in `<output-path>/.uaw-output-owner.json` (`{ run_id,
+  data_dir, claimed_at }`, created atomically via temp-file write +
+  `linkSync` on first claim) and acquire an atomic
+  `<output-path>/.uaw-output.lock` during active execution. Every mutating
+  invocation verifies that `.uaw-output-owner.json` is either absent or
+  matches the caller's durable `run_id` (and `data_dir`), refusing any
+  different `run_id` with exit code `2` even after a paused or completed run
+  releases `.uaw-output.lock` so two runs can never share or overwrite an
+  artifact directory across invocations. Mutating tools acquire `<data-dir>/run.lock` (`{ runId, attemptId,
   pid, workflow, startedAt }`) atomically via temp-file write + `linkSync`;
   locks are never stolen automatically and are cleared on crash only via
   explicit `unlock: true` when the owner PID is dead or unreadable past the
@@ -223,7 +230,11 @@ and [#109](https://github.com/qwts/universal-agentic-workflow/issues/109)
   clobbering `run.lock`) and two parallel calls against distinct `data_dir`
   paths with `output_path` omitted (asserting each writes exclusively to its own
   `<data-dir>/workflow-artifacts/`, preserves its durable `run_id` across
-  `uaw_resume`, and completes `closed` with zero cross-talk).
+  `uaw_resume`, and completes `closed` with zero cross-talk), plus a sequential/paused
+  collision test asserting that a second distinct `run_id` targeting the same
+  explicit `output_path` after the first run pauses and releases
+  `.uaw-output.lock` is rejected with exit code `2` via
+  `.uaw-output-owner.json`.
 - Security test injects synthetic API tokens matching every pattern in
   `secret-patterns.mjs` into a fixture transcript and verifies `uaw_read_transcript`
   and `uaw://<run>/transcripts/<id>` return `[redacted:<kind>]` placeholders with
