@@ -54,7 +54,9 @@ const NON_REFERENCE_TOKENS = new Map([
 ]);
 
 // Paths that are legitimately absent from this checkout.
-const PATH_ALLOWED = new Map([\n  [".github/adr", "an ADR location in the repository being audited, not this one"],
+const PATH_ALLOWED = new Map([
+  [".github/adr", "an ADR location in the repository being audited, not this one"],
+  [".github/uwf-verify.yaml", "an optional verification config in the target repository, not this checkout"],
 ]);
 
 const files = [];

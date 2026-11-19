@@ -333,7 +333,8 @@ function collectTraitFindings(repoRoot) {
     }
 
     traitDefinitions.set(traitId, {
-      source: repoPath(repoRoot, traitFile),\n      value: parsed.value,
+      source: repoPath(repoRoot, traitFile),
+      value: parsed.value,
     });
 
     if (
