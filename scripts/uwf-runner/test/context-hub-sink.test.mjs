@@ -1,0 +1,213 @@
+import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
+import { createServer } from "node:http";
+import {
+  buildSinkEnvelope,
+  canonicalizeJcs,
+  computeIdempotencyKey,
+  dispatchToContextHub,
+  signWebhookPayload,
+  validateSinkUrl,
+} from "../context-hub-sink.mjs";
+
+// Synthetic tokens assembled at runtime so no secret literal sits in the repo.
+const FAKE_OPENAI = "sk-" + "Qw3Er4Ty5Ui6Op7As8Df9Gh0Jk1Lz2Xc";
+const FAKE_BEARER = "Bearer " + "eyJhbGciOiJIUzI1NiJ9.payload-part.sig_part-1234";
+const HUB_SECRET = "uaw-test-hmac-secret-key";
+
+// ---------------------------------------------------------------------------
+// 1. URL Policy: HTTPS required except http://127.0.0.1 loopback
+// ---------------------------------------------------------------------------
+assert.equal(validateSinkUrl("https://hub.example.com/ingest"), "https://hub.example.com/ingest");
+assert.equal(validateSinkUrl("http://127.0.0.1:9999/hook"), "http://127.0.0.1:9999/hook");
+assert.throws(() => validateSinkUrl("http://example.com/hook"), /https:\/\/ is required/);
+assert.throws(() => validateSinkUrl("http://localhost:9999/hook"), /https:\/\/ is required/);
+assert.throws(() => validateSinkUrl("file:///etc/passwd"), /https:\/\/ is required/);
+assert.throws(() => validateSinkUrl(""), /required/);
+
+// ---------------------------------------------------------------------------
+// 2. Zero-overhead no-op when UAW_CONTEXT_HUB_SINK is unset or "none"
+// ---------------------------------------------------------------------------
+const baseEnvelope = buildSinkEnvelope({
+  event: "run.finalized",
+  runId: "run-abc-123",
+  workflow: "sw_dev",
+  stage: "seal",
+  sha256: "f".repeat(64),
+  deliverableKey: "qwts/uaw@deadbeef",
+  payload: {
+    note: `Leak test: ${FAKE_OPENAI} and ${FAKE_BEARER}`,
+    adr: "ADR-0009",
+  },
+});
+
+const envelopeJson = canonicalizeJcs(baseEnvelope);
+assert.ok(!envelopeJson.includes(FAKE_OPENAI), "OpenAI key leaked into envelope");
+assert.ok(!envelopeJson.includes(FAKE_BEARER.slice(7)), "Bearer token leaked into envelope");
+assert.ok(envelopeJson.includes("[redacted:openai-key]"));
+assert.ok(envelopeJson.includes("[redacted:bearer-token]"));
+
+const forbidFetch = async () => { throw new Error("Network I/O must not happen when sink is disabled"); };
+{
+  const r1 = await dispatchToContextHub(baseEnvelope, { env: {}, fetchImpl: forbidFetch });
+  assert.equal(r1.ok, true);
+  assert.equal(r1.status, "disabled");
+  assert.equal(r1.attempts, 0);
+  assert.equal(r1.exitCode, 0);
+
+  const r2 = await dispatchToContextHub(baseEnvelope, { env: { UAW_CONTEXT_HUB_SINK: "none" }, fetchImpl: forbidFetch });
+  assert.equal(r2.ok, true);
+  assert.equal(r2.status, "disabled");
+  assert.equal(r2.attempts, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Deterministic Idempotency Key + Live Loopback Webhook (HMAC-SHA256 + Dedup + Retry)
+// ---------------------------------------------------------------------------
+{
+  const expectedKey = computeIdempotencyKey("run-abc-123", "seal", "f".repeat(64));
+  assert.equal(baseEnvelope.idempotency_key, expectedKey);
+  assert.deepEqual(baseEnvelope.dedup_tuple, {
+    run_id: "run-abc-123",
+    stage: "seal",
+    sha256: "f".repeat(64),
+  });
+
+  const received = [];
+  const dedupStore = new Map();
+  let failOnce = true;
+
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (req.url === "/webhook-flaky" && failOnce) {
+        failOnce = false;
+        res.writeHead(503, { "Content-Type": "text/plain" });
+        res.end("temporary unavailable");
+        return;
+      }
+      if (req.url === "/fail-500") {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("internal error");
+        return;
+      }
+      const key = req.headers["idempotency-key"];
+      const sig = req.headers["x-uaw-signature-256"];
+      received.push({ url: req.url, key, sig, auth: req.headers["authorization"], body });
+      if (key && !dedupStore.has(key)) {
+        dedupStore.set(key, body);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, deduplicated: dedupStore.size }));
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+
+  try {
+    const res1 = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook-flaky`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "strict",
+      },
+      baseDelayMs: 10,
+    });
+    assert.equal(res1.ok, true);
+    assert.equal(res1.status, "delivered");
+    assert.equal(res1.attempts, 2, "Should retry once after 503");
+    assert.equal(res1.exitCode, 0);
+
+    const res2 = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook-flaky`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "strict",
+      },
+      baseDelayMs: 10,
+    });
+    assert.equal(res2.ok, true);
+    assert.equal(res2.idempotency_key, res1.idempotency_key);
+    assert.equal(dedupStore.size, 1, "Idempotent replay must not create duplicate records");
+
+    const wire = received[0];
+    const expectedSig = "sha256=" + createHmac("sha256", HUB_SECRET).update(wire.body, "utf8").digest("hex");
+    assert.equal(wire.sig, expectedSig);
+    assert.equal(wire.sig, signWebhookPayload(wire.body, HUB_SECRET));
+    assert.ok(!wire.body.includes(FAKE_OPENAI));
+    assert.ok(!wire.body.includes(FAKE_BEARER.slice(7)));
+
+    const logs = [];
+    const bestEffortFail = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/fail-500`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "best_effort",
+      },
+      maxAttempts: 2,
+      baseDelayMs: 5,
+      log: (m) => logs.push(m),
+    });
+    assert.equal(bestEffortFail.ok, false);
+    assert.equal(bestEffortFail.status, "failed");
+    assert.equal(bestEffortFail.exitCode, 0, "best_effort must not fail the run");
+    assert.ok(logs.length > 0 && !logs.join("\n").includes(HUB_SECRET));
+
+    const strictFail = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/fail-500`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "strict",
+      },
+      maxAttempts: 2,
+      baseDelayMs: 5,
+      log: () => {},
+    });
+    assert.equal(strictFail.ok, false);
+    assert.equal(strictFail.status, "failed");
+    assert.equal(strictFail.exitCode, 1, "strict mode must return exit code 1 (GATE)");
+
+    const mcpHttpRes = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "mcp",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/mcp`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+      },
+      baseDelayMs: 5,
+    });
+    assert.equal(mcpHttpRes.ok, true);
+    assert.equal(mcpHttpRes.status, "delivered");
+    const mcpWire = received.find((r) => r.url === "/mcp");
+    const parsedRpc = JSON.parse(mcpWire.body);
+    assert.equal(parsedRpc.method, "tools/call");
+    assert.equal(parsedRpc.params.name, "context_hub.ingest_manifest");
+    assert.equal(parsedRpc.params.arguments.idempotency_key, expectedKey);
+    assert.equal(mcpWire.auth, `Bearer ${HUB_SECRET}`);
+
+    const mcpCalls = [];
+    const mcpClientRes = await dispatchToContextHub(baseEnvelope, {
+      env: { UAW_CONTEXT_HUB_SINK: "mcp" },
+      mcpClient: {
+        callTool: async (name, args) => {
+          mcpCalls.push({ name, args });
+          return { ingested: true };
+        },
+      },
+    });
+    assert.equal(mcpClientRes.ok, true);
+    assert.equal(mcpCalls.length, 1);
+    assert.equal(mcpCalls[0].name, "context_hub.ingest_manifest");
+    assert.equal(mcpCalls[0].args.idempotency_key, expectedKey);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+console.log("context-hub-sink tests passed");

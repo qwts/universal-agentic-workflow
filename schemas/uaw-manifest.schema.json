@@ -1,0 +1,405 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/qwts/universal-agentic-workflow/main/schemas/uaw-manifest.schema.json",
+  "title": "UAW Run Provenance Manifest",
+  "description": "Content-addressed provenance manifest for a Universal Agentic Workflow (UAW) run per ADR-0009.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "workflow",
+    "goal_sha256",
+    "phase",
+    "manifest_sha256",
+    "deliverable_key",
+    "deliverable",
+    "stages",
+    "stores",
+    "architecture",
+    "execution_audit"
+  ],
+  "definitions": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableSha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "stageOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/definitions/sha256" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workflow": {
+      "type": "string",
+      "minLength": 1
+    },
+    "goal_sha256": {
+      "$ref": "#/definitions/nullableSha256"
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["snapshot", "closed", "sealed"]
+    },
+    "manifest_sha256": {
+      "$ref": "#/definitions/sha256"
+    },
+    "deliverable_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deliverable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "base_commit_sha",
+        "head_commit_sha",
+        "git_tree_sha",
+        "branch",
+        "pr_url",
+        "release_tag",
+        "artifact_uris"
+      ],
+      "properties": {
+        "repository": { "$ref": "#/definitions/nullableString" },
+        "base_commit_sha": { "$ref": "#/definitions/nullableString" },
+        "head_commit_sha": { "$ref": "#/definitions/nullableString" },
+        "git_tree_sha": { "$ref": "#/definitions/nullableString" },
+        "branch": { "$ref": "#/definitions/nullableString" },
+        "pr_url": { "$ref": "#/definitions/nullableString" },
+        "release_tag": { "$ref": "#/definitions/nullableString" },
+        "artifact_uris": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage", "status", "gate_verdict", "outputs"],
+        "properties": {
+          "stage": { "type": "string", "minLength": 1 },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "active", "passed", "failed", "skipped"]
+          },
+          "gate_verdict": { "$ref": "#/definitions/nullableString" },
+          "outputs": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/stageOutput" }
+          }
+        }
+      }
+    },
+    "stores": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirements",
+        "adrs",
+        "discoveries",
+        "reviews",
+        "issues",
+        "questions",
+        "cbs"
+      ],
+      "properties": {
+        "requirements": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["sha256", "total", "by_status", "by_prefix"],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "total": { "type": "integer", "minimum": 0 },
+            "by_status": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            },
+            "by_prefix": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "adrs": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["sha256", "total", "records"],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "total": { "type": "integer", "minimum": 0 },
+            "records": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["number", "slug", "status", "superseded_by", "file_path", "file_sha256"],
+                "properties": {
+                  "number": { "type": "string" },
+                  "slug": { "type": "string" },
+                  "status": { "type": "string" },
+                  "superseded_by": { "$ref": "#/definitions/nullableString" },
+                  "file_path": { "$ref": "#/definitions/nullableString" },
+                  "file_sha256": { "$ref": "#/definitions/nullableSha256" }
+                }
+              }
+            }
+          }
+        },
+        "discoveries": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["sha256", "total", "by_category", "unresolved_gap_ids"],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "total": { "type": "integer", "minimum": 0 },
+            "by_category": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            },
+            "unresolved_gap_ids": {
+              "type": "array",
+              "items": { "type": "integer" }
+            }
+          }
+        },
+        "reviews": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["sha256", "total_reviews", "verdicts", "findings_by_severity"],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "total_reviews": { "type": "integer", "minimum": 0 },
+            "verdicts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["stage", "verdict"],
+                "properties": {
+                  "stage": { "type": "string" },
+                  "verdict": { "type": "string" }
+                }
+              }
+            },
+            "findings_by_severity": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        "issues": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["sha256", "total", "by_status"],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "total": { "type": "integer", "minimum": 0 },
+            "by_status": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "questions": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["sha256", "total", "by_status"],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "total": { "type": "integer", "minimum": 0 },
+            "by_status": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "cbs": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": [
+            "sha256",
+            "components_count",
+            "interfaces_count",
+            "dependencies_count",
+            "sequencing_count",
+            "constraints_by_severity",
+            "constraints_by_status"
+          ],
+          "properties": {
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "components_count": { "type": "integer", "minimum": 0 },
+            "interfaces_count": { "type": "integer", "minimum": 0 },
+            "dependencies_count": { "type": "integer", "minimum": 0 },
+            "sequencing_count": { "type": "integer", "minimum": 0 },
+            "constraints_by_severity": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            },
+            "constraints_by_status": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "architecture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["drs", "br", "changelog_snapshot"],
+      "properties": {
+        "drs": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "sha256", "schema_version", "summary"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "schema_version": { "$ref": "#/definitions/nullableString" },
+            "summary": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "components_count",
+                "dependency_edges_count",
+                "gap_log_count",
+                "divergence_log_count",
+                "divergence_log",
+                "exit_criteria"
+              ],
+              "properties": {
+                "components_count": { "type": "integer", "minimum": 0 },
+                "dependency_edges_count": { "type": "integer", "minimum": 0 },
+                "gap_log_count": { "type": "integer", "minimum": 0 },
+                "divergence_log_count": { "type": "integer", "minimum": 0 },
+                "divergence_log": { "type": "array" },
+                "exit_criteria": { "type": ["object", "null"] }
+              }
+            }
+          }
+        },
+        "br": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "sha256", "schema_version", "strata"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "schema_version": { "$ref": "#/definitions/nullableString" },
+            "strata": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["label", "entry_count", "closed_at"],
+                "properties": {
+                  "label": { "$ref": "#/definitions/nullableString" },
+                  "entry_count": { "type": "integer", "minimum": 0 },
+                  "closed_at": { "$ref": "#/definitions/nullableString" }
+                }
+              }
+            }
+          }
+        },
+        "changelog_snapshot": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "sha256", "heading", "entry_sha256"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "sha256": { "$ref": "#/definitions/sha256" },
+            "heading": { "$ref": "#/definitions/nullableString" },
+            "entry_sha256": { "$ref": "#/definitions/nullableSha256" }
+          }
+        }
+      }
+    },
+    "execution_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at",
+        "finalized_at",
+        "model_profile",
+        "model_name",
+        "cost_summary",
+        "stages"
+      ],
+      "properties": {
+        "started_at": { "$ref": "#/definitions/nullableString" },
+        "finalized_at": { "type": "string", "minLength": 1 },
+        "model_profile": { "$ref": "#/definitions/nullableString" },
+        "model_name": { "$ref": "#/definitions/nullableString" },
+        "cost_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["turns", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "cost_usd"],
+          "properties": {
+            "turns": { "type": "integer", "minimum": 0 },
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "cache_read_tokens": { "type": "integer", "minimum": 0 },
+            "cache_write_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 },
+            "cost_usd": { "type": "number", "minimum": 0 }
+          }
+        },
+        "stages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "started_at",
+              "completed_at",
+              "retry_count",
+              "round_trips",
+              "session_id",
+              "transcript_sha256"
+            ],
+            "properties": {
+              "stage": { "type": "string", "minLength": 1 },
+              "started_at": { "$ref": "#/definitions/nullableString" },
+              "completed_at": { "$ref": "#/definitions/nullableString" },
+              "retry_count": { "type": "integer", "minimum": 0 },
+              "round_trips": { "type": "integer", "minimum": 0 },
+              "session_id": { "$ref": "#/definitions/nullableString" },
+              "transcript_sha256": { "$ref": "#/definitions/nullableSha256" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -35,9 +35,10 @@
  */
 
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync, readdirSync, unlinkSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
-import { resolve, join, dirname, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 import { resolveDataDir, resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
@@ -559,6 +560,66 @@ function cmdRead(db) {
   succeed({ procedure: "read", workflow, state: readState(db) });
 }
 
+function compareUtf16(a, b) {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const diff = a.charCodeAt(i) - b.charCodeAt(i);
+    if (diff !== 0) return diff;
+  }
+  return a.length - b.length;
+}
+
+function globToRegex(globPattern) {
+  let re = "^";
+  for (let i = 0; i < globPattern.length; i++) {
+    const ch = globPattern[i];
+    if (ch === "*") re += "[^/]*";
+    else if (ch === "?") re += "[^/]";
+    else if (ch === "[") {
+      const end = globPattern.indexOf("]", i + 1);
+      if (end !== -1) { re += globPattern.slice(i, end + 1); i = end; }
+      else re += "\\[";
+    } else if (".+^${}()|\\".includes(ch)) re += "\\" + ch;
+    else re += ch;
+  }
+  return new RegExp(re + "$");
+}
+
+function captureStageOutputsJson(stageDef) {
+  const cwd = process.cwd();
+  const seen = new Map();
+  for (const tmpl of stageDef?.outputs ?? []) {
+    const resolved = resolveTemplates(tmpl);
+    const absPattern = isAbsolute(resolved) ? resolved : resolve(cwd, resolved);
+    let paths = [];
+    if (/[*?[\]]/.test(absPattern)) {
+      const dir = dirname(absPattern);
+      if (existsSync(dir)) {
+        const rx = globToRegex(basename(absPattern));
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          if (e.isFile() && rx.test(e.name)) paths.push(join(dir, e.name));
+        }
+      }
+    } else if (existsSync(absPattern)) {
+      paths = [absPattern];
+    }
+    for (const abs of paths) {
+      try {
+        if (!statSync(abs).isFile()) continue;
+        const buf = readFileSync(abs);
+        const rel = relative(cwd, abs);
+        const normPath = (rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : abs).split(sep).join("/");
+        seen.set(normPath, {
+          path: normPath,
+          sha256: createHash("sha256").update(buf).digest("hex"),
+          bytes: buf.length,
+        });
+      } catch { /* ignore unreadable */ }
+    }
+  }
+  return JSON.stringify([...seen.values()].sort((a, b) => compareUtf16(a.path, b.path)));
+}
+
 function cmdStageUpdate(db, toStatus) {
   requireFlag("workflow", command);
   requireFlag("stage",    command);
@@ -568,11 +629,15 @@ function cmdStageUpdate(db, toStatus) {
   ensureRow(db, stageName);
   const row = db.prepare(`SELECT * FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, stageName);
   const now = new Date().toISOString();
+  const { stages } = loadStagesYaml(workflow);
+  const stageDef   = stages.find((s) => s.name === stageName);
 
   const updates = { status: toStatus };
   if (flags["session-id"]) updates.session_id = flags["session-id"];
   if (toStatus === "active")  updates.started_at   = now;
   if (toStatus === "passed" || toStatus === "skipped") updates.completed_at = now;
+  if (toStatus === "passed")  updates.outputs_json = captureStageOutputsJson(stageDef);
+  if (toStatus === "skipped") updates.outputs_json = "[]";
   if (note) updates.notes = note;
 
   const keys = Object.keys(updates);
@@ -582,8 +647,6 @@ function cmdStageUpdate(db, toStatus) {
   appendHistory(db, workflow, stageName, row.status, toStatus, note);
 
   // Build next-action hints for the orchestrator
-  const { stages } = loadStagesYaml(workflow);
-  const stageDef   = stages.find((s) => s.name === stageName);
   const agentId    = stageDef?.agent ?? "uwf-core-orchestrator";
   const STATE_MJS  = skillCliPath("uwf-state-manager/state.mjs");
   const Q_MJS      = skillCliPath("uwf-question-protocol/questions.mjs");
@@ -669,7 +732,7 @@ function cmdResetFrom(db) {
       ensureRow(db, name);
       const row = db.prepare(`SELECT status FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, name);
       db.prepare(
-        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL, session_id = NULL WHERE workflow = ? AND stage = ?`
+        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL, session_id = NULL, outputs_json = NULL WHERE workflow = ? AND stage = ?`
       ).run(workflow, name);
       appendHistory(db, workflow, name, row.status, "pending", note);
     }

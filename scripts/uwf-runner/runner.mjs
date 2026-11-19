@@ -39,6 +39,7 @@ import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
+import { ensureRunMeta, materializeManifest } from "./provenance.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -168,7 +169,7 @@ function pickRunScript(skillsRoot, workflow) {
 function parseArgs(argv) {
   const flags = {};
   const positional = [];
-  const bool = new Set(["non-interactive", "dry-run", "force", "unlock"]);
+  const bool = new Set(["non-interactive", "dry-run", "force", "unlock", "defer-seal"]);
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (!t.startsWith("--")) { positional.push(t); continue; }
@@ -263,6 +264,7 @@ async function main(argv) {
 
   const dryRun = flags["dry-run"] === true;
   const nonInteractive = flags["non-interactive"] === true;
+  const deferSeal = flags["defer-seal"] === true;
   const outputPath = flags["output-path"] ?? "./tmp/workflow-artifacts";
 
   // Dry run must write nothing: point every store at a throwaway dir.
@@ -278,6 +280,7 @@ async function main(argv) {
   else goal = readFileSync(goalPath, "utf8").trim();
 
   const releaseLock = scratch ? () => {} : acquireRunLock(dataDir, flags.workflow, { unlock: flags.unlock === true });
+  if (!dryRun) ensureRunMeta(dataDir, { workflow, outputPath });
 
   const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
@@ -405,7 +408,7 @@ async function main(argv) {
     const adapter = await loadAdapter(adapterName);
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, deferSeal, cli, note, withOut, maxCostUsd, resumeMaxContext,
       resetFrom, rollbackPhase, phaseFlags, resuming: command === "resume" });
   } finally {
     releaseLock();
@@ -419,7 +422,7 @@ async function main(argv) {
  */
 async function stageLoop(ctx) {
   const { command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, phaseFlags, resuming } = ctx;
+    outputPath, dataDir, timeoutMs, nonInteractive, deferSeal, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, phaseFlags, resuming } = ctx;
   let first = true;
   let lastModelLine = null;
   if (maxCostUsd !== undefined) log(`[runner] ${COST_CAP_NOTE(maxCostUsd)}`);
@@ -611,6 +614,14 @@ async function stageLoop(ctx) {
           if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
           if (adv) row.result += ` (${adv})`;
+          if (st.name === "snapshot") {
+            try {
+              const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal });
+              if (!m.ok) return finish(EXIT.GATE, rows, `${tag}: context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+            } catch (err) {
+              log(`[runner] provenance manifest at snapshot not written: ${err.message}`);
+            }
+          }
           if (over) return capStop(`${st.name} passed`);
           break;
         }
@@ -691,6 +702,22 @@ async function stageLoop(ctx) {
     if (doneTrips && row.result.startsWith("passed")) row.result += ` after ${doneTrips} round trip(s)`;
   }
   rmSync(routingPath, { force: true });
+  try {
+    const finalPhase = deferSeal ? "closed" : "sealed";
+    const m = await materializeManifest({
+      dataDir,
+      workflow,
+      repoRoot,
+      skillsRoot,
+      outputPath,
+      phase: finalPhase,
+      deferSeal,
+      dispatchSink: !deferSeal,
+    });
+    if (!m.ok) return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+  } catch (err) {
+    log(`[runner] provenance manifest not written: ${err.message}`);
+  }
   return finish(EXIT.OK, rows, "workflow complete", note);
 
   function advancePhase(target, stageName, phaseFlags) {

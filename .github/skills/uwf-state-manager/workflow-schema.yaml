@@ -35,6 +35,8 @@ tables:
         type: TEXT
       - name: model_name
         type: TEXT
+      - name: run_id
+        type: TEXT
 
   workflow_history:
     description: "Append-only audit log of phase transitions, status changes, and notes"
@@ -54,3 +56,32 @@ tables:
         type: TEXT
       - name: note
         type: TEXT
+
+  run_manifests:
+    description: "Content-addressed UAW run provenance manifests persisted per ADR-0009"
+    columns:
+      - name: run_id
+        type: TEXT
+        primary_key: true
+      - name: workflow
+        type: TEXT
+        not_null: true
+      - name: phase
+        type: TEXT
+        not_null: true
+      - name: manifest_sha256
+        type: TEXT
+        not_null: true
+      - name: deliverable_key
+        type: TEXT
+        not_null: true
+      - name: manifest_json
+        type: TEXT
+        not_null: true
+      - name: sink_status
+        type: TEXT
+        not_null: true
+        default: "disabled"
+      - name: finalized_at
+        type: TEXT
+        not_null: true
