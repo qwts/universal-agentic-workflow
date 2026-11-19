@@ -47,7 +47,9 @@ Status: Accepted
   [`.github/workflows/uwf-on-pr.yml`](../../.github/workflows/uwf-on-pr.yml))
   run `retro` with `--defer-seal` and invoke `provenance.mjs seal`
   (`uaw_manifest_seal`) immediately after commit/PR/artifact creation—verifying
-  the committed `git_tree_sha` matches the post-`retro` workspace tree, binding
+  the committed `git_tree_sha` matches the post-`retro` tracked worktree state
+  (excluding ignored `<data-dir>` / `{{output_path}}` paths, and allowing
+  `head_commit_sha == base_commit_sha` when no tracked files changed), binding
   the shipped `head_commit_sha` / `pr_url` / `release_tag` / `artifact_uris[]`,
   and only then sealing `run_manifests` (`phase: sealed`) and dispatching the
   terminal Context Hub Sink event.
@@ -79,10 +81,17 @@ Status: Accepted
   - **Executed stage ledger (`stages[]`):** ordered deterministic entries from
     `uwf-stages.db`
     ([`stage-tracker.mjs`](../../.github/skills/uwf-orchestration-engine/stage-tracker.mjs))
-    capturing `stage`, terminal `status`, `gate_verdict`, and sorted
-    `outputs[]: { path, sha256, bytes }` for every declared stage output file
-    (including structured `*.result.json` verdict files), paired by `stage`
-    with timing/attempt metadata in `execution_audit.stages[]`.
+    capturing `stage`, terminal `status`, `gate_verdict` (`null` when
+    `status === "skipped"`), and sorted `outputs[]: { path, sha256, bytes }`
+    captured and persisted in `uwf-stages.db` atomically at `stage-complete`
+    for every declared artifact produced by that stage (`outputs: []` for
+    `skipped` conditional stages such as `adr` / `security-plan` or stages with
+    no declared artifact files, and refreshed if that stage re-runs via
+    `on_verdict`). Capturing digests at `stage-complete` preserves point-in-time
+    provenance (matching `stage.completed` sink checkpoints) even when a later
+    stage legitimately updates a shared file (such as `snapshot` appending
+    stratum `5` to `blueprint`'s `*-br.json`), paired by `stage` with
+    timing/attempt metadata in `execution_audit.stages[]`.
   - **Domain-store lineage (`stores`):** canonical SHA-256 digests and scrubbed
     record summaries across `uwf-requirements.db` (accepted/deferred/rejected
     counts and IDs by `FR`/`NFR`/`DR`/`AC`/`RK`), `uwf-adrs.db` (`ADR-NNNN`
@@ -184,9 +193,12 @@ Status: Accepted
   no `pr_url`), (b) regenerating or re-sealing over identical stage outputs at a
   later wall-clock timestamp yields matching `manifest_sha256` and byte-for-byte
   identical RFC 8785 JCS JSON (including non-NFC decomposed Unicode test
-  vectors), and (c) flipping one byte in `issues-drs.json` or
-  `issues-review.result.json` changes both the stage/stratum digest and
-  `manifest_sha256`.
+  vectors), (c) skipped conditional stages (`security-plan`) emit
+  `outputs: []` while `blueprint` retains its pre-`snapshot` `issues-br.json`
+  digest alongside `snapshot`'s stratum-`5` digest, and (d) modifying a stage
+  artifact prior to `stage-complete` changes both its stage/stratum digest and
+  `manifest_sha256` (while unexpected post-stage mutation of an un-superseded
+  artifact fails manifest verification with exit code `1`).
 - Sink contract test verifies: (a) unset `UAW_CONTEXT_HUB_SINK` makes zero
   outbound requests and records `sink_status = "disabled"`, (b) `webhook` /
   `mcp` sink replay of the same finalized stage emits an identical
