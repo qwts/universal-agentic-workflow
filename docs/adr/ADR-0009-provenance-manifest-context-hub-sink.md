@@ -29,34 +29,60 @@ Status: Accepted
   is configured.
 
 ## Decision
-- **Finalize a deterministic content-addressed `uaw-manifest.json` and SQLite
-  lineage record at `snapshot` / `retro`.** During `snapshot` (`phase: snapshot`)
-  and sealed on `retro` completion (`phase: closed`), UAW materializes
-  `{{output_path}}/uaw-manifest.json` serialized in RFC 8785 canonical JSON
-  (lexicographically sorted keys, UTF-8 NFC, no insignificant whitespace) and
-  upserts a matching row into `run_manifests` in `uwf-state.db` (`run_id`,
-  `workflow`, `phase`, `manifest_sha256`, `deliverable_key`, `manifest_json`,
-  `sink_status`, `finalized_at`), exposed read-only via `uaw://<run>/manifest`
+- **Materialize `uaw-manifest.json` at `snapshot` / `retro` and seal after
+  deliverable commit/publication (`provenance.mjs seal` / `uaw_manifest_seal`).**
+  During `snapshot` (`phase: snapshot`) and `retro` (`phase: closed`), UAW
+  materializes `{{output_path}}/uaw-manifest.json` (outside the tracked git
+  deliverable tree) serialized per RFC 8785 JSON Canonicalization Scheme (JCS:
+  UTF-16 code-unit sorted keys, IEEE 754 numbers, verbatim Unicode code points
+  with no normalization pass, and no insignificant whitespace) and upserts a
+  matching row into `run_manifests` in `uwf-state.db` (`run_id`, `workflow`,
+  `phase`, `manifest_sha256`, `deliverable_key`, `manifest_json`, `sink_status`,
+  `finalized_at`), exposed read-only via `uaw://<run>/manifest`
   (`uaw_read_manifest` in
-  [ADR-0008](./ADR-0008-multi-surface-mcp-plugin-runtime-contract.md)).
+  [ADR-0008](./ADR-0008-multi-surface-mcp-plugin-runtime-contract.md)). Local
+  runs with no post-run commit harness seal immediately at `retro` against the
+  current `HEAD` / working-tree `git_tree_sha`. Automated PR and release
+  workflows that create or push the deliverable commit after `retro` (such as
+  [`.github/workflows/uwf-on-pr.yml`](../../.github/workflows/uwf-on-pr.yml))
+  run `retro` with `--defer-seal` and invoke `provenance.mjs seal`
+  (`uaw_manifest_seal`) immediately after commit/PR/artifact creation—verifying
+  the committed `git_tree_sha` matches the post-`retro` workspace tree, binding
+  the shipped `head_commit_sha` / `pr_url` / `release_tag` / `artifact_uris[]`,
+  and only then sealing `run_manifests` (`phase: sealed`) and dispatching the
+  terminal Context Hub Sink event.
 - **`uaw-manifest.json` (`schema_version: "1.0.0"`) cryptographically binds
   every stage, domain store, and `DRS`/`BR` stratum to the deliverable:**
-  - **Self-addressing envelope:** `manifest_sha256` equals the lowercase hex
-    SHA-256 over the canonical JSON payload with `manifest_sha256` omitted,
-    paired with `run_id`, `workflow`, `goal_sha256` (`runner-goal.md`), `phase`,
-    `started_at`, and `finalized_at`.
+  - **Content-addressed envelope vs. `execution_audit`:** `run_id` is the
+    durable logical identifier persisted in `<data-dir>/run-meta.json` /
+    `uwf-state.db` ([ADR-0008](./ADR-0008-multi-surface-mcp-plugin-runtime-contract.md))
+    so `resume` and replay invocations never mint a new ID. `manifest_sha256`
+    equals the lowercase hex SHA-256 over the RFC 8785 JCS payload with
+    `manifest_sha256` and `execution_audit` omitted—hashing only deterministic
+    content (`schema_version`, `run_id`, `workflow`, `goal_sha256`, `phase`,
+    `deliverable`, `stages[]` verdicts/digests, `stores`, and `architecture`).
+    Wall-clock timestamps and retry-varying telemetry (`started_at`,
+    `finalized_at`, per-stage `started_at`/`completed_at`, `retry_count`,
+    `round_trips`, `session_id`, `transcript_sha256`, and token/cost totals
+    from [`cost.mjs`](../../scripts/uwf-runner/cost.mjs)) live under
+    `execution_audit`; regenerating a manifest whose `manifest_sha256` matches
+    the persisted `run_manifests` row reuses the stored `execution_audit`
+    timestamps so reruns remain byte-for-byte identical.
   - **Deliverable identity (`deliverable`):** records `{ repository,
     base_commit_sha, head_commit_sha, git_tree_sha, branch, pr_url, release_tag,
-    artifact_uris[] }`, computing `deliverable_key` from the primary verifiable
-    target (`head_commit_sha` + `pr_url` or `artifact_uris[0]`).
-  - **Executed stage ledger (`stages[]`):** ordered entries from `uwf-stages.db`
+    artifact_uris[] }`, resolving `deliverable_key` via a total fallback chain:
+    (1) `${pr_url}@${head_commit_sha}`, (2)
+    `${repository}@${release_tag}@${head_commit_sha}`, (3) `artifact_uris[0]`,
+    (4) `${repository}@${head_commit_sha}` (using the normalized git remote or
+    local repo directory name for offline/pre-PR git runs), and (5)
+    `tree:${git_tree_sha}` (or `run:${run_id}` outside git).
+  - **Executed stage ledger (`stages[]`):** ordered deterministic entries from
+    `uwf-stages.db`
     ([`stage-tracker.mjs`](../../.github/skills/uwf-orchestration-engine/stage-tracker.mjs))
-    and `runner-routing.json` capturing `stage`, `status`, `retry_count`,
-    `round_trips`, `session_id`, `gate_verdict`, `started_at`, `completed_at`,
-    `transcript_sha256`, cost/token totals from
-    [`cost.mjs`](../../scripts/uwf-runner/cost.mjs), and `{ path, sha256,
-    bytes }` for every declared stage output file (including structured
-    `*.result.json` verdict files).
+    capturing `stage`, terminal `status`, `gate_verdict`, and sorted
+    `outputs[]: { path, sha256, bytes }` for every declared stage output file
+    (including structured `*.result.json` verdict files), paired by `stage`
+    with timing/attempt metadata in `execution_audit.stages[]`.
   - **Domain-store lineage (`stores`):** canonical SHA-256 digests and scrubbed
     record summaries across `uwf-requirements.db` (accepted/deferred/rejected
     counts and IDs by `FR`/`NFR`/`DR`/`AC`/`RK`), `uwf-adrs.db` (`ADR-NNNN`
@@ -81,11 +107,15 @@ Status: Accepted
     `none`, `uaw-manifest.json` and `run_manifests` still finalize locally with
     `sink_status: "disabled"`, making zero network calls.
   - **Deterministic idempotency (`run_id + stage + sha256`):** every emitted
-    checkpoint (`stage.completed`) or terminal (`run.finalized`) envelope carries
-    `dedup_tuple: { run_id, stage, sha256 }` and `idempotency_key =
-    sha256("${run_id}:${stage}:${sha256}")`. Re-running `retro`, replaying a
-    failed delivery, or resuming via `uaw_resume` produces the exact same key so
-    the receiving AI Context Hub deduplicates without side effects.
+    checkpoint (`stage.completed`, where `sha256` hashes canonical `outputs[]`
+    for that stage) or terminal (`run.finalized` at `retro` or post-commit
+    `seal`, where `sha256` equals content-only `manifest_sha256`) envelope
+    carries the durable logical `run_id` from `<data-dir>/run-meta.json`,
+    `dedup_tuple: { run_id, stage, sha256 }`, and `idempotency_key =
+    sha256("${run_id}:${stage}:${sha256}")`. Re-running `retro`, re-sealing an
+    unchanged deliverable, replaying a failed delivery, or resuming via
+    `uaw_resume` produces the exact same key so the receiving AI Context Hub
+    deduplicates without side effects.
   - **Pluggable `mcp` and `webhook` sink adapters:** the `mcp` adapter invokes
     `context_hub.ingest_manifest` on a configured remote/local MCP server; the
     `webhook` adapter sends an HTTPS `POST` carrying `Idempotency-Key` and
@@ -147,11 +177,16 @@ Status: Accepted
   environment variables and never persisted in SQLite or manifests.
 
 ## Verification
-- Determinism test runs `sw_dev` (`--adapter fake`) and verifies generating
-  `uaw-manifest.json` twice over identical stage outputs yields byte-for-byte
-  identical JSON and matching `manifest_sha256`, while flipping one byte in
-  `issues-drs.json` or `issues-review.result.json` changes both the stage/stratum
-  digest and `manifest_sha256`.
+- Determinism and post-commit seal test runs `sw_dev` (`--adapter fake` with
+  `--defer-seal`), creates a deliverable git commit, runs `provenance.mjs seal`,
+  and verifies: (a) `deliverable.head_commit_sha` and `deliverable_key` bind to
+  the post-`retro` commit (and resolve cleanly for offline/pre-PR commits with
+  no `pr_url`), (b) regenerating or re-sealing over identical stage outputs at a
+  later wall-clock timestamp yields matching `manifest_sha256` and byte-for-byte
+  identical RFC 8785 JCS JSON (including non-NFC decomposed Unicode test
+  vectors), and (c) flipping one byte in `issues-drs.json` or
+  `issues-review.result.json` changes both the stage/stratum digest and
+  `manifest_sha256`.
 - Sink contract test verifies: (a) unset `UAW_CONTEXT_HUB_SINK` makes zero
   outbound requests and records `sink_status = "disabled"`, (b) `webhook` /
   `mcp` sink replay of the same finalized stage emits an identical

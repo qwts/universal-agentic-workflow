@@ -55,11 +55,17 @@ and [#109](https://github.com/qwts/universal-agentic-workflow/issues/109)
   - `uaw_run`: invokes `runner.mjs run` (`workflow`, `goal`, `adapter`
     `claude-code|codex|fake|grokbot`, `model`, `data_dir`, `output_path`,
     `from_stage`, `force`, `unlock`, `non_interactive`, `dry_run`, `timeout_ms`,
-    `repo_root`, `skills_root`, `max_cost_usd`, `resume_max_context`) and
-    returns `{ run_id, data_dir, exit_code, status, phase, failed_stage,
+    `repo_root`, `skills_root`, `max_cost_usd`, `resume_max_context`),
+    persisting a durable logical `run_id` and resolved `output_path`
+    (defaulting to `<data-dir>/workflow-artifacts` whenever `output_path` is
+    omitted, never shared `./tmp/workflow-artifacts`) in
+    `<data-dir>/run-meta.json` and `uwf-state.db`, and returns `{ run_id,
+    data_dir, output_path, exit_code, status, phase, failed_stage,
     pending_questions, cost_summary }`.
-  - `uaw_resume`: invokes `runner.mjs resume` from the first non-`passed`,
-    non-`skipped` stage recorded in `uwf-stages.db`.
+  - `uaw_resume`: reloads the persisted logical `run_id` and `output_path`
+    from `<data-dir>/run-meta.json` / `uwf-state.db` and invokes
+    `runner.mjs resume` from the first non-`passed`, non-`skipped` stage
+    recorded in `uwf-stages.db`.
   - `uaw_gates`: invokes `runner.mjs gates` and
     [`stage-tracker.mjs`](../../.github/skills/uwf-orchestration-engine/stage-tracker.mjs)
     (`check-gate`, `gate-prescriptions`) to evaluate `require_non_empty`,
@@ -136,13 +142,21 @@ and [#109](https://github.com/qwts/universal-agentic-workflow/issues/109)
     status, inspect scrubbed transcripts, answer `uaw_question_resolve` prompts,
     and trigger `uaw_run` / `uaw_resume` without bundling Node or SQLite in the
     browser runtime.
-- **Per-run `run.lock` and workspace isolation prevent cross-run interference.**
-  Every run allocates an isolated `data_dir` containing the eight SQLite files,
-  `runner-goal.md`, `runner-routing.json`, `transcripts/`, and
-  `<data-dir>/workflow-artifacts/`. Mutating tools acquire `<data-dir>/run.lock`
-  (`{ runId, pid, workflow, startedAt }`) atomically via temp-file write +
-  `linkSync`; locks are never stolen automatically and are cleared on crash only
-  via explicit `unlock: true` when the owner PID is dead or unreadable past the
+- **Per-run `run.lock`, durable `run_id`, and `output_path` isolation prevent
+  cross-run interference.** Every run allocates an isolated `data_dir`
+  containing the eight SQLite files, `<data-dir>/run-meta.json` (`{ run_id,
+  workflow, output_path, created_at }`, written once on `uaw_run` and reused
+  across all `uaw_resume` calls, CQRS `uaw://<run>/...` reads, and provenance
+  manifests), `runner-goal.md`, `runner-routing.json`, `transcripts/`, and
+  default `<data-dir>/workflow-artifacts/`. When `output_path` is omitted, the
+  MCP server and runner resolve it to `<data-dir>/workflow-artifacts` rather
+  than shared `./tmp/workflow-artifacts`; if a caller explicitly supplies an
+  `output_path` outside `data_dir`, mutating tools also acquire an atomic
+  `<output-path>/.uaw-output.lock` so two runs can never share an artifact
+  directory. Mutating tools acquire `<data-dir>/run.lock` (`{ runId, attemptId,
+  pid, workflow, startedAt }`) atomically via temp-file write + `linkSync`;
+  locks are never stolen automatically and are cleared on crash only via
+  explicit `unlock: true` when the owner PID is dead or unreadable past the
   stale window. Multi-repo or concurrent single-repo runs use separate git
   worktrees + distinct `data_dir` paths so parallel MCP sessions never contend.
 
@@ -207,7 +221,9 @@ and [#109](https://github.com/qwts/universal-agentic-workflow/issues/109)
 - Concurrency test launches two parallel `uaw_run` calls against the same
   `data_dir` (asserting the second fails immediately with exit code `2` without
   clobbering `run.lock`) and two parallel calls against distinct `data_dir`
-  paths (asserting both complete `closed` with zero cross-talk).
+  paths with `output_path` omitted (asserting each writes exclusively to its own
+  `<data-dir>/workflow-artifacts/`, preserves its durable `run_id` across
+  `uaw_resume`, and completes `closed` with zero cross-talk).
 - Security test injects synthetic API tokens matching every pattern in
   `secret-patterns.mjs` into a fixture transcript and verifies `uaw_read_transcript`
   and `uaw://<run>/transcripts/<id>` return `[redacted:<kind>]` placeholders with
