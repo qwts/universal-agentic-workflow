@@ -126,7 +126,7 @@ jobs:
           persist-credentials: false
 
       - name: Install model-adaptation dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install model-adaptation dependencies
           executable: npm
@@ -137,7 +137,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install orchestration-engine dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install orchestration-engine dependencies
           executable: npm
@@ -148,7 +148,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install state-manager dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install state-manager dependencies
           executable: npm
@@ -159,7 +159,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install adr dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install adr dependencies
           executable: npm
@@ -170,7 +170,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install discovery dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install discovery dependencies
           executable: npm
@@ -181,7 +181,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install local-tracking dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install local-tracking dependencies
           executable: npm
@@ -192,7 +192,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install question-protocol dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install question-protocol dependencies
           executable: npm
@@ -203,7 +203,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install review dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install review dependencies
           executable: npm
@@ -214,7 +214,7 @@ jobs:
           retry-delay-seconds: '5'
 
       - name: Install requirements dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install requirements dependencies
           executable: npm
@@ -521,7 +521,7 @@ jobs:
           persist-credentials: false
 
       - name: Install question-protocol dependencies
-        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@3a5617b287d922e37f262210a1d8750d8217b56d
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
         with:
           task: Install question-protocol dependencies
           executable: npm
