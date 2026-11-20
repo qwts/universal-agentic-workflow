@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,7 +69,19 @@ writeFileSync(
     {
       adapter: "fake",
       stdout: SYNTHETIC_SECRETS.map((s) => `${s.kind}: ${s.raw}`).join("\n"),
-      nested: { note: `leaked ${SYNTHETIC_SECRETS[1].raw}` },
+      nested: {
+        note: `leaked ${SYNTHETIC_SECRETS[1].raw}`,
+        [SYNTHETIC_SECRETS[2].raw]: "secret-key-val-1",
+        [`prefix-${SYNTHETIC_SECRETS[3].raw}`]: "secret-key-val-2",
+        collision: {
+          [SYNTHETIC_SECRETS[2].raw]: "secret-first",
+          "[redacted:openai-key]": "literal-second",
+        },
+        reverseCollision: {
+          "[redacted:github-token]": "literal-first",
+          [SYNTHETIC_SECRETS[3].raw]: "secret-second",
+        },
+      },
     },
     null,
     2,
@@ -94,6 +106,13 @@ try {
       `missing [redacted:${s.kind}] placeholder in uaw_read_transcript`,
     );
   }
+  const parsedToolNested = toolResp.structuredContent.transcript.nested;
+  assert.equal(parsedToolNested["[redacted:openai-key]"], "secret-key-val-1");
+  assert.equal(parsedToolNested["prefix-[redacted:github-token]"], "secret-key-val-2");
+  assert.equal(parsedToolNested.collision["[redacted:openai-key]"], "secret-first");
+  assert.equal(parsedToolNested.collision["[redacted:openai-key]#2"], "literal-second");
+  assert.equal(parsedToolNested.reverseCollision["[redacted:github-token]"], "literal-first");
+  assert.equal(parsedToolNested.reverseCollision["[redacted:github-token]#2"], "secret-second");
 
   // 2. Verify uaw://<run>/transcripts/<id> resource redacts every pattern
   const resResp = handler.readResource(`uaw://${runId}/transcripts/${transcriptId}`);
@@ -577,6 +596,83 @@ try {
     params: { uri: `uaw://${secondRunId}/state` },
   });
   assert.equal(readNewState.error, undefined);
+
+  // 14. Path traversal run_id ("..", "."), malformed URI percent-encoding, and unknown run_id in uaw_question_resolve
+  for (const badId of ["..", ".", "a/../b"]) {
+    const badRun = await handler.callTool("uaw_run", {
+      workflow: "sw_dev",
+      run_id: badId,
+      goal: "Reject traversal run_id",
+      adapter: "fake",
+      fake_fixture_dir: forceFxDir,
+      repo_root: safeRepo,
+      skills_root: safeRepo,
+    });
+    assert.equal(badRun.isError, true, `run_id="${badId}" must be rejected`);
+    assert.equal(badRun.structuredContent.exit_code, 2);
+  }
+
+  const malformedUriRes = await handler.handleJsonRpc({
+    jsonrpc: "2.0",
+    id: 100,
+    method: "resources/read",
+    params: { uri: "uaw://bad%ZZescape/state" },
+  });
+  assert.equal(malformedUriRes.error?.code, -32602, "malformed percent-encoding must map to Invalid params (-32602)");
+
+  const ghostRunId = "nonexistent-question-run-xyz";
+  const ghostQ = await handler.callTool("uaw_question_resolve", {
+    run_id: ghostRunId,
+    action: "list",
+  });
+  assert.equal(ghostQ.isError, true);
+  assert.equal(ghostQ.structuredContent.exit_code, 2);
+  assert.equal(existsSync(join(root, ".uaw-runs", ghostRunId)), false, "unknown run_id must not create run directory or DB");
+
+  // 15. claimOutputPath serializes before linking ownership record and cleans up on output conflict
+  const rollbackOut = join(safeRepo, "rollback-out");
+  mkdirSync(rollbackOut, { recursive: true });
+  const rollbackFxDir = join(safeRepo, "fx-rollback");
+  mkdirSync(rollbackFxDir, { recursive: true });
+  writeFileSync(
+    join(rollbackFxDir, "intake.json"),
+    JSON.stringify({
+      files: { "rollback-out/out.md": "# Rollback test output\n" },
+      transcript: "ok",
+      sessionId: "sess-rollback",
+    }),
+    "utf8",
+  );
+  const legitOwnerData = join(safeRepo, "legit-owner-data");
+  const attackerData = join(safeRepo, "attacker-data");
+  const legitRun = await handler.callTool("uaw_run", {
+    workflow: "sw_dev",
+    run_id: "legit-owner-run",
+    goal: "Own rollback-out",
+    adapter: "fake",
+    fake_fixture_dir: rollbackFxDir,
+    data_dir: legitOwnerData,
+    output_path: rollbackOut,
+    repo_root: safeRepo,
+    skills_root: safeRepo,
+  });
+  assert.equal(legitRun.structuredContent.exit_code, 0);
+  const attackerRun = await handler.callTool("uaw_run", {
+    workflow: "sw_dev",
+    run_id: "attacker-rollback-run",
+    goal: "Fail on occupied output_path",
+    adapter: "fake",
+    fake_fixture_dir: rollbackFxDir,
+    data_dir: attackerData,
+    output_path: rollbackOut,
+    repo_root: safeRepo,
+    skills_root: safeRepo,
+  });
+  assert.equal(attackerRun.isError, true);
+  assert.equal(attackerRun.structuredContent.exit_code, 2);
+  assert.equal(lookupRunById(stateDir, "attacker-rollback-run"), null, "rejected run must roll back run_id index");
+  assert.equal(lookupRunById(stateDir, "legit-owner-run")?.data_dir, legitOwnerData);
+  assert.equal(assertAllowedPath(join(safeRepo, "..cache"), [safeRepo]), join(safeRepo, "..cache"));
 
   const srv = await startHttpServer({
     host: "127.0.0.1",

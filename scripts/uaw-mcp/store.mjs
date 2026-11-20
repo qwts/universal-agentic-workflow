@@ -62,7 +62,15 @@ export function redactDeep(value) {
     if (v && typeof v === "object") {
       const out = {};
       for (const [k, val] of Object.entries(v)) {
-        Object.defineProperty(out, k, {
+        const keyRes = redactSecrets(k);
+        redactions += keyRes.count;
+        let safeKey = keyRes.text;
+        if (Object.hasOwn(out, safeKey)) {
+          let suffix = 2;
+          while (Object.hasOwn(out, `${safeKey}#${suffix}`)) suffix++;
+          safeKey = `${safeKey}#${suffix}`;
+        }
+        Object.defineProperty(out, safeKey, {
           value: walk(val),
           enumerable: true,
           configurable: true,

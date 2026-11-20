@@ -21,6 +21,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -75,6 +76,7 @@ function acquireFileLock({
   beforeReturn = null,
 }) {
   const lockTmp = `${lockPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const reclaimPath = `${lockPath}.reclaim`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   let allowUnlock = unlock === true;
 
@@ -83,16 +85,24 @@ function acquireFileLock({
     while (true) {
       try {
         linkSync(lockTmp, lockPath);
-        if (beforeReturn) beforeReturn();
+        const linkedIno = statSync(lockPath).ino;
         const release = () => {
           try {
-            if (readJsonQuiet(lockPath)?.token === lockToken) {
-              rmSync(lockPath, { force: true });
+            if (statSync(lockPath).ino === linkedIno && readJsonQuiet(lockPath)?.token === lockToken) {
+              unlinkSync(lockPath);
             }
           } catch {
             /* already removed */
           }
         };
+        if (beforeReturn) {
+          try {
+            beforeReturn();
+          } catch (err) {
+            release();
+            throw err;
+          }
+        }
         return { lockPath, release };
       } catch (e) {
         if (e.code !== "EEXIST") throw e;
@@ -109,7 +119,7 @@ function acquireFileLock({
         throw new UsageError(heldMessage(other));
       }
       const isStale = Date.now() - st.mtimeMs > LOCK_UNREADABLE_STALE_MS;
-      if (!other && !isStale) {
+      if ((!other || !Number.isInteger(other.pid)) && !isStale) {
         if (Date.now() >= deadline) {
           throw new UsageError(waitMessage);
         }
@@ -124,8 +134,38 @@ function acquireFileLock({
           `${stalePrefix} ${left}: ${lockPath}. Retry with unlock=true to clear it.`,
         );
       }
-      rmSync(lockPath, { force: true });
-      allowUnlock = false;
+      let holdingReclaim = false;
+      try {
+        linkSync(lockTmp, reclaimPath);
+        holdingReclaim = true;
+      } catch (reclaimErr) {
+        if (reclaimErr.code === "EEXIST") {
+          try {
+            const rst = statSync(reclaimPath);
+            if (Date.now() - rst.mtimeMs > 1_000) {
+              rmSync(reclaimPath, { force: true });
+            }
+          } catch {
+            /* reclaim released */
+          }
+        }
+      }
+      if (holdingReclaim) {
+        try {
+          const stNow = statSync(lockPath);
+          const cur = readJsonQuiet(lockPath);
+          if (stNow.ino === st.ino && (!other?.token || cur?.token === other.token)) {
+            unlinkSync(lockPath);
+          }
+        } catch {
+          /* lock already gone */
+        } finally {
+          rmSync(reclaimPath, { force: true });
+        }
+        allowUnlock = false;
+        continue;
+      }
+      sleepMs(20);
     }
   } finally {
     rmSync(lockTmp, { force: true });
@@ -190,7 +230,8 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
   const { ownersDir, recordPath, lockPath } = outputOwnerPaths(canonicalOutput, stateDir);
   mkdirSync(ownersDir, { recursive: true });
 
-  // 1. Atomic first-claim durable ownership record (<sha256>.json) & paired execution lock (<sha256>.lock)
+  // Acquire the paired execution lock BEFORE linking/updating the durable .json record,
+  // so lock contention or stale-lock refusal never leaves an orphaned .json ownership record behind.
   const recordPayload = {
     run_id: runId,
     data_dir: canonicalDataDir,
@@ -207,28 +248,12 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
     pid: process.pid,
     started_at: new Date().toISOString(),
   };
-  let needsOwnershipUpdate = false;
+  let createdRecord = false;
+  let previousRecordRaw = null;
+  let updatedRecord = false;
 
   try {
     writeFileSync(recordTmp, JSON.stringify(recordPayload, null, 2) + "\n", "utf8");
-    try {
-      linkSync(recordTmp, recordPath);
-    } catch (e) {
-      if (e.code !== "EEXIST") throw e;
-      const existing = readJsonQuiet(recordPath);
-      const sameDataDir = Boolean(existing?.data_dir) && canonicalizePath(existing.data_dir) === canonicalDataDir;
-      const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
-      if (!existing || !sameDataDir || (!sameRun && !force)) {
-        const ownerDesc = existing?.run_id
-          ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
-          : "another run (unreadable ownership record)";
-        throw new UsageError(
-          `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
-        );
-      }
-      if (!sameRun && force) needsOwnershipUpdate = true;
-    }
-
     const acquired = acquireFileLock({
       lockPath,
       lockPayload,
@@ -239,12 +264,56 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
       stalePrefix: `Output path "${canonicalOutput}" has a stale execution lock`,
       unlock,
       beforeReturn: () => {
-        if (needsOwnershipUpdate) {
-          renameSync(recordTmp, recordPath);
+        try {
+          linkSync(recordTmp, recordPath);
+          createdRecord = true;
+        } catch (e) {
+          if (e.code !== "EEXIST") throw e;
+          const existing = readJsonQuiet(recordPath);
+          const sameDataDir = Boolean(existing?.data_dir) && canonicalizePath(existing.data_dir) === canonicalDataDir;
+          const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
+          if (!existing || !sameDataDir || (!sameRun && !force)) {
+            const ownerDesc = existing?.run_id
+              ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
+              : "another run (unreadable ownership record)";
+            throw new UsageError(
+              `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
+            );
+          }
+          if (!sameRun && force) {
+            try {
+              previousRecordRaw = readFileSync(recordPath, "utf8");
+            } catch {
+              previousRecordRaw = null;
+            }
+            renameSync(recordTmp, recordPath);
+            updatedRecord = true;
+          }
         }
       },
     });
-    return { recordPath, lockPath: acquired.lockPath, release: acquired.release };
+    return {
+      recordPath,
+      lockPath: acquired.lockPath,
+      release: acquired.release,
+      rollback() {
+        if (createdRecord) {
+          rmSync(recordPath, { force: true });
+          createdRecord = false;
+          return;
+        }
+        if (updatedRecord && previousRecordRaw !== null) {
+          const restoreTmp = `${recordPath}.${process.pid}.${Date.now()}.restore.tmp`;
+          try {
+            writeFileSync(restoreTmp, previousRecordRaw, "utf8");
+            renameSync(restoreTmp, recordPath);
+          } finally {
+            rmSync(restoreTmp, { force: true });
+          }
+          updatedRecord = false;
+        }
+      },
+    };
   } finally {
     rmSync(recordTmp, { force: true });
   }

@@ -13,12 +13,16 @@
  */
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { outputOwnerPaths } from "../ownership.mjs";
-import { readRunMeta } from "../paths.mjs";
+import { lookupRunById, readRunMeta } from "../paths.mjs";
 import { startHttpServer } from "../server.mjs";
 import { createFixtureWorkspace } from "./helpers.mjs";
+
+const PROTOCOL_URL = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), "..", "protocol.mjs")).href;
 
 const ws = createFixtureWorkspace({ withQuestions: false, withRoundTrip: false, delayMs: 250 });
 const wsPause = createFixtureWorkspace({ withQuestions: true, withRoundTrip: false, delayMs: 0 });
@@ -257,6 +261,80 @@ try {
     assert.equal(winner.exit_code, 0);
     assert.equal(readRunMeta(sharedDataDir)?.output_path, winner.output_path);
     assert.equal(readRunMeta(sharedDataDir)?.run_id, winner.run_id);
+  }
+
+  // 5. Two separate processes racing with the SAME explicit run_id and DIFFERENT data_dirs serialize atomically
+  {
+    const sharedRunId = "cross-proc-shared-run-id";
+    const dataA = join(ws.repoRoot, ".runs", "proc-race-a");
+    const dataB = join(ws.repoRoot, ".runs", "proc-race-b");
+    const outA = join(ws.repoRoot, "deliverables", "proc-out-a");
+    const outB = join(ws.repoRoot, "deliverables", "proc-out-b");
+    const fxA = ws.writeFixturesForOutput(outA);
+    const fxB = ws.writeFixturesForOutput(outB);
+
+    const runInChild = ({ dataDir, outputPath, fakeFixtureDir }) =>
+      new Promise((resolveChild, rejectChild) => {
+        const script = [
+          `import { createMcpHandler } from ${JSON.stringify(PROTOCOL_URL)};`,
+          `const h = createMcpHandler({ allowedRoots: [${JSON.stringify(ws.root)}], stateDir: ${JSON.stringify(ws.stateDir)} });`,
+          `const res = await h.callTool("uaw_run", {`,
+          `  workflow: "mcp_fixture",`,
+          `  run_id: ${JSON.stringify(sharedRunId)},`,
+          `  goal: "Cross-process run_id race",`,
+          `  adapter: "fake",`,
+          `  data_dir: ${JSON.stringify(dataDir)},`,
+          `  output_path: ${JSON.stringify(outputPath)},`,
+          `  repo_root: ${JSON.stringify(ws.repoRoot)},`,
+          `  skills_root: ${JSON.stringify(ws.skillsRoot)},`,
+          `  fake_fixture_dir: ${JSON.stringify(fakeFixtureDir)},`,
+          `});`,
+          `process.stdout.write(JSON.stringify(res.structuredContent));`,
+        ].join("\n");
+        const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => (stdout += d));
+        child.stderr.on("data", (d) => (stderr += d));
+        child.on("error", rejectChild);
+        child.on("close", (code) => {
+          if (code !== 0) {
+            rejectChild(new Error(`Child exited ${code}: ${stderr}\nstdout: ${stdout}`));
+            return;
+          }
+          resolveChild({ dataDir, result: JSON.parse(stdout) });
+        });
+      });
+
+    const [resA, resB] = await Promise.all([
+      runInChild({ dataDir: dataA, outputPath: outA, fakeFixtureDir: fxA }),
+      runInChild({ dataDir: dataB, outputPath: outB, fakeFixtureDir: fxB }),
+    ]);
+    const winner = [resA, resB].find((x) => x.result.exit_code === 0);
+    const loser = [resA, resB].find((x) => x.result.exit_code === 2);
+    assert.ok(winner, `one process must claim run_id cleanly; got ${JSON.stringify([resA, resB])}`);
+    assert.ok(loser, `second process must fail closed with exit_code 2; got ${JSON.stringify([resA, resB])}`);
+    assert.match(loser.result.error ?? "", /already registered to data_dir/);
+    assert.equal(lookupRunById(ws.stateDir, sharedRunId)?.data_dir, winner.dataDir);
+    assert.equal(readRunMeta(loser.dataDir), null, "losing data_dir must not persist run-meta.json");
+
+    // Losing contender must NOT leave an orphaned output-owners record behind for loserOut.
+    const loserOut = loser.dataDir === dataA ? outA : outB;
+    const loserFx = loser.dataDir === dataA ? fxA : fxB;
+    const legitFollowup = await callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      run_id: "cross-proc-followup-legit",
+      goal: "Reclaim loser output_path cleanly",
+      adapter: "fake",
+      data_dir: join(ws.repoRoot, ".runs", "proc-race-followup"),
+      output_path: loserOut,
+      repo_root: ws.repoRoot,
+      skills_root: ws.skillsRoot,
+      fake_fixture_dir: loserFx,
+    });
+    assert.equal(legitFollowup.exit_code, 0, "rejected run_id race must not orphan output_path ownership");
   }
 
   console.log("uaw-mcp concurrency & out-of-tree output ownership tests passed");

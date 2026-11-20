@@ -27,6 +27,7 @@ import {
   canonicalizePath,
   defaultOutputPath,
   generateRunId,
+  pruneSupersededRunIndices,
   readRunMeta,
   registerRunIndex,
   resolveRunTarget,
@@ -247,7 +248,7 @@ function buildRunEnvelope({ runId, dataDir, outputPath, workflow, exitCode, stdo
     /* DB may not exist */
   }
   try {
-    costSummary = computeCostSummary(dataDir);
+    costSummary = redactDeep(computeCostSummary(dataDir)).value;
   } catch {
     /* no transcripts */
   }
@@ -266,6 +267,24 @@ function buildRunEnvelope({ runId, dataDir, outputPath, workflow, exitCode, stdo
     stdout: scrubbedStdout,
     stderr: scrubbedStderr,
   };
+}
+
+function rollbackClaimAndIndex(claim, idxReg) {
+  try {
+    claim?.rollback?.();
+  } catch {
+    /* best-effort rollback */
+  }
+  try {
+    claim?.release?.();
+  } catch {
+    /* best-effort lock release */
+  }
+  try {
+    idxReg?.rollback?.();
+  } catch {
+    /* best-effort index rollback */
+  }
 }
 
 const SAFE_WORKFLOW_RE = /^[A-Za-z0-9_-]+$/;
@@ -513,15 +532,6 @@ export async function cmdRun(params = {}, ctx = {}) {
     const env = { UAW_RUN_ID: runId };
     if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
 
-    claim = claimOutputPath({
-      outputPath,
-      runId,
-      dataDir,
-      stateDir,
-      unlock: params.unlock === true,
-      force,
-    });
-
     const preserved = existingMeta && !force ? existingMeta : {};
     const meta = {
       ...preserved,
@@ -534,8 +544,26 @@ export async function cmdRun(params = {}, ctx = {}) {
       created_at: !force && existingMeta?.created_at ? existingMeta.created_at : new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
-    writeRunMeta(dataDir, meta);
-    registerRunIndex(stateDir, meta);
+
+    // Reserve run_id BEFORE claiming output_path so a cross-process run_id collision
+    // never leaves an orphaned output-owners record behind.
+    const idxReg = registerRunIndex(stateDir, meta, { pruneSuperseded: false });
+    try {
+      claim = claimOutputPath({
+        outputPath,
+        runId,
+        dataDir,
+        stateDir,
+        unlock: params.unlock === true,
+        force,
+      });
+      writeRunMeta(dataDir, meta);
+    } catch (err) {
+      rollbackClaimAndIndex(claim, idxReg);
+      claim = null;
+      throw err;
+    }
+    pruneSupersededRunIndices(stateDir, meta);
 
     const res = await execNodeAsync(RUNNER_CLI, args, {
       cwd: repoRoot,
@@ -660,14 +688,6 @@ export async function cmdResume(params = {}, ctx = {}) {
     const env = { UAW_RUN_ID: runId };
     if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
 
-    claim = claimOutputPath({
-      outputPath,
-      runId,
-      dataDir,
-      stateDir,
-      unlock: params.unlock === true,
-    });
-
     if (!meta || !meta.output_path) {
       const updatedMeta = {
         ...(meta ?? {}),
@@ -680,8 +700,30 @@ export async function cmdResume(params = {}, ctx = {}) {
         created_at: meta?.created_at ?? new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-      writeRunMeta(dataDir, updatedMeta);
-      registerRunIndex(stateDir, updatedMeta);
+      const idxReg = registerRunIndex(stateDir, updatedMeta, { pruneSuperseded: false });
+      try {
+        claim = claimOutputPath({
+          outputPath,
+          runId,
+          dataDir,
+          stateDir,
+          unlock: params.unlock === true,
+        });
+        writeRunMeta(dataDir, updatedMeta);
+      } catch (err) {
+        rollbackClaimAndIndex(claim, idxReg);
+        claim = null;
+        throw err;
+      }
+      pruneSupersededRunIndices(stateDir, updatedMeta);
+    } else {
+      claim = claimOutputPath({
+        outputPath,
+        runId,
+        dataDir,
+        stateDir,
+        unlock: params.unlock === true,
+      });
     }
 
     const res = await execNodeAsync(RUNNER_CLI, args, {
@@ -950,14 +992,6 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       "skills_root",
     );
 
-    claim = claimOutputPath({
-      outputPath,
-      runId,
-      dataDir,
-      stateDir,
-      unlock: params.unlock === true,
-    });
-
     const common = ["--data-dir", dataDir, "--output-path", outputPath];
     const env = { UWF_DATA_DIR: dataDir, ...(skillsRoot ? { UWF_SKILLS_ROOT: skillsRoot } : {}) };
 
@@ -972,8 +1006,30 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-      writeRunMeta(dataDir, createdMeta);
-      registerRunIndex(stateDir, createdMeta);
+      const idxReg = registerRunIndex(stateDir, createdMeta, { pruneSuperseded: false });
+      try {
+        claim = claimOutputPath({
+          outputPath,
+          runId,
+          dataDir,
+          stateDir,
+          unlock: params.unlock === true,
+        });
+        writeRunMeta(dataDir, createdMeta);
+      } catch (err) {
+        rollbackClaimAndIndex(claim, idxReg);
+        claim = null;
+        throw err;
+      }
+      pruneSupersededRunIndices(stateDir, createdMeta);
+    } else {
+      claim = claimOutputPath({
+        outputPath,
+        runId,
+        dataDir,
+        stateDir,
+        unlock: params.unlock === true,
+      });
     }
 
     if (scope === "state") {
@@ -1050,7 +1106,7 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
     data_dir: params.data_dir,
     stateDir,
     allowedRoots,
-    requireExisting: false,
+    requireExisting: true,
   });
   const dataDir = target.dataDir;
 
@@ -1065,6 +1121,22 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
   if (params.answer !== undefined) args.push("--answer", assertNoLeadingDash(params.answer, "answer"));
 
   if (action !== "answer" && action !== "skip") {
+    if (!existsSync(dataDir)) {
+      throw new UsageError(`No run directory found at "${dataDir}"`);
+    }
+    if (!existsSync(join(dataDir, "uwf-questions.db"))) {
+      return redactDeep({
+        ok: true,
+        exit_code: EXIT.OK,
+        run_id: target.runId,
+        data_dir: dataDir,
+        action,
+        result: action === "list"
+          ? { ok: true, procedure: "list", count: 0, questions: [] }
+          : { ok: true, procedure: "check", gate: "pass", pending_count: 0, pending: [] },
+        error: null,
+      }).value;
+    }
     const res = await execNodeAsync(QUESTIONS_CLI, args, {
       cwd: OWN_REPO_ROOT,
       env: { UWF_DATA_DIR: dataDir },

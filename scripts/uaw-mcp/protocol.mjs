@@ -332,9 +332,15 @@ function parseUawUri(uri) {
   if (slashIdx <= 0) {
     throw new UsageError(`Malformed resource URI "${uri}"; expected uaw://<run>/<resource>`);
   }
-  const runSegment = decodeURIComponent(rest.slice(0, slashIdx));
-  const pathPart = rest.slice(slashIdx + 1);
-  const segments = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
+  let runSegment;
+  let segments;
+  try {
+    runSegment = decodeURIComponent(rest.slice(0, slashIdx));
+    const pathPart = rest.slice(slashIdx + 1);
+    segments = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    throw new UsageError(`Malformed percent-encoding in resource URI "${uri}"`);
+  }
   if (segments.length === 0) {
     throw new UsageError(`Missing resource path in URI "${uri}"`);
   }

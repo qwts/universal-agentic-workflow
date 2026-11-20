@@ -6,6 +6,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -14,6 +15,8 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -102,7 +105,7 @@ export function assertAllowedPath(targetPath, allowedRoots, label = "path") {
     const canonicalRoot = canonicalizePath(root);
     if (canonicalTarget === canonicalRoot) return true;
     const rel = relative(canonicalRoot, canonicalTarget);
-    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+    return rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
   });
   if (!allowed) {
     throw new UsageError(
@@ -192,43 +195,219 @@ function runIndexPath(stateDir, runId) {
   return join(resolveUawStateDir(stateDir), "runs", `${key}.json`);
 }
 
-export function registerRunIndex(stateDir, meta) {
-  if (!meta?.run_id || !meta?.data_dir) return null;
-  const existing = lookupRunById(stateDir, meta.run_id);
-  if (existing?.data_dir && canonicalizePath(existing.data_dir) !== canonicalizePath(meta.data_dir)) {
-    throw new UsageError(
-      `run_id "${meta.run_id}" is already registered to data_dir "${existing.data_dir}" (refusing to reassign to "${meta.data_dir}")`,
-    );
-  }
-  const idxPath = runIndexPath(stateDir, meta.run_id);
-  const runsDir = dirname(idxPath);
-  mkdirSync(runsDir, { recursive: true });
-  const tmpPath = `${idxPath}.${process.pid}.${Date.now()}.tmp`;
+const SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+function sleepSyncMs(ms) {
+  Atomics.wait(SLEEP_ARRAY, 0, 0, ms);
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
-    renameSync(tmpPath, idxPath);
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+function readLockJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function withRunIndexLock(stateDir, runId, fn) {
+  const key = createHash("sha256").update(String(runId)).digest("hex");
+  const locksDir = join(resolveUawStateDir(stateDir), "run-locks");
+  const lockPath = join(locksDir, `${key}.lock`);
+  const reclaimPath = `${lockPath}.reclaim`;
+  mkdirSync(locksDir, { recursive: true });
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const tmpPath = `${lockPath}.${token}.tmp`;
+  const deadline = Date.now() + 2000;
+  let acquired = false;
+  let linkedIno = null;
+
+  try {
+    writeFileSync(tmpPath, JSON.stringify({ run_id: runId, pid: process.pid, token }) + "\n", "utf8");
+    while (!acquired) {
+      try {
+        linkSync(tmpPath, lockPath);
+        linkedIno = statSync(lockPath).ino;
+        acquired = true;
+        break;
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+
+      let st;
+      try {
+        st = statSync(lockPath);
+      } catch {
+        continue;
+      }
+      const other = readLockJson(lockPath);
+      const deadPid = Boolean(other && Number.isInteger(other.pid) && !isPidAlive(other.pid));
+      const corruptStale = (!other || !Number.isInteger(other.pid)) && Date.now() - st.mtimeMs > 1_000;
+      if (deadPid || corruptStale) {
+        let holdingReclaim = false;
+        try {
+          linkSync(tmpPath, reclaimPath);
+          holdingReclaim = true;
+        } catch (reclaimErr) {
+          if (reclaimErr.code === "EEXIST") {
+            try {
+              const rst = statSync(reclaimPath);
+              if (Date.now() - rst.mtimeMs > 1_000) {
+                rmSync(reclaimPath, { force: true });
+              }
+            } catch {
+              /* reclaim released */
+            }
+          }
+        }
+        if (holdingReclaim) {
+          try {
+            const stNow = statSync(lockPath);
+            const cur = readLockJson(lockPath);
+            if (stNow.ino === st.ino && (!other?.token || cur?.token === other.token)) {
+              unlinkSync(lockPath);
+            }
+          } catch {
+            /* lock already gone */
+          } finally {
+            rmSync(reclaimPath, { force: true });
+          }
+          continue;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new UsageError(
+          `Could not acquire run_id "${runId}" index lock (held by pid ${other?.pid ?? "unknown"}); retry shortly.`,
+        );
+      }
+      sleepSyncMs(15);
+    }
+    return fn();
   } finally {
     rmSync(tmpPath, { force: true });
+    if (acquired && linkedIno !== null) {
+      try {
+        if (statSync(lockPath).ino === linkedIno && readLockJson(lockPath)?.token === token) {
+          unlinkSync(lockPath);
+        }
+      } catch {
+        /* lock already removed */
+      }
+    }
   }
+}
+
+export function pruneSupersededRunIndices(stateDir, meta) {
+  if (!meta?.run_id || !meta?.data_dir) return;
   const canonicalDataDir = canonicalizePath(meta.data_dir);
-  const currentName = basename(idxPath);
+  const currentIdxPath = runIndexPath(stateDir, meta.run_id);
+  const runsDir = dirname(currentIdxPath);
+  if (!existsSync(runsDir)) return;
+  const currentName = basename(currentIdxPath);
   for (const name of readdirSync(runsDir).filter((f) => f.endsWith(".json"))) {
     if (name === currentName) continue;
     const otherPath = join(runsDir, name);
+    let parsed;
     try {
-      const parsed = JSON.parse(readFileSync(otherPath, "utf8"));
+      parsed = JSON.parse(readFileSync(otherPath, "utf8"));
       if (
-        parsed?.data_dir &&
-        parsed?.run_id !== meta.run_id &&
-        canonicalizePath(parsed.data_dir) === canonicalDataDir
+        !parsed?.run_id ||
+        parsed.run_id === meta.run_id ||
+        !parsed?.data_dir ||
+        canonicalizePath(parsed.data_dir) !== canonicalDataDir
       ) {
-        rmSync(otherPath, { force: true });
+        continue;
       }
     } catch {
-      /* ignore corrupt sibling index entry */
+      continue;
+    }
+    try {
+      withRunIndexLock(stateDir, parsed.run_id, () => {
+        try {
+          const latest = JSON.parse(readFileSync(otherPath, "utf8"));
+          if (
+            latest?.run_id === parsed.run_id &&
+            latest?.data_dir &&
+            canonicalizePath(latest.data_dir) === canonicalDataDir
+          ) {
+            rmSync(otherPath, { force: true });
+          }
+        } catch {
+          /* ignore missing or unreadable sibling index entry */
+        }
+      });
+    } catch {
+      /* ignore transient lock/filesystem error on sibling index entry */
     }
   }
-  return idxPath;
+}
+
+export function registerRunIndex(stateDir, meta, { pruneSuperseded = true } = {}) {
+  if (!meta?.run_id || !meta?.data_dir) return null;
+  const canonicalDataDir = canonicalizePath(meta.data_dir);
+  const reg = withRunIndexLock(stateDir, meta.run_id, () => {
+    const existing = lookupRunById(stateDir, meta.run_id);
+    if (existing?.data_dir && canonicalizePath(existing.data_dir) !== canonicalDataDir) {
+      throw new UsageError(
+        `run_id "${meta.run_id}" is already registered to data_dir "${existing.data_dir}" (refusing to reassign to "${meta.data_dir}")`,
+      );
+    }
+    const idxPath = runIndexPath(stateDir, meta.run_id);
+    const createdNew = !existing;
+    let previousRaw = null;
+    if (!createdNew && existsSync(idxPath)) {
+      try {
+        previousRaw = readFileSync(idxPath, "utf8");
+      } catch {
+        previousRaw = null;
+      }
+    }
+    const runsDir = dirname(idxPath);
+    mkdirSync(runsDir, { recursive: true });
+    const tmpPath = `${idxPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
+      renameSync(tmpPath, idxPath);
+    } finally {
+      rmSync(tmpPath, { force: true });
+    }
+    return {
+      idxPath,
+      createdNew,
+      rollback() {
+        withRunIndexLock(stateDir, meta.run_id, () => {
+          if (createdNew) {
+            const cur = lookupRunById(stateDir, meta.run_id);
+            if (cur?.data_dir && canonicalizePath(cur.data_dir) === canonicalDataDir) {
+              rmSync(idxPath, { force: true });
+            }
+            return;
+          }
+          if (previousRaw !== null) {
+            const restoreTmp = `${idxPath}.${process.pid}.${Date.now()}.restore.tmp`;
+            try {
+              writeFileSync(restoreTmp, previousRaw, "utf8");
+              renameSync(restoreTmp, idxPath);
+            } finally {
+              rmSync(restoreTmp, { force: true });
+            }
+          }
+        });
+      },
+    };
+  });
+  if (pruneSuperseded) {
+    pruneSupersededRunIndices(stateDir, meta);
+  }
+  return reg;
 }
 
 export function lookupRunById(stateDir, runId) {
@@ -272,6 +451,14 @@ export function listRegisteredRuns(stateDir) {
  */
 export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, requireExisting = false } = {}) {
   const resolvedStateDir = resolveUawStateDir(stateDir);
+  if (run_id !== undefined && run_id !== null) {
+    if (typeof run_id !== "string" || !run_id.trim()) {
+      throw new UsageError("run_id must be a non-empty string");
+    }
+    if (run_id === "." || run_id.includes("/") || run_id.includes("\\") || run_id.includes("..")) {
+      throw new UsageError(`Invalid run_id "${run_id}": path traversal sequences are disallowed`);
+    }
+  }
   let resolvedDataDir = null;
   let meta = null;
 
@@ -293,6 +480,9 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
       meta = readRunMeta(resolvedDataDir) ?? indexed;
     } else if (!requireExisting) {
       const safeRun = String(run_id).replace(/[^A-Za-z0-9._-]+/g, "_");
+      if (!safeRun || safeRun === "." || safeRun === "..") {
+        throw new UsageError(`Invalid run_id "${run_id}"`);
+      }
       const baseDir = Array.isArray(allowedRoots) && allowedRoots.length > 0
         ? join(canonicalizePath(allowedRoots[0]), ".uaw-runs")
         : join(resolvedStateDir, "runs-data");
