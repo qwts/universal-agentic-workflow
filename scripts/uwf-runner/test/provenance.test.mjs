@@ -12,6 +12,7 @@ import {
   captureStageOutputs,
   computeIdempotencyKey,
   computeWorktreeTreeSha,
+  ensureRunMeta,
   materializeManifest,
   resolveDeliverableKey,
   sealManifest,
@@ -1541,6 +1542,41 @@ try {
     const rebuiltRecovered = buildManifest({ dataDir: replayData, workflow: "sw_dev", repoRoot: replayRepo, phase: "closed" });
     assert.equal(rebuiltRecovered.manifest.run_id, sealedRunId, "deleted run-meta.json must recover run_id from uwf-state.db");
     assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
+
+    // Conflicting explicit runId / UAW_RUN_ID during resume / --from-stage fails closed when forceNew is false.
+    assert.throws(
+      () => ensureRunMeta(replayData, { workflow: "sw_dev", runId: "conflicting-explicit-id", repoRoot: replayRepo }),
+      /Run ID mismatch/i,
+    );
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
+
+    let mismatchExit = 0;
+    let mismatchStderr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Replay seal test", "--from-stage", "retro", "--adapter", "fake", "--repo-root", replayRepo, "--data-dir", replayData, "--defer-seal"],
+        { encoding: "utf8", env: { ...replayEnv, UAW_RUN_ID: "conflicting-env-id" }, stdio: "pipe" },
+      );
+    } catch (err) {
+      mismatchExit = err.status ?? 1;
+      mismatchStderr = String(err.stderr ?? "");
+    }
+    assert.notEqual(mismatchExit, 0, "runner --from-stage with conflicting UAW_RUN_ID must fail closed");
+    assert.match(mismatchStderr, /Run ID mismatch/i);
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
+
+    const forceRotData = join(runRoot, "force-rotate-data");
+    mkdirSync(forceRotData, { recursive: true });
+    cpSync(replayData, forceRotData, { recursive: true });
+    const forcedMeta = ensureRunMeta(forceRotData, {
+      workflow: "sw_dev",
+      runId: "forced-explicit-id",
+      repoRoot: replayRepo,
+      forceNew: true,
+    });
+    assert.equal(forcedMeta.run_id, "forced-explicit-id");
+    assert.equal(JSON.parse(readFileSync(join(forceRotData, "run-meta.json"), "utf8")).run_id, "forced-explicit-id");
 
     // Corrupt run-meta.json in a fresh data dir with no persisted run_id fails closed instead of minting a replacement.
     const corruptEmptyData = join(runRoot, "corrupt-empty-data");

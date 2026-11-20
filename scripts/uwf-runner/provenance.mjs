@@ -265,11 +265,12 @@ export function ensureRunMeta(
   }
 
   const explicitRunId = runId || process.env.UAW_RUN_ID || null;
-  if (
-    !forceNew &&
-    existing &&
-    (!explicitRunId || existing.run_id === explicitRunId)
-  ) {
+  if (!forceNew && existing) {
+    if (explicitRunId && existing.run_id !== explicitRunId) {
+      throw new Error(
+        `Run ID mismatch for ${absDataDir}: run-meta.json records "${existing.run_id}", requested "${explicitRunId}"`,
+      );
+    }
     let dirty = false;
     if (!existing.workflow && workflow) { existing.workflow = workflow; dirty = true; }
     if (!existing.output_path && outputPath) { existing.output_path = outputPath; dirty = true; }
@@ -304,20 +305,17 @@ export function ensureRunMeta(
       }
       return recoveredMeta;
     }
-    if (!explicitRunId) {
-      if (metaFileCorrupt) {
-        throw new Error(`Corrupt run metadata at ${metaPath} and no persisted run_id found in uwf-state.db`);
-      }
-      if (recovered.hasRunnerHistory) {
-        throw new Error(`Missing run metadata at ${metaPath} for existing runner run in ${absDataDir} with no persisted run_id in uwf-state.db`);
-      }
+    if (metaFileCorrupt) {
+      throw new Error(`Corrupt run metadata at ${metaPath} and no persisted run_id found in uwf-state.db`);
+    }
+    if (recovered.hasRunnerHistory) {
+      throw new Error(`Missing run metadata at ${metaPath} for existing runner run in ${absDataDir} with no persisted run_id in uwf-state.db`);
     }
   }
 
   const defaultWorkflow = workflow ?? "sw_dev";
   const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
-  const explicitChanged = Boolean(explicitRunId && existing?.run_id && existing.run_id !== explicitRunId);
-  const priorTranscripts = (forceNew || explicitChanged)
+  const priorTranscripts = forceNew
     ? listTranscripts(absDataDir).map((f) => basename(f))
     : Array.isArray(existing?.prior_transcripts)
       ? existing.prior_transcripts
