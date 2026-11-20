@@ -23,11 +23,13 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   copyFileSync,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -36,8 +38,9 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -66,6 +69,55 @@ const RUN_META_FILE = "run-meta.json";
 const GOAL_FILE = "runner-goal.md";
 const ROUTING_FILE = "runner-routing.json";
 const SCHEMA_VERSION = "1.0.0";
+
+/**
+ * Write UTF-8 text or Buffer atomically via a unique sibling temp file, fsync, mode preservation, and `renameSync`.
+ */
+export function writeFileAtomic(filePath, content) {
+  const absPath = resolve(filePath);
+  const inspectRegularTarget = () => {
+    try {
+      const st = lstatSync(absPath);
+      if (st.isSymbolicLink() || !st.isFile()) {
+        throw new Error(`Refusing unsafe or symlinked file at ${absPath}`);
+      }
+      return st.mode & 0o7777;
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+      return null;
+    }
+  };
+  const prevMode = inspectRegularTarget();
+  const dir = dirname(absPath);
+  mkdirSync(dir, { recursive: true });
+  const tmpPath = join(dir, `.${basename(absPath)}.tmp-${process.pid}-${randomUUID()}`);
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(String(content), "utf8");
+  let fd = null;
+  try {
+    fd = openSync(tmpPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, prevMode ?? 0o666);
+    try {
+      let written = 0;
+      while (written < buf.length) {
+        written += writeSync(fd, buf, written, buf.length - written);
+      }
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+      fd = null;
+    }
+    if (prevMode !== null) {
+      chmodSync(tmpPath, prevMode);
+    }
+    inspectRegularTarget();
+    renameSync(tmpPath, absPath);
+  } catch (err) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* ignore close error */ }
+    }
+    rmSync(tmpPath, { force: true });
+    throw err;
+  }
+}
 
 // Load better-sqlite3 and js-yaml from the skill packages (or fallback to local node_modules).
 function loadDatabaseCtor() {
@@ -335,7 +387,7 @@ export function ensureRunMeta(
       const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
       if (resolvedBase) { existing.base_commit_sha = resolvedBase; dirty = true; }
     }
-    if (dirty && persist) writeFileSync(metaPath, JSON.stringify(existing, null, 2) + "\n");
+    if (dirty && persist) writeFileAtomic(metaPath, JSON.stringify(existing, null, 2) + "\n");
     return existing;
   }
 
@@ -358,7 +410,7 @@ export function ensureRunMeta(
         ...(recoveredBase ? { base_commit_sha: recoveredBase } : {}),
       };
       if (persist) {
-        writeFileSync(metaPath, JSON.stringify(recoveredMeta, null, 2) + "\n");
+        writeFileAtomic(metaPath, JSON.stringify(recoveredMeta, null, 2) + "\n");
       }
       return recoveredMeta;
     }
@@ -394,7 +446,7 @@ export function ensureRunMeta(
     ...(priorTranscripts.length ? { prior_transcripts: priorTranscripts } : {}),
   };
   if (persist) {
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+    writeFileAtomic(metaPath, JSON.stringify(meta, null, 2) + "\n");
   }
   return meta;
 }
@@ -803,21 +855,24 @@ function isOutsideRel(rel) {
   return rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
 }
 
-function readRegularFileNoFollow(filePath) {
+function readRegularFileNoFollow(filePath, label = "Declared output") {
   let fd;
   const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
   try {
     fd = openSync(filePath, openFlags);
   } catch (err) {
-    if (err.code === "ELOOP" || err.code === "EFTYPE") {
-      throw new Error(`Declared output "${filePath}" must not be a symlink`);
-    }
-    throw new Error(`Failed to open declared output "${filePath}": ${err.message}`);
+    const wrapped = err.code === "ELOOP" || err.code === "EFTYPE"
+      ? new Error(`${label} "${filePath}" must not be a symlink`)
+      : new Error(`Failed to open ${label.toLowerCase()} "${filePath}": ${err.message}`);
+    wrapped.code = err.code;
+    throw wrapped;
   }
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) {
-      throw new Error(`Declared output "${filePath}" must be a regular file`);
+      const err = new Error(`${label} "${filePath}" must be a regular file`);
+      err.code = "EINVAL";
+      throw err;
     }
     return readFileSync(fd);
   } finally {
@@ -1831,17 +1886,60 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
   return { perStage, costSummary };
 }
 
-function readRoundTrips(dataDir) {
+export function readRoutingState(dataDir) {
   const routingPath = join(dataDir, ROUTING_FILE);
-  const byStage = new Map();
-  if (!existsSync(routingPath)) return byStage;
+  let rawText;
   try {
-    const saved = JSON.parse(readFileSync(routingPath, "utf8"));
-    for (const [k, v] of Object.entries(saved.trips ?? {})) {
-      const stage = k.split("|")[0];
-      byStage.set(stage, (byStage.get(stage) ?? 0) + Number(v || 0));
+    rawText = readRegularFileNoFollow(routingPath, "Routing telemetry").toString("utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return { trips: {}, findings: {} };
+    throw err;
+  }
+  let saved;
+  try {
+    saved = JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(`Corrupt routing telemetry at ${routingPath}: ${err.message}`);
+  }
+  if (!isPlainObject(saved)) {
+    throw new Error(`Corrupt routing telemetry at ${routingPath}: expected JSON object`);
+  }
+  const tripsObj = saved.trips === undefined || saved.trips === null ? {} : saved.trips;
+  if (!isPlainObject(tripsObj)) {
+    throw new Error(`Corrupt routing telemetry at ${routingPath}: trips must be an object`);
+  }
+  for (const [k, v] of Object.entries(tripsObj)) {
+    const stage = k.split("|")[0];
+    if (!stage || typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+      throw new Error(`Corrupt routing telemetry at ${routingPath}: invalid entry "${k}"`);
     }
-  } catch { /* ignore */ }
+  }
+  const findingsObj = saved.findings === undefined || saved.findings === null ? {} : saved.findings;
+  if (!isPlainObject(findingsObj)) {
+    throw new Error(`Corrupt routing telemetry at ${routingPath}: findings must be an object`);
+  }
+  for (const [k, f] of Object.entries(findingsObj)) {
+    if (
+      !k.trim() ||
+      !isPlainObject(f) ||
+      !Array.isArray(f.files) ||
+      !f.files.every((p) => typeof p === "string") ||
+      typeof f.note !== "string" ||
+      (f.from !== undefined && f.from !== null && typeof f.from !== "string")
+    ) {
+      throw new Error(`Corrupt routing telemetry at ${routingPath}: invalid finding entry "${k}"`);
+    }
+  }
+  return { trips: tripsObj, findings: findingsObj };
+}
+
+function readRoundTrips(dataDir) {
+  const saved = readRoutingState(dataDir);
+  const byStage = new Map();
+  for (const [k, v] of Object.entries(saved.trips)) {
+    const stage = k.split("|")[0];
+    byStage.set(stage, (byStage.get(stage) ?? 0) + v);
+  }
   return byStage;
 }
 
@@ -2171,15 +2269,7 @@ export async function materializeManifest({
 
   mkdirSync(absDataDir, { recursive: true });
   const manifestPath = join(absDataDir, MANIFEST_FILE);
-  try {
-    const manLst = lstatSync(manifestPath);
-    if (manLst.isSymbolicLink() || !manLst.isFile()) {
-      throw new Error(`Refusing unsafe or symlinked manifest at ${manifestPath}`);
-    }
-  } catch (err) {
-    if (err.code !== "ENOENT") throw err;
-  }
-  writeFileSync(manifestPath, built.canonicalJson, "utf8");
+  writeFileAtomic(manifestPath, built.canonicalJson);
 
   const isStageEvent = phase === "snapshot";
   const suppressForDefer = Boolean(deferSeal && !isStageEvent);
@@ -2557,7 +2647,7 @@ function scrubTextFileInRoots(absPath, allowedRealRoots) {
   const { text, count } = redactSecrets(buf.toString("utf8"));
   if (count <= 0) return { scrubbed: false, redacted: 0, buf };
   const nextBuf = Buffer.from(text, "utf8");
-  writeFileSync(realFile, nextBuf);
+  writeFileAtomic(realFile, nextBuf);
   return { scrubbed: true, redacted: count, buf: nextBuf };
 }
 
@@ -2694,7 +2784,7 @@ export async function scrubProvenanceOutputs({
           if (count <= 0) continue;
 
           const nextBuf = Buffer.from(text, "utf8");
-          writeFileSync(realAbs, nextBuf);
+          writeFileAtomic(realAbs, nextBuf);
           latest.item.sha256 = sha256Hex(nextBuf);
           latest.item.bytes = nextBuf.length;
           parsedRows.get(latest.rowId).changed = true;

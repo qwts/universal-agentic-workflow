@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
-import { computeWorktreeTreeSha, ensureRunMeta, getCommitTreeSha, isGitRepo, materializeManifest, sealManifest } from "./provenance.mjs";
+import { computeWorktreeTreeSha, ensureRunMeta, getCommitTreeSha, isGitRepo, materializeManifest, readRoutingState, sealManifest, writeFileAtomic } from "./provenance.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -85,7 +85,7 @@ async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, ou
   }
   const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal || hasDirtyGitWorktree);
   const finalPhase = effectiveDeferSeal ? "closed" : "sealed";
-  writeFileSync(
+  writeFileAtomic(
     join(dataDir, FINALIZE_PENDING_FILE),
     JSON.stringify({ phase: finalPhase, defer_seal: effectiveDeferSeal, ts: new Date().toISOString() }) + "\n",
   );
@@ -539,7 +539,7 @@ async function main(argv) {
         rollbackPhase(start);
       }
       mkdirSync(dataDir, { recursive: true });
-      writeFileSync(goalPath, goal + "\n");
+      writeFileAtomic(goalPath, goal + "\n");
       const noted = note(`runner start: workflow=${workflow} adapter=${adapterName} from=${stages[start].name}`);
       if (!noted.ok) log(`[runner] note not recorded: ${noted.error}`);
     }
@@ -575,14 +575,12 @@ async function stageLoop(ctx) {
   const routingPath = join(dataDir, ROUTING_FILE);
   const saveRouting = () => {
     mkdirSync(dataDir, { recursive: true });
-    writeFileSync(routingPath, JSON.stringify({ trips: Object.fromEntries(trips), findings: Object.fromEntries(findings) }, null, 2) + "\n");
+    writeFileAtomic(routingPath, JSON.stringify({ trips: Object.fromEntries(trips), findings: Object.fromEntries(findings) }, null, 2) + "\n");
   };
   if (resuming || flags["from-stage"]) {
-    try {
-      const saved = JSON.parse(readFileSync(routingPath, "utf8"));
-      for (const [k, v] of Object.entries(saved.trips ?? {})) trips.set(k, v);
-      for (const [k, v] of Object.entries(saved.findings ?? {})) findings.set(k, v);
-    } catch { /* nothing recorded */ }
+    const savedRouting = readRoutingState(dataDir);
+    for (const [k, v] of Object.entries(savedRouting.trips)) trips.set(k, v);
+    for (const [k, v] of Object.entries(savedRouting.findings)) findings.set(k, v);
   }
   // Stages skipped (this run or recorded earlier): inputs only they would produce are optional downstream.
   const recorded = cli(TRACKER, ["read", "--workflow", workflow], withOut);

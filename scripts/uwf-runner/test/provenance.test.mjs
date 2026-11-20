@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -20,6 +20,7 @@ import {
   sha256Hex,
   validateManifest,
   verifyManifest,
+  writeFileAtomic,
 } from "../provenance.mjs";
 import { scrubDeep } from "../context-hub-sink.mjs";
 import { listChanges, readEntry } from "../../uwf-on-pr/push-as-bot.mjs";
@@ -2019,6 +2020,121 @@ try {
     } finally {
       runnerSymDb.close();
     }
+
+    // Step S5: Atomic manifest/state writes preserve prior valid files on failure, and corrupt routing telemetry fails closed
+    // 5a. writeFileAtomic against symlinked target or unwritable directory fails without corrupting target or leaving .tmp files
+    const atomicDir = join(runRoot, "atomic-test");
+    mkdirSync(atomicDir, { recursive: true });
+    const atomicTarget = join(atomicDir, "uaw-manifest.json");
+    const intactPayload = '{"schema_version":"1.0.0","ok":true}\n';
+    writeFileAtomic(atomicTarget, intactPayload);
+    assert.equal(readFileSync(atomicTarget, "utf8"), intactPayload);
+
+    const atomicSym = join(atomicDir, "sym-manifest.json");
+    symlinkSync(atomicTarget, atomicSym);
+    assert.throws(
+      () => writeFileAtomic(atomicSym, '{"corrupted":true}\n'),
+      /Refusing unsafe or symlinked file/i,
+    );
+    assert.equal(readFileSync(atomicTarget, "utf8"), intactPayload, "symlinked atomic write must not touch target");
+    assert.equal(
+      readdirSync(atomicDir).some((n) => n.includes(".tmp-")),
+      false,
+      "failed writeFileAtomic must clean up any temp files",
+    );
+
+    if (process.platform !== "win32") {
+      chmodSync(atomicTarget, 0o750);
+      writeFileAtomic(atomicTarget, '{"schema_version":"1.0.0","ok":true,"mode":"kept"}\n');
+      assert.equal(statSync(atomicTarget).mode & 0o777, 0o750, "writeFileAtomic must preserve existing file mode");
+    }
+
+    // Also test a real completed run where an existing valid uaw-manifest.json cannot be replaced (e.g., symlinked manifest or blocked seal retry):
+    // when writeFileAtomic fails (e.g. target replaced by directory on materializeManifest, or read-only dir after valid manifest exists), existing valid manifest stays intact
+    if (process.platform !== "win32" && process.getuid?.() !== 0) {
+      const roAtomicDir = join(runRoot, "ro-atomic-dir");
+      mkdirSync(roAtomicDir, { recursive: true });
+      const roManifest = join(roAtomicDir, "uaw-manifest.json");
+      writeFileAtomic(roManifest, intactPayload);
+      chmodSync(roAtomicDir, 0o555);
+      try {
+        assert.throws(() => writeFileAtomic(roManifest, "partial-corrupt\n"));
+        assert.equal(readFileSync(roManifest, "utf8"), intactPayload, "failed atomic overwrite must preserve prior valid file");
+        assert.equal(readdirSync(roAtomicDir).filter((n) => n.includes(".tmp-")).length, 0);
+      } finally {
+        chmodSync(roAtomicDir, 0o755);
+      }
+    }
+
+    // 5b. Truncated / corrupt / symlinked runner-routing.json fails closed during provenance build/materialize and runner resume
+    const routingRepo = join(runRoot, "routing-corrupt-repo");
+    const routingData = join(runRoot, "routing-corrupt-data");
+    mkdirSync(routingRepo, { recursive: true });
+    writeFileSync(join(routingRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Routing fail-closed test", "--adapter", "fake", "--repo-root", routingRepo, "--data-dir", routingData, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+
+    // Seed valid runner-routing.json and confirm round_trips is captured cleanly
+    const validRouting = { trips: { "review|changes_requested": 2 }, findings: {} };
+    writeFileSync(join(routingData, "runner-routing.json"), JSON.stringify(validRouting));
+    const goodRoutingBuilt = buildManifest({ dataDir: routingData, workflow: "sw_dev", repoRoot: routingRepo, phase: "closed" });
+    assert.equal(
+      goodRoutingBuilt.manifest.execution_audit.stages.find((s) => s.stage === "review")?.round_trips,
+      2,
+    );
+
+    // Truncated JSON, non-object JSON, negative/string count, and invalid finding shape must fail closed instead of zeroing round_trips
+    for (const badContent of [
+      '{"trips":',
+      '[]',
+      JSON.stringify({ trips: { "review|changes_requested": -1 } }),
+      JSON.stringify({ trips: { "review|changes_requested": "two" } }),
+      JSON.stringify({ trips: {}, findings: { implementation: { files: "not-array", note: "n" } } }),
+    ]) {
+      writeFileSync(join(routingData, "runner-routing.json"), badContent);
+      assert.throws(
+        () => buildManifest({ dataDir: routingData, workflow: "sw_dev", repoRoot: routingRepo, phase: "closed" }),
+        /Corrupt routing telemetry/i,
+      );
+    }
+    const outsideRouting = join(runRoot, "outside-routing.json");
+    writeFileSync(outsideRouting, JSON.stringify({ trips: {}, findings: {} }));
+    rmSync(join(routingData, "runner-routing.json"));
+    symlinkSync(outsideRouting, join(routingData, "runner-routing.json"));
+    assert.throws(
+      () => buildManifest({ dataDir: routingData, workflow: "sw_dev", repoRoot: routingRepo, phase: "closed" }),
+      /must not be a symlink/i,
+    );
+
+    // runner.mjs resume with truncated runner-routing.json during pending finalization must fail closed and keep runner-finalize-pending.json
+    rmSync(join(routingData, "runner-routing.json"));
+    writeFileSync(join(routingData, "runner-routing.json"), '{"trips":{"review|changes_requested":');
+    writeFileSync(join(routingData, "runner-finalize-pending.json"), JSON.stringify({ phase: "closed", defer_seal: true }));
+    const resumeCorruptRouting = spawnSync(
+      process.execPath,
+      [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", routingRepo, "--data-dir", routingData, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" } },
+    );
+    assert.equal(resumeCorruptRouting.status, 1, "runner.mjs resume must fail closed when runner-routing.json is truncated");
+    assert.match(resumeCorruptRouting.stderr ?? "", /Corrupt routing telemetry/i);
+    assert.equal(existsSync(join(routingData, "runner-finalize-pending.json")), true, "runner-finalize-pending.json must remain retryable");
+
+    // Restoring valid runner-routing.json makes resume succeed cleanly and records round_trips=2
+    writeFileSync(join(routingData, "runner-routing.json"), JSON.stringify(validRouting));
+    const healedRoutingResume = spawnSync(
+      process.execPath,
+      [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", routingRepo, "--data-dir", routingData, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" } },
+    );
+    assert.equal(healedRoutingResume.status, 0, healedRoutingResume.stderr ?? "");
+    const healedRoutingManifest = JSON.parse(readFileSync(join(routingData, "uaw-manifest.json"), "utf8"));
+    assert.equal(
+      healedRoutingManifest.execution_audit.stages.find((s) => s.stage === "review")?.round_trips,
+      2,
+    );
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }
