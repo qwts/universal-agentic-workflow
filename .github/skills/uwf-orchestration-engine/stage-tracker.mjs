@@ -290,6 +290,8 @@ const [command, ...rest] = args;
 const flags = parseFlags(rest);
 
 const workflow   = flags["workflow"];
+if (flags["repo-root"] === true) usageError("--repo-root requires a path.");
+const repoRoot   = flags["repo-root"] ? resolve(String(flags["repo-root"])) : process.cwd();
 const dataDirFlag = resolveDataDir(flags, undefined);
 const outputPath = flags["output-path"] ?? (dataDirFlag ? join(dataDirFlag, "workflow-artifacts") : "./tmp/workflow-artifacts");
 const DB_PATH = resolveDbPath(flags, "uwf-stages.db", __dirname);
@@ -356,8 +358,8 @@ function resolveTemplates(str) {
   if (typeof str !== "string") return str;
   return str
     .replace(/\{\{output_path\}\}/g, outputPath)
-    .replace(/\{\{cwd\}\}/g,         process.cwd())
-    .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? process.cwd());
+    .replace(/\{\{cwd\}\}/g,         repoRoot)
+    .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? repoRoot);
 }
 
 /**
@@ -645,13 +647,12 @@ function matchGlobSegment(pattern, name) {
 }
 
 function captureStageOutputsJson(stageDef) {
-  const cwd = process.cwd();
   const seen = new Map();
   for (const tmpl of stageDef?.outputs ?? []) {
     const resolved = resolveTemplates(tmpl);
-    const absPattern = isAbsolute(resolved) ? resolved : resolve(cwd, resolved);
+    const absPattern = isAbsolute(resolved) ? resolved : resolve(repoRoot, resolved);
     let paths = [];
-    if (/[*?[\]]/.test(absPattern)) {
+    if (/[*?[\]]/.test(basename(absPattern))) {
       const dir = dirname(absPattern);
       const basePattern = basename(absPattern);
       if (existsSync(dir)) {
@@ -668,7 +669,7 @@ function captureStageOutputsJson(stageDef) {
       try {
         if (!lstatSync(abs).isFile()) continue;
         const buf = readFileSync(abs);
-        const rel = relative(cwd, abs);
+        const rel = relative(repoRoot, abs);
         const normPath = (rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : abs).split(sep).join("/");
         seen.set(normPath, {
           path: normPath,

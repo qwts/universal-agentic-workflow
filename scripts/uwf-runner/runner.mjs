@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
-import { ensureRunMeta, materializeManifest } from "./provenance.mjs";
+import { computeWorktreeTreeSha, ensureRunMeta, getCommitTreeSha, isGitRepo, materializeManifest, sealManifest } from "./provenance.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -77,25 +77,45 @@ function needsFinalization(dataDir) {
 async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log }) {
   mkdirSync(dataDir, { recursive: true });
   const pending = readFinalizePending(dataDir);
-  const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal);
+  let hasDirtyGitWorktree = false;
+  if (!deferSeal && !pending?.defer_seal && isGitRepo(repoRoot)) {
+    const headTree = getCommitTreeSha(repoRoot, "HEAD");
+    const wtTree = computeWorktreeTreeSha(repoRoot, { dataDir });
+    hasDirtyGitWorktree = !headTree || headTree !== wtTree;
+  }
+  const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal || hasDirtyGitWorktree);
   const finalPhase = effectiveDeferSeal ? "closed" : "sealed";
   writeFileSync(
     join(dataDir, FINALIZE_PENDING_FILE),
     JSON.stringify({ phase: finalPhase, defer_seal: effectiveDeferSeal, ts: new Date().toISOString() }) + "\n",
   );
   try {
-    const m = await materializeManifest({
-      dataDir,
-      workflow,
-      repoRoot,
-      skillsRoot,
-      outputPath,
-      phase: finalPhase,
-      deferSeal: effectiveDeferSeal,
-      dispatchSink: !effectiveDeferSeal,
-    });
+    const m = effectiveDeferSeal
+      ? await materializeManifest({
+          dataDir,
+          workflow,
+          repoRoot,
+          skillsRoot,
+          outputPath,
+          phase: "closed",
+          deferSeal: true,
+          dispatchSink: false,
+        })
+      : await sealManifest({
+          dataDir,
+          workflow,
+          repoRoot,
+          skillsRoot,
+          outputPath,
+        });
     if (!m.ok) {
-      return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+      if (m.sink && !m.sink.ok) {
+        return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+      }
+      return finish(EXIT.GATE, rows, `provenance manifest seal failed (${m.error ?? "unknown"})`, note);
+    }
+    if (hasDirtyGitWorktree) {
+      log("[runner] working tree has uncommitted tracked changes; manifest materialized at phase=closed (run provenance.mjs seal after commit)");
     }
   } catch (err) {
     log(`[runner] provenance manifest failed: ${err.message}`);

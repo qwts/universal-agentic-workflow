@@ -11,6 +11,9 @@
  *     [--output-path <p>] [--repo-root <r>] [--skills-root <s>]
  *     [--head-commit <sha>] [--base-commit <sha>] [--pr-url <u>] [--release-tag <t>] [--artifact-uri <u>]
  *
+ *   node scripts/uwf-runner/provenance.mjs scrub --data-dir <d>
+ *     [--workflow <w>] [--output-path <p>] [--repo-root <r>] [--skills-root <s>]
+ *
  *   node scripts/uwf-runner/provenance.mjs verify --data-dir <d> [--repo-root <r>]
  *   node scripts/uwf-runner/provenance.mjs read --data-dir <d>
  *
@@ -18,14 +21,16 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -43,6 +48,7 @@ import {
   scrubDeep,
   sha256Hex,
 } from "./context-hub-sink.mjs";
+import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import { listTranscripts, transcriptRow } from "./cost.mjs";
 
 export { canonicalizeJcs, compareUtf16, computeIdempotencyKey, scrubDeep, sha256Hex };
@@ -109,8 +115,24 @@ export function ensureRunMeta(
   dataDir,
   { workflow = "sw_dev", outputPath = null, runId = null, baseCommitSha = null, repoRoot = null, forceNew = false } = {}
 ) {
+  try {
+    const dirLst = lstatSync(dataDir);
+    if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+      throw new Error(`Refusing unsafe or symlinked directory at ${dataDir}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
   mkdirSync(dataDir, { recursive: true });
   const metaPath = join(dataDir, RUN_META_FILE);
+  try {
+    const metaLst = lstatSync(metaPath);
+    if (metaLst.isSymbolicLink() || !metaLst.isFile()) {
+      throw new Error(`Refusing unsafe or symlinked run metadata at ${metaPath}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
   let existing = null;
   if (existsSync(metaPath)) {
     try {
@@ -169,21 +191,87 @@ export function ensureRunMeta(
 // Git & Deliverable Identity Helpers
 // ---------------------------------------------------------------------------
 
-function gitExec(repoRoot, args, { env, encoding = "utf8" } = {}) {
-  return execFileSync("git", ["-C", repoRoot, ...args], {
-    encoding,
-    env: env ? { ...process.env, ...env } : process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: 64 * 1024 * 1024,
-  });
+function gitExec(repoRoot, args, { env, encoding = "utf8", input } = {}) {
+  const safeEnv = {
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_NO_LAZY_FETCH: "1",
+  };
+  for (const key of ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "LANG", "LC_ALL"]) {
+    if (process.env[key] !== undefined) safeEnv[key] = process.env[key];
+  }
+  if (env) Object.assign(safeEnv, env);
+  return execFileSync(
+    "git",
+    [
+      "-c", "core.fsmonitor=false",
+      "-c", "core.hooksPath=/dev/null",
+      "-c", "core.pager=cat",
+      "-c", "core.sshCommand=false",
+      "-c", "core.attributesFile=/dev/null",
+      "-c", "core.gitProxy=",
+      "-c", "core.askPass=",
+      "-c", "core.alternateRefsCommand=",
+      "-c", "credential.helper=",
+      "-c", "diff.external=",
+      "-c", "http.proxy=",
+      "-c", "protocol.allow=never",
+      "-C", repoRoot,
+      ...args,
+    ],
+    {
+      encoding,
+      env: safeEnv,
+      stdio: [input !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
+      ...(input !== undefined ? { input } : {}),
+      maxBuffer: 64 * 1024 * 1024,
+    },
+  );
 }
 
-function isGitRepo(repoRoot) {
+export function isGitRepo(repoRoot) {
   try {
     const out = gitExec(repoRoot, ["rev-parse", "--is-inside-work-tree"]).trim();
     return out === "true";
   } catch {
     return false;
+  }
+}
+
+function isValidGitObjectStore(gitDir) {
+  try {
+    gitExec(gitDir, ["rev-parse", "--git-dir"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertSafeGitConfig(repoRoot) {
+  try {
+    const matched = gitExec(repoRoot, [
+      "config",
+      "--show-scope",
+      "--includes",
+      "--name-only",
+      "--get-regexp",
+      "^(include\\.|includeif\\.|extensions\\.partialclone$|filter\\.|diff\\..*\\.(textconv|command|external)|diff\\.external$|merge\\..*\\.driver|remote\\..*\\.(uploadpack|receivepack|proxy|promisor|partialclonefilter)|core\\.(gitproxy|askpass|alternaterefscommand)$|uploadpack\\.packobjectshook$)",
+    ]);
+    const badKeys = matched
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => !line.startsWith("command\t"))
+      .map((line) => line.split("\t").slice(1).join("\t"));
+    if (badKeys.length > 0) {
+      throw new Error(`Refusing unsafe git config keys in ${repoRoot}: ${badKeys.join(", ")}`);
+    }
+  } catch (err) {
+    if (err?.status === 1 && !String(err?.stderr ?? "").trim()) {
+      return;
+    }
+    throw err;
   }
 }
 
@@ -219,6 +307,7 @@ function toPosix(p) {
 export function computeWorktreeTreeSha(repoRoot, { dataDir = null } = {}) {
   if (!isGitRepo(repoRoot)) return null;
   const absRepo = resolve(repoRoot);
+  assertSafeGitConfig(absRepo);
   let relDataDir = null;
   if (dataDir) {
     const rel = toPosix(relative(absRepo, resolve(dataDir)));
@@ -237,8 +326,11 @@ export function computeWorktreeTreeSha(repoRoot, { dataDir = null } = {}) {
 
   const gitDirRaw = gitExec(absRepo, ["rev-parse", "--git-dir"]).trim();
   const gitDir = resolve(absRepo, gitDirRaw);
-  const tempIndex = join(tmpdir(), `uaw-index-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const tempIdxDir = mkdtempSync(join(tmpdir(), "uaw-idx-"));
+  const tempIndex = join(tempIdxDir, "index");
   const env = { GIT_INDEX_FILE: tempIndex };
+  const gitBlobSha1 = (buf) =>
+    createHash("sha1").update(`blob ${buf.length}\0`).update(buf).digest("hex");
 
   try {
     let hasHead = true;
@@ -251,12 +343,20 @@ export function computeWorktreeTreeSha(repoRoot, { dataDir = null } = {}) {
     if (hasHead) {
       gitExec(absRepo, ["read-tree", "HEAD"], { env });
     } else if (existsSync(join(gitDir, "index"))) {
-      copyFileSync(join(gitDir, "index"), tempIndex);
+      const idxPath = join(gitDir, "index");
+      if (lstatSync(idxPath).isSymbolicLink()) {
+        throw new Error(`Refusing symlinked git index at ${idxPath}`);
+      }
+      copyFileSync(idxPath, tempIndex);
     }
 
     const changes = new Map();
     if (hasHead) {
-      const diffBuf = gitExec(absRepo, ["diff", "--name-status", "-z", "--no-renames", "HEAD"], { encoding: "buffer" });
+      const diffBuf = gitExec(
+        absRepo,
+        ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--no-renames", "HEAD"],
+        { encoding: "buffer" },
+      );
       const fields = diffBuf.toString("utf8").split("\0").filter(Boolean);
       for (let i = 0; i + 1 < fields.length; i += 2) {
         const status = fields[i];
@@ -269,30 +369,45 @@ export function computeWorktreeTreeSha(repoRoot, { dataDir = null } = {}) {
       changes.set(p, { path: p, deleted: false });
     }
 
+    const indexLines = [];
     for (const c of changes.values()) {
       if (isExcluded(c.path)) continue;
-      if (c.deleted) {
-        gitExec(absRepo, ["update-index", "--force-remove", "--", c.path], { env });
-      } else {
-        const full = join(absRepo, c.path);
-        if (!existsSync(full)) {
-          gitExec(absRepo, ["update-index", "--force-remove", "--", c.path], { env });
-          continue;
-        }
-        const st = lstatSync(full);
-        if (!st.isFile() && !st.isSymbolicLink()) continue;
-        gitExec(absRepo, ["update-index", "--add", "--replace", "--", c.path], { env });
+      const full = join(absRepo, c.path);
+      let st = null;
+      if (!c.deleted) {
+        try { st = lstatSync(full); } catch { st = null; }
+      }
+      if (c.deleted || !st) {
+        indexLines.push(`0 ${"0".repeat(40)}\t${c.path}\0`);
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        const targetBuf = Buffer.from(readlinkSync(full), "utf8");
+        indexLines.push(`120000 ${gitBlobSha1(targetBuf)}\t${c.path}\0`);
+      } else if (st.isFile()) {
+        const mode = (st.mode & 0o100) ? "100755" : "100644";
+        const fileBuf = readFileSync(full);
+        const blobSha = gitExec(absRepo, ["hash-object", "--stdin", "--path", c.path], {
+          input: fileBuf,
+        }).trim();
+        indexLines.push(`${mode} ${blobSha}\t${c.path}\0`);
       }
     }
+    if (indexLines.length > 0) {
+      gitExec(absRepo, ["update-index", "-z", "--index-info"], {
+        env,
+        input: Buffer.from(indexLines.join(""), "utf8"),
+      });
+    }
 
-    return gitExec(absRepo, ["write-tree"], { env }).trim();
+    return gitExec(absRepo, ["write-tree", "--missing-ok"], { env }).trim();
   } finally {
-    rmSync(tempIndex, { force: true });
+    rmSync(tempIdxDir, { recursive: true, force: true });
   }
 }
 
 export function getCommitTreeSha(repoRoot, ref = "HEAD") {
-  if (!isGitRepo(repoRoot)) return null;
+  if (!isValidGitObjectStore(repoRoot)) return null;
   try {
     return gitExec(repoRoot, ["rev-parse", `${ref}^{tree}`]).trim();
   } catch {
@@ -302,14 +417,14 @@ export function getCommitTreeSha(repoRoot, ref = "HEAD") {
 
 export function collectGitDeliverable(repoRoot, { dataDir = null, overrides = {} } = {}) {
   const inGit = isGitRepo(repoRoot);
-  let headSha = overrides.head_commit_sha ?? null;
+  const explicitHead = Object.hasOwn(overrides, "head_commit_sha") ? overrides.head_commit_sha : undefined;
+  let headSha = explicitHead ?? null;
+  let currentHead = null;
   let branch = overrides.branch ?? null;
   let repository = overrides.repository ?? null;
 
   if (inGit) {
-    if (!headSha) {
-      try { headSha = gitExec(repoRoot, ["rev-parse", "HEAD"]).trim(); } catch { headSha = null; }
-    }
+    try { currentHead = gitExec(repoRoot, ["rev-parse", "HEAD"]).trim(); } catch { currentHead = null; }
     if (!branch) {
       try {
         const b = gitExec(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
@@ -323,10 +438,18 @@ export function collectGitDeliverable(repoRoot, { dataDir = null, overrides = {}
     repository = basename(resolve(repoRoot)) || null;
   }
 
-  const baseCommitSha = overrides.base_commit_sha ?? headSha ?? null;
+  const baseCommitSha = overrides.base_commit_sha ?? currentHead ?? headSha ?? null;
   const gitTreeSha =
     overrides.git_tree_sha ??
     (inGit ? computeWorktreeTreeSha(repoRoot, { dataDir }) : null);
+
+  if (explicitHead === undefined) {
+    if (inGit && currentHead && gitTreeSha && getCommitTreeSha(repoRoot, currentHead) === gitTreeSha) {
+      headSha = currentHead;
+    } else {
+      headSha = null;
+    }
+  }
 
   const artifactUris = Array.isArray(overrides.artifact_uris)
     ? overrides.artifact_uris.filter((u) => typeof u === "string" && u.length > 0)
@@ -458,7 +581,7 @@ function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
     .replace(/\{\{skills_root\}\}/g, () => skillsRoot ?? repoRoot);
 
   const absPattern = isAbsolute(expanded) ? expanded : resolve(repoRoot, expanded);
-  if (!/[*?[\]]/.test(absPattern)) {
+  if (!/[*?[\]]/.test(basename(absPattern))) {
     return existsSync(absPattern) ? [absPattern] : [];
   }
   const dir = dirname(absPattern);
@@ -562,12 +685,12 @@ function isInsideOrEqual(candidate, parentDir) {
 
 function resolveDomainDb(dataDir, skillDirName, dbFileName, repoRoot) {
   if (dataDir) {
-    const inDataDir = join(dataDir, dbFileName);
-    return existsSync(inDataDir) ? inDataDir : null;
+    const checked = assertSafeDbPath(join(dataDir, dbFileName), dataDir);
+    return checked.exists ? checked.path : null;
   }
   if (repoRoot) {
-    const inRepoSkill = join(repoRoot, ".github", "skills", skillDirName, dbFileName);
-    if (existsSync(inRepoSkill)) return inRepoSkill;
+    const checked = assertSafeDbPath(join(repoRoot, ".github", "skills", skillDirName, dbFileName), repoRoot);
+    return checked.exists ? checked.path : null;
   }
   return null;
 }
@@ -750,6 +873,77 @@ function readQuestionsStore(Database, dataDir, repoRoot) {
   }
 }
 
+function assertSafeDbPath(candidatePath, allowedRoot) {
+  const absCandidate = resolve(candidatePath);
+  if (!allowedRoot) return { exists: existsSync(absCandidate), path: absCandidate };
+  const absRoot = resolve(allowedRoot);
+  let rootLst;
+  try {
+    rootLst = lstatSync(absRoot);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return { exists: false, path: absCandidate };
+    }
+    throw err;
+  }
+  if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+    throw new Error(`Refusing unsafe or symlinked directory at ${absRoot}`);
+  }
+  const realRoot = realpathSync(absRoot);
+
+  const rel = relative(absRoot, absCandidate);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`Refusing database path escaping ${absRoot}: ${absCandidate}`);
+  }
+  let cur = absRoot;
+  for (const part of rel.split(sep)) {
+    cur = join(cur, part);
+    let lst;
+    try {
+      lst = lstatSync(cur);
+    } catch (err) {
+      if (err.code === "ENOENT") break;
+      throw err;
+    }
+    if (lst.isSymbolicLink()) {
+      throw new Error(`Refusing symlinked database path at ${cur}`);
+    }
+  }
+
+  let present = false;
+  let realDb = absCandidate;
+  try {
+    const dbLst = lstatSync(absCandidate);
+    if (dbLst.isSymbolicLink() || !dbLst.isFile()) {
+      throw new Error(`Refusing unsafe or symlinked database at ${absCandidate}`);
+    }
+    realDb = realpathSync(absCandidate);
+    if (!isInsideOrEqual(realDb, realRoot)) {
+      throw new Error(`Refusing database escaping ${absRoot}: ${absCandidate}`);
+    }
+    present = true;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const sidecar = `${absCandidate}${suffix}`;
+    try {
+      const sLst = lstatSync(sidecar);
+      if (sLst.isSymbolicLink() || !sLst.isFile()) {
+        throw new Error(`Refusing unsafe or symlinked SQLite sidecar at ${sidecar}`);
+      }
+      if (!isInsideOrEqual(realpathSync(sidecar), realRoot)) {
+        throw new Error(`Refusing SQLite sidecar escaping ${absRoot}: ${sidecar}`);
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+  }
+
+  return { exists: present, path: present ? realDb : absCandidate };
+}
+
 /**
  * Canonical Build Spec store: `<data-dir>/uwf-cbs.db` or `.github/skills/uwf-cbs/uwf-cbs.db`.
  * Returns `null` when `blueprint` did not run or the DB does not exist.
@@ -757,10 +951,18 @@ function readQuestionsStore(Database, dataDir, repoRoot) {
 function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
   if (!blueprintRan) return null;
   const candidates = [
-    join(dataDir, "uwf-cbs.db"),
-    join(repoRoot, ".github", "skills", "uwf-cbs", "uwf-cbs.db"),
+    { path: dataDir ? join(dataDir, "uwf-cbs.db") : null, root: dataDir },
+    { path: repoRoot ? join(repoRoot, ".github", "skills", "uwf-cbs", "uwf-cbs.db") : null, root: repoRoot },
   ];
-  const dbPath = candidates.find((p) => existsSync(p)) ?? null;
+  let dbPath = null;
+  for (const c of candidates) {
+    if (!c.path) continue;
+    const checked = assertSafeDbPath(c.path, c.root);
+    if (checked.exists) {
+      dbPath = checked.path;
+      break;
+    }
+  }
   const db = openReadOnly(Database, dbPath);
   if (!db) return null;
   try {
@@ -1092,8 +1294,9 @@ function ensureRunManifestsTable(db) {
 }
 
 function readPersistedManifestRow(Database, dataDir, runId) {
-  const stateDbPath = join(dataDir, "uwf-state.db");
-  const db = openReadOnly(Database, stateDbPath);
+  const checked = assertSafeDbPath(join(dataDir, "uwf-state.db"), dataDir);
+  if (!checked.exists) return null;
+  const db = openReadOnly(Database, checked.path);
   if (!db) return null;
   try {
     if (!tableExists(db, "run_manifests")) return null;
@@ -1107,9 +1310,17 @@ function readPersistedManifestRow(Database, dataDir, runId) {
 }
 
 function upsertRunManifest(Database, dataDir, { runId, workflow, phase, manifestSha256, deliverableKey, manifestJson, sinkStatus, finalizedAt }) {
+  try {
+    const dirLst = lstatSync(dataDir);
+    if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+      throw new Error(`Refusing unsafe or symlinked directory at ${dataDir}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
   mkdirSync(dataDir, { recursive: true });
-  const stateDbPath = join(dataDir, "uwf-state.db");
-  const db = new Database(stateDbPath);
+  const checked = assertSafeDbPath(join(dataDir, "uwf-state.db"), dataDir);
+  const db = new Database(checked.path);
   try {
     db.pragma("journal_mode = WAL");
     ensureRunManifestsTable(db);
@@ -1235,7 +1446,8 @@ export function buildManifest({
   let modelName = null;
   let stateArtifactPath = null;
   let firstHistTs = null;
-  const stateDb = openReadOnly(Database, join(absDataDir, "uwf-state.db"));
+  const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
+  const stateDb = stateChecked.exists ? openReadOnly(Database, stateChecked.path) : null;
   if (stateDb) {
     try {
       if (tableExists(stateDb, "workflow_state")) {
@@ -1284,7 +1496,8 @@ export function buildManifest({
   const { perStage: transcriptDigests, costSummary } = collectTranscriptTelemetry(absDataDir, meta.prior_transcripts);
   let blueprintRan = false;
 
-  const stagesDb = openReadOnly(Database, join(absDataDir, "uwf-stages.db"));
+  const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
+  const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
   if (stagesDb) {
     try {
       if (tableExists(stagesDb, "stage_runs")) {
@@ -1381,8 +1594,22 @@ export function buildManifest({
   if (persisted && persisted.manifest_sha256 === manifestSha256 && persisted.manifest_json) {
     try {
       const prev = JSON.parse(persisted.manifest_json);
-      if (prev && prev.execution_audit) {
-        executionAudit = prev.execution_audit;
+      const prevAudit = prev?.execution_audit;
+      const sameStageTelemetry =
+        canonicalizeJcs(prevAudit?.stages ?? null) === canonicalizeJcs(executionAudit.stages ?? null);
+      const sameModel =
+        (prevAudit?.model_profile ?? null) === (executionAudit.model_profile ?? null) &&
+        (prevAudit?.model_name ?? null) === (executionAudit.model_name ?? null);
+      const sameCostSummary =
+        canonicalizeJcs(prevAudit?.cost_summary ?? null) === canonicalizeJcs(executionAudit.cost_summary ?? null);
+      if (prevAudit && sameStageTelemetry && sameModel && sameCostSummary) {
+        executionAudit = prevAudit;
+      } else if (prevAudit) {
+        executionAudit = {
+          ...executionAudit,
+          started_at: prevAudit.started_at ?? executionAudit.started_at,
+          finalized_at: prevAudit.finalized_at ?? executionAudit.finalized_at,
+        };
       }
     } catch { /* use fresh executionAudit */ }
   }
@@ -1406,6 +1633,8 @@ export function buildManifest({
 // Materialize, Seal & Verify Operations
 // ---------------------------------------------------------------------------
 
+const SEAL_CALLER_TOKEN = Symbol("sealManifest");
+
 /**
  * Materialize `<data-dir>/uaw-manifest.json` (NEVER inside `output_path`!),
  * upsert into `run_manifests` in `uwf-state.db`, and optionally dispatch to Context Hub Sink.
@@ -1422,7 +1651,11 @@ export async function materializeManifest({
   dispatchSink = true,
   sinkOptions = {},
   now = new Date().toISOString(),
+  _sealToken = null,
 }) {
+  if (phase === "sealed" && _sealToken !== SEAL_CALLER_TOKEN) {
+    throw new Error('phase="sealed" requires sealManifest()');
+  }
   const Database = loadDatabaseCtor();
   const absDataDir = resolve(dataDir);
   const built = buildManifest({
@@ -1454,6 +1687,14 @@ export async function materializeManifest({
 
   mkdirSync(absDataDir, { recursive: true });
   const manifestPath = join(absDataDir, MANIFEST_FILE);
+  try {
+    const manLst = lstatSync(manifestPath);
+    if (manLst.isSymbolicLink() || !manLst.isFile()) {
+      throw new Error(`Refusing unsafe or symlinked manifest at ${manifestPath}`);
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
   writeFileSync(manifestPath, built.canonicalJson, "utf8");
 
   let sinkResult = { ok: true, status: deferSeal ? "deferred" : "disabled", exitCode: 0 };
@@ -1630,6 +1871,7 @@ export async function sealManifest({
   prUrl = null,
   releaseTag = null,
   artifactUris = [],
+  commitGitDir = null,
   sinkOptions = {},
   now = new Date().toISOString(),
 }) {
@@ -1648,6 +1890,30 @@ export async function sealManifest({
     }
   }
 
+  let commitRepo = absRepoRoot;
+  if (commitGitDir) {
+    const absCommitDir = resolve(commitGitDir);
+    let cLst;
+    try {
+      cLst = lstatSync(absCommitDir);
+    } catch {
+      return {
+        ok: false,
+        exitCode: 1,
+        error: `Commit git dir not found: "${commitGitDir}"`,
+      };
+    }
+    if (cLst.isSymbolicLink() || !cLst.isDirectory() || !isValidGitObjectStore(absCommitDir)) {
+      return {
+        ok: false,
+        exitCode: 1,
+        error: `Invalid commit git dir "${commitGitDir}"`,
+      };
+    }
+    assertSafeGitConfig(absCommitDir);
+    commitRepo = absCommitDir;
+  }
+
   let resolvedHead = headCommitSha;
   let committedTreeSha = null;
   if (resolvedHead && (String(resolvedHead).startsWith("-") || /[\s\0]/.test(String(resolvedHead)))) {
@@ -1657,10 +1923,18 @@ export async function sealManifest({
       error: `Invalid git commit ref "${resolvedHead}"`,
     };
   }
-  if (isGitRepo(absRepoRoot)) {
+  if (!isGitRepo(absRepoRoot)) {
+    if (commitGitDir || headCommitSha) {
+      return {
+        ok: false,
+        exitCode: 1,
+        error: `Cannot verify git commit against non-git repoRoot "${absRepoRoot}"`,
+      };
+    }
+  } else {
     const ref = resolvedHead || "HEAD";
     try {
-      resolvedHead = gitExec(absRepoRoot, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
+      resolvedHead = gitExec(commitRepo, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
     } catch (err) {
       return {
         ok: false,
@@ -1668,7 +1942,7 @@ export async function sealManifest({
         error: `Cannot resolve git commit "${ref}": ${err.message}`,
       };
     }
-    committedTreeSha = getCommitTreeSha(absRepoRoot, resolvedHead);
+    committedTreeSha = getCommitTreeSha(commitRepo, resolvedHead);
     const worktreeTreeSha = computeWorktreeTreeSha(absRepoRoot, { dataDir: absDataDir });
     if (committedTreeSha !== worktreeTreeSha) {
       return {
@@ -1687,6 +1961,7 @@ export async function sealManifest({
     outputPath,
     phase: "sealed",
     deferSeal: false,
+    _sealToken: SEAL_CALLER_TOKEN,
     deliverableOverrides: {
       ...(baseCommitSha ? { base_commit_sha: baseCommitSha } : {}),
       ...(resolvedHead ? { head_commit_sha: resolvedHead } : {}),
@@ -1701,6 +1976,246 @@ export async function sealManifest({
   });
 }
 
+const MAX_SCRUB_BYTES = 64 * 1024 * 1024;
+
+function scrubTextFileInRoots(absPath, allowedRealRoots) {
+  let lst;
+  try {
+    lst = lstatSync(absPath);
+  } catch {
+    return { scrubbed: false, redacted: 0, buf: null };
+  }
+  if (lst.isSymbolicLink() || !lst.isFile()) return { scrubbed: false, redacted: 0, buf: null };
+  const realFile = realpathSync(absPath);
+  if (!allowedRealRoots.some((r) => isInsideOrEqual(realFile, r))) {
+    return { scrubbed: false, redacted: 0, buf: null };
+  }
+  if (lst.size > MAX_SCRUB_BYTES) return { scrubbed: false, redacted: 0, buf: null };
+  const buf = readFileSync(realFile);
+  if (buf.subarray(0, 8192).includes(0)) return { scrubbed: false, redacted: 0, buf };
+  const { text, count } = redactSecrets(buf.toString("utf8"));
+  if (count <= 0) return { scrubbed: false, redacted: 0, buf };
+  const nextBuf = Buffer.from(text, "utf8");
+  writeFileSync(realFile, nextBuf);
+  return { scrubbed: true, redacted: count, buf: nextBuf };
+}
+
+/**
+ * Scrub secret-shaped strings across un-superseded declared stage outputs (only inside
+ * `dataDir` or `outputPath`, never tracked repo files) plus `runner-goal.md` and
+ * `transcripts/*.json`, updating `uwf-stages.db` (`outputs_json`) only when pre-scrub
+ * file bytes match the recorded stage digest so tamper detection stays fail-closed.
+ * If an unsealed (`snapshot` or `closed`) `uaw-manifest.json` already exists and was
+ * valid prior to scrubbing, refreshes it in-place without sealing or dispatching the sink.
+ */
+export async function scrubProvenanceOutputs({
+  dataDir,
+  workflow = null,
+  repoRoot = OWN_ROOT,
+  skillsRoot = null,
+  outputPath = null,
+} = {}) {
+  const absDataDir = resolve(dataDir);
+  const absRepoRoot = resolve(repoRoot);
+  if (!existsSync(absDataDir)) {
+    return { ok: true, updatedStages: 0, scrubbedFiles: 0, redactions: 0 };
+  }
+  if (lstatSync(absDataDir).isSymbolicLink()) {
+    throw new Error(`Refusing symlinked data_dir at ${absDataDir}`);
+  }
+
+  const existingMeta = readExistingRunMeta(absDataDir);
+  const Database = loadDatabaseCtor();
+
+  let stateArtifactPath = null;
+  const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
+  if (stateChecked.exists) {
+    const stateDb = openReadOnly(Database, stateChecked.path);
+    if (stateDb) {
+      try {
+        if (tableExists(stateDb, "workflow_state")) {
+          const ws = stateDb.prepare("SELECT artifact_path FROM workflow_state WHERE id = 1").get();
+          stateArtifactPath = ws?.artifact_path ?? null;
+        }
+      } finally {
+        stateDb.close();
+      }
+    }
+  }
+
+  if (workflow && existingMeta?.workflow && workflow !== existingMeta.workflow) {
+    throw new Error(
+      `Workflow mismatch for ${absDataDir}: run-meta.json records "${existingMeta.workflow}", requested "${workflow}"`,
+    );
+  }
+  const effectiveWorkflow = workflow ?? existingMeta?.workflow ?? "sw_dev";
+  const rawOut = outputPath ?? existingMeta?.output_path ?? stateArtifactPath ?? join(absDataDir, "workflow-artifacts");
+  const absOut = rawOut ? (isAbsolute(rawOut) ? resolve(rawOut) : resolve(absRepoRoot, rawOut)) : null;
+
+  const realData = realpathSync(absDataDir);
+  let realOut = null;
+  if (absOut && existsSync(absOut)) {
+    const outLst = lstatSync(absOut);
+    if (!outLst.isSymbolicLink() && outLst.isDirectory()) {
+      realOut = realpathSync(absOut);
+    }
+  }
+  const scrubRealRoots = [realData, ...(realOut ? [realOut] : [])];
+
+  const manifestPath = join(absDataDir, MANIFEST_FILE);
+  let hadManifest = false;
+  let preManifestValid = false;
+  let prevManifest = null;
+  if (existsSync(manifestPath)) {
+    hadManifest = true;
+    const preCheck = verifyManifest({ dataDir: absDataDir, repoRoot: absRepoRoot });
+    preManifestValid = preCheck.ok;
+    if (preManifestValid) {
+      try {
+        prevManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      } catch {
+        preManifestValid = false;
+      }
+    }
+  }
+
+  let updatedStages = 0;
+  let scrubbedFiles = 0;
+  let redactions = 0;
+
+  const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
+  if (stagesChecked.exists) {
+    const db = new Database(stagesChecked.path);
+    try {
+      if (tableExists(db, "stage_runs")) {
+        const rows = db
+          .prepare("SELECT id, stage, status, outputs_json FROM stage_runs WHERE workflow = ? ORDER BY id ASC")
+          .all(effectiveWorkflow);
+        const parsedRows = new Map();
+        const latestByPath = new Map();
+
+        for (const row of rows) {
+          if (row.status === "skipped" || !row.outputs_json) continue;
+          let arr;
+          try {
+            arr = JSON.parse(row.outputs_json);
+          } catch {
+            continue;
+          }
+          if (!Array.isArray(arr)) continue;
+          const info = { row, arr, changed: false };
+          parsedRows.set(row.id, info);
+          for (const item of arr) {
+            if (item && typeof item.path === "string" && typeof item.sha256 === "string" && Number.isInteger(item.bytes)) {
+              latestByPath.set(item.path, { rowId: row.id, item });
+            }
+          }
+        }
+
+        for (const [relPath, latest] of latestByPath.entries()) {
+          const abs = isAbsolute(relPath) ? resolve(relPath) : resolve(absRepoRoot, relPath);
+          if (!isInsideOrEqual(abs, absDataDir) && !(absOut && isInsideOrEqual(abs, absOut))) {
+            continue;
+          }
+          let lst;
+          try {
+            lst = lstatSync(abs);
+          } catch {
+            continue;
+          }
+          if (lst.isSymbolicLink() || !lst.isFile()) continue;
+          const realAbs = realpathSync(abs);
+          if (!scrubRealRoots.some((r) => isInsideOrEqual(realAbs, r))) continue;
+          if (lst.size > MAX_SCRUB_BYTES) continue;
+
+          const buf = readFileSync(realAbs);
+          // Fail closed: never re-sign outputs that were already mutated post-stage.
+          if (sha256Hex(buf) !== latest.item.sha256 || buf.length !== latest.item.bytes) {
+            continue;
+          }
+          if (buf.subarray(0, 8192).includes(0)) continue;
+
+          const { text, count } = redactSecrets(buf.toString("utf8"));
+          if (count <= 0) continue;
+
+          const nextBuf = Buffer.from(text, "utf8");
+          writeFileSync(realAbs, nextBuf);
+          latest.item.sha256 = sha256Hex(nextBuf);
+          latest.item.bytes = nextBuf.length;
+          parsedRows.get(latest.rowId).changed = true;
+          scrubbedFiles += 1;
+          redactions += count;
+        }
+
+        const changedRows = [...parsedRows.values()].filter((r) => r.changed);
+        if (changedRows.length > 0) {
+          const updateStmt = db.prepare("UPDATE stage_runs SET outputs_json = ? WHERE id = ?");
+          db.transaction(() => {
+            for (const info of changedRows) {
+              info.arr.sort((a, b) => compareUtf16(String(a?.path ?? ""), String(b?.path ?? "")));
+              updateStmt.run(JSON.stringify(info.arr), info.row.id);
+              updatedStages += 1;
+            }
+          })();
+        }
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  const goalRes = scrubTextFileInRoots(join(absDataDir, GOAL_FILE), [realData]);
+  if (goalRes.scrubbed) {
+    scrubbedFiles += 1;
+    redactions += goalRes.redacted;
+  }
+
+  const transcriptsDir = join(absDataDir, "transcripts");
+  if (existsSync(transcriptsDir)) {
+    const tLst = lstatSync(transcriptsDir);
+    if (!tLst.isSymbolicLink() && tLst.isDirectory()) {
+      const realTranscripts = realpathSync(transcriptsDir);
+      if (isInsideOrEqual(realTranscripts, realData)) {
+        for (const f of readdirSync(realTranscripts)) {
+          if (!f.endsWith(".json")) continue;
+          const res = scrubTextFileInRoots(join(realTranscripts, f), [realTranscripts]);
+          if (res.scrubbed) {
+            scrubbedFiles += 1;
+            redactions += res.redacted;
+          }
+        }
+      }
+    }
+  }
+
+  if (
+    hadManifest &&
+    preManifestValid &&
+    prevManifest &&
+    (prevManifest.phase === "snapshot" || prevManifest.phase === "closed")
+  ) {
+    await materializeManifest({
+      dataDir: absDataDir,
+      workflow: effectiveWorkflow,
+      repoRoot: absRepoRoot,
+      skillsRoot: skillsRoot ?? existingMeta?.skills_root ?? null,
+      outputPath: rawOut,
+      phase: prevManifest.phase,
+      deferSeal: true,
+      dispatchSink: false,
+      deliverableOverrides: prevManifest.deliverable ?? {},
+      now: prevManifest.execution_audit?.finalized_at ?? new Date().toISOString(),
+    });
+  }
+
+  return {
+    ok: true,
+    updatedStages,
+    scrubbedFiles,
+    redactions,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -1709,11 +2224,34 @@ function parseCliArgs(argv) {
   const flags = { "artifact-uri": [] };
   const positional = [];
   const boolFlags = new Set(["defer-seal", "no-sink"]);
+  const valueFlags = new Set([
+    "data-dir",
+    "workflow",
+    "repo-root",
+    "skills-root",
+    "output-path",
+    "phase",
+    "base-commit",
+    "head-commit",
+    "commit-git-dir",
+    "pr-url",
+    "release-tag",
+    "artifact-uri",
+  ]);
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
-    if (!t.startsWith("--")) { positional.push(t); continue; }
+    if (!t.startsWith("--")) {
+      positional.push(t);
+      if (positional.length > 1) {
+        throw new Error(`Unexpected positional argument "${t}"`);
+      }
+      continue;
+    }
     const key = t.slice(2);
     if (boolFlags.has(key)) { flags[key] = true; continue; }
+    if (!valueFlags.has(key)) {
+      throw new Error(`Unknown flag "--${key}"`);
+    }
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) {
       throw new Error(`--${key} requires a value`);
@@ -1736,7 +2274,7 @@ async function runCliMain(argv) {
   const { command, flags } = parsed;
   const dataDir = flags["data-dir"] ?? process.env.UWF_DATA_DIR;
   if (!command || !dataDir) {
-    process.stderr.write("Usage: provenance.mjs materialize|seal|verify|read --data-dir <dir> [--workflow <w>] [options]\n");
+    process.stderr.write("Usage: provenance.mjs materialize|seal|scrub|verify|read --data-dir <dir> [--workflow <w>] [options]\n");
     return 2;
   }
   const workflow = flags.workflow ?? null;
@@ -1762,6 +2300,10 @@ async function runCliMain(argv) {
 
   if (command === "materialize") {
     const phase = flags.phase ?? "closed";
+    if (phase !== "snapshot" && phase !== "closed") {
+      process.stderr.write('Usage error: materialize --phase must be "snapshot" or "closed" (use "provenance.mjs seal" to seal)\n');
+      return 2;
+    }
     const res = await materializeManifest({
       dataDir,
       workflow,
@@ -1792,6 +2334,18 @@ async function runCliMain(argv) {
     return res.exitCode;
   }
 
+  if (command === "scrub") {
+    const res = await scrubProvenanceOutputs({
+      dataDir,
+      workflow,
+      repoRoot,
+      skillsRoot,
+      outputPath,
+    });
+    process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+    return res.ok ? 0 : 1;
+  }
+
   if (command === "seal") {
     const res = await sealManifest({
       dataDir,
@@ -1804,6 +2358,7 @@ async function runCliMain(argv) {
       prUrl: flags["pr-url"] ?? null,
       releaseTag: flags["release-tag"] ?? null,
       artifactUris: flags["artifact-uri"],
+      commitGitDir: flags["commit-git-dir"] ?? null,
     });
     process.stdout.write(
       JSON.stringify({
@@ -1823,7 +2378,16 @@ async function runCliMain(argv) {
   return 2;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isDirectCliEntry() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  }
+}
+
+if (isDirectCliEntry()) {
   runCliMain(process.argv.slice(2)).then(
     (code) => { process.exitCode = code; },
     (err) => {

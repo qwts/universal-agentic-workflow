@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -18,6 +18,7 @@ import {
   validateManifest,
   verifyManifest,
 } from "../provenance.mjs";
+import { scrubDeep } from "../context-hub-sink.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
@@ -693,6 +694,469 @@ try {
     assert.notEqual(swMeta.run_id, pmMeta.run_id, "switching workflows must rotate run_id");
     assert.equal(swMeta.workflow, "sw_dev");
     assert.equal(swManifest.workflow, "sw_dev");
+
+    // Step M4: provenance.mjs scrub before seal preserves provenance integrity after secret redaction
+    // while pre-scrub post-stage tampering still fails closed at seal time.
+    const fxScrub = join(runRoot, "fx-scrub");
+    const rootScrub = join(runRoot, "root-scrub");
+    const dataScrub = join(runRoot, "data-scrub");
+    cpSync(fxDir, fxScrub, { recursive: true });
+    mkdirSync(rootScrub, { recursive: true });
+    writeFileSync(join(rootScrub, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const intakeFx = JSON.parse(readFileSync(join(fxScrub, "intake.json"), "utf8"));
+    intakeFx.files["tmp/workflow-artifacts/issues-intake.md"] =
+      (intakeFx.files["tmp/workflow-artifacts/issues-intake.md"] ?? "") + `\nToken leak ${FAKE_GITHUB}\n`;
+    intakeFx.transcript = `intake secret ${FAKE_ANTHROPIC}`;
+    intakeFx.claudeResult = {
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: { input_tokens: 10, output_tokens: 5 },
+      result: `intake secret ${FAKE_ANTHROPIC}`,
+    };
+    writeFileSync(join(fxScrub, "intake.json"), JSON.stringify(intakeFx, null, 2));
+
+    const findIntakeTranscript = (dir) => {
+      const txDir = join(dir, "transcripts");
+      for (const f of readdirSync(txDir).filter((x) => x.endsWith(".json")).sort()) {
+        const parsed = JSON.parse(readFileSync(join(txDir, f), "utf8"));
+        if (/^Run the intake stage/m.test(String(parsed.prompt ?? ""))) return join(txDir, f);
+      }
+      return null;
+    };
+
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", `Goal with ${FAKE_GITHUB}`, "--adapter", "fake", "--repo-root", rootScrub, "--data-dir", dataScrub, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxScrub, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    execFileSync(
+      process.execPath,
+      [
+        PROVENANCE_CLI,
+        "scrub",
+        "--data-dir",
+        dataScrub,
+        "--workflow",
+        "sw_dev",
+        "--repo-root",
+        rootScrub,
+        "--output-path",
+        join(rootScrub, "tmp/workflow-artifacts"),
+      ],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    // Running scrub.mjs right after (as uwf-on-pr.yml does) is a clean idempotent no-op on stage outputs.
+    const { scrubPaths } = await import("../../uwf-on-pr/scrub.mjs");
+    const scrubStats = scrubPaths([dataScrub, join(rootScrub, "tmp/workflow-artifacts")]);
+    assert.equal(scrubStats.failed, 0);
+
+    const scrubbedIntake = readFileSync(join(rootScrub, "tmp/workflow-artifacts/issues-intake.md"), "utf8");
+    assert.ok(!scrubbedIntake.includes(FAKE_GITHUB), "stage output secret must be redacted on disk");
+    assert.match(scrubbedIntake, /\[redacted:github-token\]/);
+    const scrubSealOut = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", dataScrub, "--workflow", "sw_dev", "--repo-root", rootScrub, "--pr-url", "https://github.com/org/repo/pull/999"],
+        { encoding: "utf8", env, stdio: "pipe" },
+      ),
+    );
+    assert.equal(scrubSealOut.ok, true);
+    assert.equal(scrubSealOut.phase, "sealed");
+    const scrubVerifyOut = JSON.parse(
+      execFileSync(process.execPath, [PROVENANCE_CLI, "verify", "--data-dir", dataScrub, "--repo-root", rootScrub], { encoding: "utf8", env, stdio: "pipe" }),
+    );
+    assert.equal(scrubVerifyOut.ok, true, `scrub + seal manifest must verify cleanly: ${JSON.stringify(scrubVerifyOut.errors)}`);
+    const finalScrubManifest = readFileSync(join(dataScrub, "uaw-manifest.json"), "utf8");
+    assert.ok(!finalScrubManifest.includes(FAKE_GITHUB) && !finalScrubManifest.includes(FAKE_ANTHROPIC));
+    const finalParsed = JSON.parse(finalScrubManifest);
+    const scrubbedIntakeAudit = finalParsed.execution_audit.stages.find((s) => s.stage === "intake");
+    const scrubbedIntakeTxPath = findIntakeTranscript(dataScrub);
+    assert.ok(scrubbedIntakeTxPath, "intake transcript file must exist");
+    assert.equal(scrubbedIntakeAudit?.transcript_sha256, sha256Hex(readFileSync(scrubbedIntakeTxPath)));
+
+    // Transcript-only scrub on a closed manifest must refresh transcript_sha256 even when manifest_sha256 is unchanged.
+    const fxTxOnly = join(runRoot, "fx-tx-only");
+    const rootTxOnly = join(runRoot, "root-tx-only");
+    const dataTxOnly = join(runRoot, "data-tx-only");
+    cpSync(fxDir, fxTxOnly, { recursive: true });
+    mkdirSync(rootTxOnly, { recursive: true });
+    writeFileSync(join(rootTxOnly, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const intakeTxOnlyFx = JSON.parse(readFileSync(join(fxTxOnly, "intake.json"), "utf8"));
+    intakeTxOnlyFx.transcript = `tx-only secret ${FAKE_ANTHROPIC}`;
+    intakeTxOnlyFx.claudeResult = {
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: { input_tokens: 10, output_tokens: 5 },
+      result: `tx-only secret ${FAKE_ANTHROPIC}`,
+    };
+    writeFileSync(join(fxTxOnly, "intake.json"), JSON.stringify(intakeTxOnlyFx, null, 2));
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Transcript-only scrub", "--adapter", "fake", "--repo-root", rootTxOnly, "--data-dir", dataTxOnly, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxTxOnly, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    const closedPreSha = JSON.parse(readFileSync(join(dataTxOnly, "uaw-manifest.json"), "utf8")).manifest_sha256;
+    execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "scrub", "--data-dir", dataTxOnly, "--workflow", "sw_dev", "--repo-root", rootTxOnly],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const closedPost = JSON.parse(readFileSync(join(dataTxOnly, "uaw-manifest.json"), "utf8"));
+    assert.equal(closedPost.manifest_sha256, closedPreSha, "transcript-only scrub keeps content manifest_sha256 unchanged");
+    const txOnlyIntakePath = findIntakeTranscript(dataTxOnly);
+    assert.ok(txOnlyIntakePath);
+    assert.equal(
+      closedPost.execution_audit.stages.find((s) => s.stage === "intake")?.transcript_sha256,
+      sha256Hex(readFileSync(txOnlyIntakePath)),
+      "transcript-only scrub must update execution_audit.stages[].transcript_sha256",
+    );
+
+    // Symlink containment: planted symlink inside artifacts/data dir must never rewrite outside file during scrub.
+    const outsideVictim = join(runRoot, "outside-secret.txt");
+    writeFileSync(outsideVictim, `outside ${FAKE_GITHUB}\n`);
+    symlinkSync(outsideVictim, join(rootScrub, "tmp", "workflow-artifacts", "escaped-secret.txt"));
+    execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "scrub", "--data-dir", dataScrub, "--workflow", "sw_dev", "--repo-root", rootScrub, "--output-path", join(rootScrub, "tmp/workflow-artifacts")],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    scrubPaths([dataScrub, join(rootScrub, "tmp/workflow-artifacts")]);
+    assert.ok(readFileSync(outsideVictim, "utf8").includes(FAKE_GITHUB), "symlink target outside root must remain unmodified");
+
+    // Pre-scrub tampering on a declared stage output must still fail closed at seal time even if scrub ran.
+    const fxTamperBeforeScrub = join(runRoot, "fx-tamper-before-scrub");
+    const rootTamperBeforeScrub = join(runRoot, "root-tamper-before-scrub");
+    const dataTamperBeforeScrub = join(runRoot, "data-tamper-before-scrub");
+    cpSync(fxDir, fxTamperBeforeScrub, { recursive: true });
+    mkdirSync(rootTamperBeforeScrub, { recursive: true });
+    writeFileSync(join(rootTamperBeforeScrub, ".uwf.json"), JSON.stringify({ verify: [] }));
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Tamper before scrub", "--adapter", "fake", "--repo-root", rootTamperBeforeScrub, "--data-dir", dataTamperBeforeScrub, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxTamperBeforeScrub, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    // Simulate post-run unauthorized mutation containing a secret before scrub runs
+    writeFileSync(join(rootTamperBeforeScrub, "tmp/workflow-artifacts/issues-intake.md"), `# Intake\nTAMPERED ${FAKE_GITHUB}\n`);
+    execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "scrub", "--data-dir", dataTamperBeforeScrub, "--workflow", "sw_dev", "--repo-root", rootTamperBeforeScrub],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    scrubPaths([dataTamperBeforeScrub, join(rootTamperBeforeScrub, "tmp/workflow-artifacts")]);
+    assert.ok(
+      !readFileSync(join(rootTamperBeforeScrub, "tmp/workflow-artifacts/issues-intake.md"), "utf8").includes(FAKE_GITHUB),
+      "scrub.mjs still scrubs secrets even in tampered outputs",
+    );
+    let tamperedSealExit = 0;
+    let tamperedSealOut = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", dataTamperBeforeScrub, "--workflow", "sw_dev", "--repo-root", rootTamperBeforeScrub],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      tamperedSealExit = err.status;
+      tamperedSealOut = String(err.stdout ?? "");
+    }
+    assert.equal(tamperedSealExit, 1, "seal must still fail closed on pre-scrub tampering");
+    const tamperedParsed = JSON.parse(tamperedSealOut);
+    assert.equal(tamperedParsed.ok, false);
+    assert.match(tamperedParsed.error, /Pre-seal verification failed/);
+    assert.match(tamperedParsed.error, /Unexpected post-stage mutation/);
+
+    // Symlinked domain DB must fail closed instead of opening outside file or silently skipping.
+    const outsideDomainDb = join(runRoot, "outside-req.db");
+    writeFileSync(outsideDomainDb, "");
+    const dataSymlinkDomain = join(runRoot, "data-symlink-domain");
+    mkdirSync(dataSymlinkDomain, { recursive: true });
+    symlinkSync(outsideDomainDb, join(dataSymlinkDomain, "uwf-requirements.db"));
+    let symlinkDomainExit = 0;
+    let symlinkDomainStderr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "materialize", "--data-dir", dataSymlinkDomain, "--workflow", "sw_dev", "--repo-root", rootScrub],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      symlinkDomainExit = err.status;
+      symlinkDomainStderr = String(err.stderr ?? "");
+    }
+    assert.notEqual(symlinkDomainExit, 0, "symlinked domain DB must fail closed");
+    assert.match(symlinkDomainStderr, /Refusing/);
+
+    // scrubDeep redacts secret-bearing object keys and disambiguates collisions with #2.
+    const secondGithub = "ghp_" + "9876543210fedcba9876543210fedcba9876";
+    const keyScrubbed = scrubDeep({
+      [FAKE_GITHUB]: "v1",
+      [secondGithub]: "v2",
+    });
+    assert.deepEqual(Object.keys(keyScrubbed), ["[redacted:github-token]", "[redacted:github-token]#2"]);
+
+    // CLI materialize must reject --phase sealed with exit 2 (sealing must go through provenance.mjs seal).
+    let materializeSealedCode = 0;
+    try {
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "materialize", "--data-dir", dataScrub, "--workflow", "sw_dev", "--repo-root", rootScrub, "--phase", "sealed"],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      materializeSealedCode = err.status;
+    }
+    assert.equal(materializeSealedCode, 2, "materialize --phase sealed must exit 2");
+
+    // gitExec during seal must ignore attacker-planted .git/config core.fsmonitor / hooksPath.
+    const repoFsMon = join(runRoot, "repo-fsmonitor");
+    const dataFsMon = join(runRoot, "data-fsmonitor");
+    mkdirSync(repoFsMon, { recursive: true });
+    execFileSync("git", ["-C", repoFsMon, "init", "-q"]);
+    execFileSync("git", ["-C", repoFsMon, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", repoFsMon, "config", "user.name", "Test"]);
+    writeFileSync(join(repoFsMon, "README.md"), "# clean\n");
+    execFileSync("git", ["-C", repoFsMon, "add", "README.md"]);
+    execFileSync("git", ["-C", repoFsMon, "commit", "-q", "-m", "init"]);
+    execFileSync("git", ["-C", repoFsMon, "config", "core.fsmonitor", "false_nonexistent_attacker_cmd"]);
+    mkdirSync(dataFsMon, { recursive: true });
+    const fsMonSeal = execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    assert.equal(JSON.parse(fsMonSeal).phase, "sealed");
+
+    // Unsafe local git filter config + .gitattributes must fail closed without executing filter commands.
+    execFileSync("git", ["-C", repoFsMon, "config", "--unset", "core.fsmonitor"]);
+    writeFileSync(join(repoFsMon, ".gitattributes"), "* filter=evil\n");
+    execFileSync("git", ["-C", repoFsMon, "add", ".gitattributes"]);
+    execFileSync("git", ["-C", repoFsMon, "commit", "-q", "-m", "add gitattributes"]);
+    execFileSync("git", ["-C", repoFsMon, "config", "filter.evil.clean", "evil_filter_cmd_must_not_run"]);
+    let filterErrCode = 0;
+    let filterErrStderr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      filterErrCode = err.status;
+      filterErrStderr = String(err.stderr ?? "");
+    }
+    assert.notEqual(filterErrCode, 0, "unsafe local filter config must fail closed");
+    assert.match(filterErrStderr, /Refusing unsafe.*git config keys/);
+
+    // include.path bypass to filter driver must fail closed without executing filters
+    execFileSync("git", ["-C", repoFsMon, "config", "--unset", "filter.evil.clean"]);
+    const evilIncludeCfg = join(runRoot, "evil-inc.cfg");
+    writeFileSync(evilIncludeCfg, '[filter "evil"]\n\tclean = evil_inc_cmd_must_not_run\n');
+    execFileSync("git", ["-C", repoFsMon, "config", "include.path", evilIncludeCfg]);
+    let incErrCode = 0;
+    let incErrStderr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      incErrCode = err.status;
+      incErrStderr = String(err.stderr ?? "");
+    }
+    assert.notEqual(incErrCode, 0, "include.path pointing to filter config must fail closed");
+    assert.match(incErrStderr, /Refusing unsafe.*git config keys/);
+    execFileSync("git", ["-C", repoFsMon, "config", "--unset", "include.path"]);
+
+    // extensions.worktreeConfig + config.worktree filter bypass must fail closed, while benign worktree config passes
+    execFileSync("git", ["-C", repoFsMon, "config", "extensions.worktreeConfig", "true"]);
+    execFileSync("git", ["-C", repoFsMon, "config", "--worktree", "filter.evil.clean", "evil_wt_cmd_must_not_run"]);
+    let wtErrCode = 0;
+    let wtErrStderr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      wtErrCode = err.status;
+      wtErrStderr = String(err.stderr ?? "");
+    }
+    assert.notEqual(wtErrCode, 0, "worktree config filter must fail closed");
+    assert.match(wtErrStderr, /Refusing unsafe.*git config keys/);
+    execFileSync("git", ["-C", repoFsMon, "config", "--worktree", "--unset", "filter.evil.clean"]);
+    execFileSync("git", ["-C", repoFsMon, "config", "--worktree", "user.name", "Worktree Bot"]);
+    const benignWtSeal = execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    assert.equal(JSON.parse(benignWtSeal).phase, "sealed");
+
+    // CRLF file under * text=auto must hash identically to git commit without mismatch
+    writeFileSync(join(repoFsMon, ".gitattributes"), "* text=auto\n");
+    writeFileSync(join(repoFsMon, "crlf.txt"), Buffer.from("line1\r\nline2\r\n"));
+    execFileSync("git", ["-C", repoFsMon, "add", ".gitattributes", "crlf.txt"]);
+    execFileSync("git", ["-C", repoFsMon, "commit", "-q", "-m", "add crlf file"]);
+    const crlfSeal = execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    assert.equal(JSON.parse(crlfSeal).phase, "sealed");
+
+    // provenance.mjs seal --commit-git-dir resolves commit & tree from isolated bare repo without fetching into repoRoot.
+    execFileSync("git", ["-C", repoFsMon, "config", "--unset", "extensions.worktreeConfig"]);
+    const remoteSrc = join(runRoot, "remote-src");
+    const localTarget = join(runRoot, "local-target");
+    const bareCommitStore = join(runRoot, "bare-commit-store.git");
+    const dataBareSeal = join(runRoot, "data-bare-seal");
+    execFileSync("git", ["clone", "-q", repoFsMon, remoteSrc]);
+    execFileSync("git", ["clone", "-q", remoteSrc, localTarget]);
+    execFileSync("git", ["-C", remoteSrc, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", remoteSrc, "config", "user.name", "Test"]);
+    writeFileSync(join(remoteSrc, "README.md"), "# shipped in bare\n");
+    execFileSync("git", ["-C", remoteSrc, "add", "README.md"]);
+    execFileSync("git", ["-C", remoteSrc, "commit", "-q", "-m", "remote commit"]);
+    const remoteHead = execFileSync("git", ["-C", remoteSrc, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    // Simulate post-push worktree matching remoteHead, while localTarget git object DB still only has parent commit.
+    writeFileSync(join(localTarget, "README.md"), "# shipped in bare\n");
+    mkdirSync(bareCommitStore, { recursive: true });
+    execFileSync("git", ["-C", bareCommitStore, "init", "--bare", "-q"]);
+    execFileSync("git", ["-C", bareCommitStore, "fetch", "--depth=1", "--no-tags", remoteSrc, remoteHead]);
+    mkdirSync(dataBareSeal, { recursive: true });
+    const bareSealOut = execFileSync(
+      process.execPath,
+      [
+        PROVENANCE_CLI,
+        "seal",
+        "--data-dir", dataBareSeal,
+        "--workflow", "sw_dev",
+        "--repo-root", localTarget,
+        "--head-commit", remoteHead,
+        "--commit-git-dir", bareCommitStore,
+      ],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    assert.equal(JSON.parse(bareSealOut).phase, "sealed");
+    const bareManifest = JSON.parse(readFileSync(join(dataBareSeal, "uaw-manifest.json"), "utf8"));
+    assert.equal(bareManifest.deliverable.head_commit_sha, remoteHead);
+
+    // Direct materializeManifest({ phase: "sealed" }) must reject outside sealManifest()
+    await assert.rejects(
+      () =>
+        materializeManifest({
+          dataDir: dataBareSeal,
+          workflow: "sw_dev",
+          repoRoot: localTarget,
+          phase: "sealed",
+          deferSeal: false,
+        }),
+      /requires sealManifest/,
+    );
+
+    // sealManifest fails closed when commitGitDir or headCommitSha is given for a non-git repoRoot
+    const nonGitRepo = join(runRoot, "non-git-root");
+    const nonGitData = join(runRoot, "non-git-data");
+    mkdirSync(nonGitRepo, { recursive: true });
+    mkdirSync(nonGitData, { recursive: true });
+    const nonGitSealRes = await sealManifest({
+      dataDir: nonGitData,
+      workflow: "sw_dev",
+      repoRoot: nonGitRepo,
+      headCommitSha: remoteHead,
+      commitGitDir: bareCommitStore,
+    });
+    assert.equal(nonGitSealRes.ok, false);
+    assert.equal(nonGitSealRes.exitCode, 1);
+    assert.match(nonGitSealRes.error, /non-git repoRoot/);
+
+    // Local runner.mjs run without --defer-seal in a git repo with uncommitted tracked changes
+    // must materialize phase=closed (head_commit_sha=null, tree:<sha>) until committed and sealed
+    const dirtyRepo = join(runRoot, "dirty-seal-repo");
+    const dirtyData = join(runRoot, "dirty-seal-data");
+    const fxDirty = join(runRoot, "fx-dirty");
+    cpSync(fxDir, fxDirty, { recursive: true });
+    mkdirSync(dirtyRepo, { recursive: true });
+    execFileSync("git", ["-C", dirtyRepo, "init", "-q"]);
+    execFileSync("git", ["-C", dirtyRepo, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", dirtyRepo, "config", "user.name", "Test"]);
+    writeFileSync(join(dirtyRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+    writeFileSync(join(dirtyRepo, ".gitignore"), "tmp/\n");
+    writeFileSync(join(dirtyRepo, "app.txt"), "v1\n");
+    execFileSync("git", ["-C", dirtyRepo, "add", ".uwf.json", ".gitignore", "app.txt"]);
+    execFileSync("git", ["-C", dirtyRepo, "commit", "-q", "-m", "initial"]);
+    const implFx = JSON.parse(readFileSync(join(fxDirty, "implementation.json"), "utf8"));
+    implFx.files = { ...(implFx.files ?? {}), "app.txt": "v2-uncommitted\n" };
+    writeFileSync(join(fxDirty, "implementation.json"), JSON.stringify(implFx, null, 2));
+
+    execFileSync(
+      process.execPath,
+      [
+        RUNNER_CLI,
+        "run",
+        "--workflow", "sw_dev",
+        "--goal", "Dirty worktree defers seal",
+        "--adapter", "fake",
+        "--repo-root", dirtyRepo,
+        "--data-dir", dirtyData,
+      ],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDirty, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    const dirtyManifest = JSON.parse(readFileSync(join(dirtyData, "uaw-manifest.json"), "utf8"));
+    const expectedWtTree = computeWorktreeTreeSha(dirtyRepo, { dataDir: dirtyData });
+    assert.equal(dirtyManifest.phase, "closed", "uncommitted tracked changes must materialize closed, not sealed");
+    assert.equal(dirtyManifest.deliverable.head_commit_sha, null);
+    assert.equal(dirtyManifest.deliverable.git_tree_sha, expectedWtTree);
+    assert.equal(dirtyManifest.deliverable_key, `tree:${expectedWtTree}`);
+
+    execFileSync("git", ["-C", dirtyRepo, "add", "app.txt"]);
+    execFileSync("git", ["-C", dirtyRepo, "commit", "-q", "-m", "commit v2"]);
+    const v2Head = execFileSync("git", ["-C", dirtyRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const afterCommitSeal = execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "seal", "--data-dir", dirtyData, "--workflow", "sw_dev", "--repo-root", dirtyRepo],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    assert.equal(JSON.parse(afterCommitSeal).phase, "sealed");
+    const dirtySealed = JSON.parse(readFileSync(join(dirtyData, "uaw-manifest.json"), "utf8"));
+    assert.equal(dirtySealed.deliverable.head_commit_sha, v2Head);
+
+    // stage-tracker.mjs --repo-root works from a different cwd and when repo dir name contains [bracket]
+    const bracketRepo = join(runRoot, "repo-[v1]");
+    const bracketData = join(runRoot, "data-bracket");
+    const bracketOutRel = "tmp/workflow-artifacts";
+    const trackerCli = join(REPO_ROOT, ".github", "skills", "uwf-orchestration-engine", "stage-tracker.mjs");
+    mkdirSync(join(bracketRepo, bracketOutRel), { recursive: true });
+    writeFileSync(join(bracketRepo, bracketOutRel, "issues-intake.md"), "# Intake\nBracket dir ok\n");
+    execFileSync(
+      process.execPath,
+      [trackerCli, "init", "--workflow", "sw_dev", "--data-dir", bracketData, "--skills-root", REPO_ROOT, "--repo-root", bracketRepo, "--output-path", bracketOutRel],
+      { cwd: runRoot, encoding: "utf8", stdio: "pipe" },
+    );
+    execFileSync(
+      process.execPath,
+      [trackerCli, "stage-complete", "--workflow", "sw_dev", "--stage", "intake", "--data-dir", bracketData, "--skills-root", REPO_ROOT, "--repo-root", bracketRepo, "--output-path", bracketOutRel],
+      { cwd: runRoot, encoding: "utf8", stdio: "pipe" },
+    );
+    await materializeManifest({
+      dataDir: bracketData,
+      workflow: "sw_dev",
+      repoRoot: bracketRepo,
+      skillsRoot: REPO_ROOT,
+      outputPath: bracketOutRel,
+      phase: "closed",
+      deferSeal: true,
+    });
+    const bracketManifest = JSON.parse(readFileSync(join(bracketData, "uaw-manifest.json"), "utf8"));
+    const bracketIntake = bracketManifest.stages.find((s) => s.stage === "intake");
+    assert.deepEqual(
+      bracketIntake?.outputs.map((o) => o.path),
+      ["tmp/workflow-artifacts/issues-intake.md"],
+    );
+    const bracketVerify = verifyManifest({ dataDir: bracketData, repoRoot: bracketRepo });
+    assert.equal(bracketVerify.ok, true, JSON.stringify(bracketVerify.errors));
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

@@ -87,14 +87,21 @@ export function sha256Hex(input) {
   return createHash("sha256").update(input).digest("hex");
 }
 
-/** Recursively scrub every string leaf through redactSecrets(). */
+/** Recursively scrub every string leaf and object key through redactSecrets(). */
 export function scrubDeep(value) {
   if (typeof value === "string") return redactSecrets(value).text;
   if (Array.isArray(value)) return value.map((v) => scrubDeep(v));
   if (value !== null && typeof value === "object") {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      Object.defineProperty(out, k, {
+      const baseKey = redactSecrets(k).text;
+      let safeKey = baseKey;
+      let suffix = 2;
+      while (Object.hasOwn(out, safeKey)) {
+        safeKey = `${baseKey}#${suffix}`;
+        suffix += 1;
+      }
+      Object.defineProperty(out, safeKey, {
         value: scrubDeep(v),
         enumerable: true,
         configurable: true,
