@@ -23,11 +23,15 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
+  constants,
   copyFileSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -663,20 +667,12 @@ function openReadOnly(Database, dbPath) {
 }
 
 function tableExists(db, name) {
-  try {
-    const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
-    return Boolean(row);
-  } catch {
-    return false;
-  }
+  const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+  return Boolean(row);
 }
 
-function safeAll(db, sql, ...params) {
-  try {
-    return db.prepare(sql).all(...params);
-  } catch {
-    return [];
-  }
+function queryAll(db, sql, ...params) {
+  return db.prepare(sql).all(...params);
 }
 
 function bumpCount(obj, key) {
@@ -693,7 +689,7 @@ function pushToArrayProp(obj, key, val) {
 
 function isInsideOrEqual(candidate, parentDir) {
   const rel = relative(resolve(parentDir), resolve(candidate));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel));
 }
 
 function resolveDomainDb(dataDir, skillDirName, dbFileName, repoRoot) {
@@ -714,7 +710,7 @@ function readRequirementsStore(Database, dataDir, repoRoot) {
   if (!db) return null;
   try {
     if (!tableExists(db, "requirements")) return null;
-    const rows = scrubDeep(safeAll(db, "SELECT * FROM requirements ORDER BY id ASC"));
+    const rows = scrubDeep(queryAll(db, "SELECT * FROM requirements ORDER BY id ASC"));
     const byStatus = {};
     const byPrefix = { FR: [], NFR: [], DR: [], AC: [], RK: [] };
     for (const r of rows) {
@@ -745,7 +741,7 @@ function readAdrsStore(Database, dataDir, repoRoot) {
   if (!db) return null;
   try {
     if (!tableExists(db, "adrs")) return null;
-    const rows = scrubDeep(safeAll(db, "SELECT * FROM adrs ORDER BY number ASC, id ASC"));
+    const rows = scrubDeep(queryAll(db, "SELECT * FROM adrs ORDER BY number ASC, id ASC"));
     const realRepo = repoRoot && existsSync(repoRoot) ? realpathSync(repoRoot) : null;
     const realData = dataDir && existsSync(dataDir) ? realpathSync(dataDir) : null;
     const records = rows.map((r) => {
@@ -786,7 +782,7 @@ function readDiscoveriesStore(Database, dataDir, repoRoot) {
   if (!db) return null;
   try {
     if (!tableExists(db, "discoveries")) return null;
-    const rows = scrubDeep(safeAll(db, "SELECT * FROM discoveries ORDER BY id ASC"));
+    const rows = scrubDeep(queryAll(db, "SELECT * FROM discoveries ORDER BY id ASC"));
     const byCategory = {};
     const unresolvedGapIds = [];
     for (const r of rows) {
@@ -814,9 +810,9 @@ function readReviewsStore(Database, dataDir, repoRoot) {
   if (!db) return null;
   try {
     if (!tableExists(db, "reviews")) return null;
-    const reviews = scrubDeep(safeAll(db, "SELECT * FROM reviews ORDER BY id ASC"));
+    const reviews = scrubDeep(queryAll(db, "SELECT * FROM reviews ORDER BY id ASC"));
     const findings = tableExists(db, "findings")
-      ? scrubDeep(safeAll(db, "SELECT * FROM findings ORDER BY id ASC"))
+      ? scrubDeep(queryAll(db, "SELECT * FROM findings ORDER BY id ASC"))
       : [];
     const verdicts = reviews.map((r) => ({
       stage: String(r.stage ?? ""),
@@ -848,7 +844,7 @@ function readIssuesStore(Database, dataDir, repoRoot) {
   if (!db) return null;
   try {
     if (!tableExists(db, "issues")) return null;
-    const rows = scrubDeep(safeAll(db, "SELECT * FROM issues ORDER BY id ASC"));
+    const rows = scrubDeep(queryAll(db, "SELECT * FROM issues ORDER BY id ASC"));
     const byStatus = {};
     for (const r of rows) {
       const st = String(r.status ?? "open");
@@ -870,7 +866,7 @@ function readQuestionsStore(Database, dataDir, repoRoot) {
   if (!db) return null;
   try {
     if (!tableExists(db, "questions")) return null;
-    const rows = scrubDeep(safeAll(db, "SELECT * FROM questions ORDER BY id ASC"));
+    const rows = scrubDeep(queryAll(db, "SELECT * FROM questions ORDER BY id ASC"));
     const byStatus = {};
     for (const r of rows) {
       const st = String(r.status ?? "pending");
@@ -980,19 +976,19 @@ function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
   if (!db) return null;
   try {
     const components = tableExists(db, "components")
-      ? scrubDeep(safeAll(db, "SELECT * FROM components ORDER BY id ASC"))
+      ? scrubDeep(queryAll(db, "SELECT * FROM components ORDER BY id ASC"))
       : [];
     const interfaces = tableExists(db, "interfaces")
-      ? scrubDeep(safeAll(db, "SELECT * FROM interfaces ORDER BY id ASC"))
+      ? scrubDeep(queryAll(db, "SELECT * FROM interfaces ORDER BY id ASC"))
       : [];
     const dependencies = tableExists(db, "dependencies")
-      ? scrubDeep(safeAll(db, "SELECT * FROM dependencies ORDER BY id ASC"))
+      ? scrubDeep(queryAll(db, "SELECT * FROM dependencies ORDER BY id ASC"))
       : [];
     const sequencing = tableExists(db, "sequencing")
-      ? scrubDeep(safeAll(db, "SELECT * FROM sequencing ORDER BY step_number ASC, id ASC"))
+      ? scrubDeep(queryAll(db, "SELECT * FROM sequencing ORDER BY step_number ASC, id ASC"))
       : [];
     const constraints = tableExists(db, "constraints")
-      ? scrubDeep(safeAll(db, "SELECT * FROM constraints ORDER BY id ASC"))
+      ? scrubDeep(queryAll(db, "SELECT * FROM constraints ORDER BY id ASC"))
       : [];
 
     const constraintsBySeverity = {};
@@ -1387,13 +1383,49 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
     output_tokens: 0,
     cost_usd: 0,
   };
+  const transcriptsDir = join(dataDir, "transcripts");
+  let realTranscriptsDir = null;
+  if (existsSync(transcriptsDir)) {
+    const dirLst = lstatSync(transcriptsDir);
+    if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+      throw new Error(`Refusing unsafe or symlinked transcripts directory at ${transcriptsDir}`);
+    }
+    const realData = existsSync(dataDir) ? realpathSync(dataDir) : null;
+    realTranscriptsDir = realpathSync(transcriptsDir);
+    if (realData && !isInsideOrEqual(realTranscriptsDir, realData)) {
+      throw new Error(`Refusing escaping transcripts directory at ${transcriptsDir}`);
+    }
+  }
+  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
   for (const f of listTranscripts(dataDir).sort(compareUtf16)) {
     if (skip.has(basename(f))) continue;
     let raw;
-    try { raw = readFileSync(f); } catch { continue; }
+    let fd;
+    try {
+      const lst = lstatSync(f);
+      if (lst.isSymbolicLink() || !lst.isFile()) continue;
+      if (realTranscriptsDir && !isInsideOrEqual(realpathSync(f), realTranscriptsDir)) continue;
+      fd = openSync(f, openFlags);
+      const st = fstatSync(fd);
+      if (!st.isFile()) continue;
+      raw = readFileSync(fd);
+    } catch {
+      continue;
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
     const digest = sha256Hex(raw);
     let parsed;
     try { parsed = JSON.parse(raw.toString("utf8")); } catch { continue; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+    const explicitStage =
+      typeof parsed.stage === "string" && parsed.stage.trim() && parsed.stage.trim() !== "?"
+        ? parsed.stage.trim()
+        : null;
+    const promptMatch = String(parsed.prompt ?? "").match(/^Run the (\S+) stage for the/m);
+    const promptStage = promptMatch && promptMatch[1] !== "?" ? promptMatch[1] : null;
     const row = transcriptRow(f, parsed);
     if (row) {
       costSummary.turns += row.turns ?? 0;
@@ -1402,9 +1434,10 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
       costSummary.cache_write_tokens += row.write ?? 0;
       costSummary.output_tokens += row.output ?? 0;
       costSummary.cost_usd += row.cost ?? 0;
-      if (row.stage && row.stage !== "?") {
-        perStage.set(row.stage, digest);
-      }
+    }
+    const effectiveStage = (row?.stage && row.stage !== "?" ? row.stage : null) ?? explicitStage ?? promptStage;
+    if (effectiveStage) {
+      perStage.set(effectiveStage, digest);
     }
   }
   costSummary.cost_usd = Number(costSummary.cost_usd.toFixed(6));
@@ -1514,7 +1547,7 @@ export function buildManifest({
   if (stagesDb) {
     try {
       if (tableExists(stagesDb, "stage_runs")) {
-        const rows = safeAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", resolvedWorkflow);
+        const rows = queryAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", resolvedWorkflow);
         for (const row of rows) {
           if (row.stage === "blueprint" && row.status === "passed") blueprintRan = true;
           const isSkipped = row.status === "skipped";

@@ -1365,6 +1365,115 @@ try {
     }
     assert.notEqual(tamperStatus, 0, "tampered worktree bytes must fail closed");
     assert.match(tamperOutput, /does not match post-retro tracked worktree state/);
+
+    // Step Q: Non-Claude adapter transcripts still populate transcript_sha256, and domain-store query errors propagate.
+    const ncRepo = join(runRoot, "non-claude-repo");
+    const ncData = join(runRoot, "non-claude-data");
+    mkdirSync(ncRepo, { recursive: true });
+    mkdirSync(join(ncData, "transcripts"), { recursive: true });
+    {
+      const sdb = new Database(join(ncData, "uwf-stages.db"));
+      sdb.exec(`
+        CREATE TABLE stage_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+          status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+          started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
+        );
+        INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
+          ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]'),
+          ('sw_dev', 'discovery', 'passed', '2026-11-20T00:00:03Z', '2026-11-20T00:00:04Z', '[]'),
+          ('sw_dev', 'review', 'passed', '2026-11-20T00:00:05Z', '2026-11-20T00:00:06Z', '[]');
+      `);
+      sdb.close();
+    }
+    const codexTxPath = join(ncData, "transcripts", "2026-11-20T00-00-01-codex1.json");
+    const grokTxPath = join(ncData, "transcripts", "2026-11-20T00-00-02-grok01.json");
+    const explicitStageTxPath = join(ncData, "transcripts", "2026-11-20T00-00-03-explicit.json");
+    const nonObjectTxPath = join(ncData, "transcripts", "2026-11-20T00-00-04-array.json");
+    const symTxPath = join(ncData, "transcripts", "2026-11-20T00-00-05-sym.json");
+    writeFileSync(
+      codexTxPath,
+      JSON.stringify({
+        adapter: "codex",
+        prompt: "Run the intake stage for the sw_dev workflow.\nDo intake.",
+        sessionId: "codex-sid-1",
+        exitCode: 0,
+        stdout: "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10}}\n",
+      }, null, 2),
+    );
+    writeFileSync(
+      grokTxPath,
+      JSON.stringify({
+        adapter: "grokbot",
+        prompt: "Run the discovery stage for the sw_dev workflow.\nDo discovery.",
+        sessionId: "grok-sid-1",
+        exitCode: 0,
+        stdout: "plain text summary",
+      }, null, 2),
+    );
+    writeFileSync(
+      explicitStageTxPath,
+      JSON.stringify({
+        adapter: "codex",
+        stage: "review",
+        prompt: "unmatched prompt format",
+        exitCode: 0,
+        stdout: "done",
+      }, null, 2),
+    );
+    writeFileSync(nonObjectTxPath, "[]");
+    const outsideTx = join(runRoot, "outside-tx.json");
+    writeFileSync(outsideTx, JSON.stringify({ stage: "intake", prompt: "Run the intake stage for the sw_dev workflow.", stdout: "hijacked" }));
+    symlinkSync(outsideTx, symTxPath);
+    const ncBuilt = buildManifest({
+      dataDir: ncData,
+      workflow: "sw_dev",
+      repoRoot: ncRepo,
+      phase: "closed",
+      now: "2026-11-20T00:00:05.000Z",
+    });
+    const ncIntake = ncBuilt.manifest.execution_audit.stages.find((s) => s.stage === "intake");
+    const ncDiscovery = ncBuilt.manifest.execution_audit.stages.find((s) => s.stage === "discovery");
+    const ncReview = ncBuilt.manifest.execution_audit.stages.find((s) => s.stage === "review");
+    assert.equal(ncIntake?.transcript_sha256, sha256Hex(readFileSync(codexTxPath)), "Codex NDJSON transcript must populate transcript_sha256 and skip symlinks");
+    assert.equal(ncDiscovery?.transcript_sha256, sha256Hex(readFileSync(grokTxPath)), "Grokbot plain-text transcript must populate transcript_sha256");
+    assert.equal(ncReview?.transcript_sha256, sha256Hex(readFileSync(explicitStageTxPath)), "Explicit stage metadata must populate transcript_sha256");
+    assert.equal(ncBuilt.manifest.execution_audit.cost_summary.turns, 0);
+    assert.equal(ncBuilt.manifest.execution_audit.cost_summary.cost_usd, 0);
+
+    // Symlinked transcripts/ directory must fail closed.
+    const symDataDir = join(runRoot, "sym-tx-data");
+    const outsideTxDir = join(runRoot, "outside-tx-dir");
+    mkdirSync(symDataDir, { recursive: true });
+    mkdirSync(outsideTxDir, { recursive: true });
+    symlinkSync(outsideTxDir, join(symDataDir, "transcripts"));
+    assert.throws(
+      () => buildManifest({ dataDir: symDataDir, workflow: "sw_dev", repoRoot: ncRepo, phase: "closed" }),
+      /symlinked transcripts directory/i,
+    );
+
+    // Broken schema in a domain store must propagate instead of silently reporting empty store counts.
+    {
+      const badAdrDb = new Database(join(ncData, "uwf-adrs.db"));
+      badAdrDb.exec("CREATE TABLE adrs (id INTEGER PRIMARY KEY, slug TEXT); INSERT INTO adrs VALUES (1, 'broken');");
+      badAdrDb.close();
+    }
+    assert.throws(
+      () => buildManifest({ dataDir: ncData, workflow: "sw_dev", repoRoot: ncRepo, phase: "closed" }),
+      /no such column: number/i,
+    );
+    await assert.rejects(
+      () => materializeManifest({ dataDir: ncData, workflow: "sw_dev", repoRoot: ncRepo, phase: "closed", deferSeal: true, dispatchSink: false }),
+      /no such column: number/i,
+    );
+
+    // Corrupt non-SQLite database file must also propagate instead of being treated as empty.
+    rmSync(join(ncData, "uwf-adrs.db"), { force: true });
+    writeFileSync(join(ncData, "uwf-reviews.db"), "not a valid sqlite database");
+    assert.throws(
+      () => buildManifest({ dataDir: ncData, workflow: "sw_dev", repoRoot: ncRepo, phase: "closed" }),
+      /not a database/i,
+    );
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }
