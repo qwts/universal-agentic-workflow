@@ -14,7 +14,7 @@
  * Also used by the runner: attemptUsage() (one transcript) and listTranscripts() (all transcripts in a data dir).
  */
 
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { materializePrompt } from "./prompt.mjs";
 
@@ -47,25 +47,118 @@ export function transcriptRow(file, t) {
   };
 }
 
+function readRegularUtf8Bounded(fullPath, expectedRealDir = null, maxBytes = MAX_TRANSCRIPT_BYTES) {
+  let lst;
+  try {
+    lst = lstatSync(fullPath);
+  } catch {
+    return null;
+  }
+  if (lst.isSymbolicLink() || !lst.isFile() || lst.size > maxBytes) return null;
+  if (expectedRealDir !== null) {
+    let realFull;
+    try {
+      realFull = realpathSync(fullPath);
+    } catch {
+      return null;
+    }
+    const prefix = expectedRealDir.endsWith(sep) ? expectedRealDir : expectedRealDir + sep;
+    if (!realFull.startsWith(prefix)) return null;
+  }
+  let fd;
+  try {
+    fd = openSync(fullPath, OPEN_NOFOLLOW_FLAGS);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    const chunks = [];
+    let total = 0;
+    const chunkBuf = Buffer.allocUnsafe(65536);
+    while (true) {
+      const n = readSync(fd, chunkBuf, 0, chunkBuf.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > maxBytes) return null;
+      chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+function readTranscriptJsonSafe(fullPath, expectedRealDir = null) {
+  const raw = readRegularUtf8Bounded(fullPath, expectedRealDir, MAX_TRANSCRIPT_BYTES);
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 /** { ctx, cost } for one transcript file: context of the last turn (falls back to the per-turn average) and reported cost (0 when unknown). */
 export function attemptUsage(path) {
   try {
-    const row = transcriptRow(path, JSON.parse(readFileSync(path, "utf8")));
+    const parsed = readTranscriptJsonSafe(path);
+    if (!parsed) return { ctx: 0, cost: 0 };
+    const row = transcriptRow(path, parsed);
     return row ? { ctx: row.lastCtx || row.perTurn, cost: row.cost ?? 0 } : { ctx: 0, cost: 0 };
   } catch { return { ctx: 0, cost: 0 }; }
 }
 
-/** Absolute paths of every transcript file in <dataDir>/transcripts. */
+/** Absolute paths of every regular, non-symlink transcript file in <dataDir>/transcripts. */
 export function listTranscripts(dataDir) {
   const dir = join(dataDir, "transcripts");
-  return existsSync(dir) ? readdirSync(dir).filter((x) => x.endsWith(".json")).map((f) => join(dir, f)) : [];
+  let dirStat;
+  try {
+    dirStat = lstatSync(dir);
+  } catch {
+    return [];
+  }
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return [];
+  let realDir;
+  try {
+    realDir = realpathSync(dir);
+  } catch {
+    return [];
+  }
+  const prefix = realDir.endsWith(sep) ? realDir : realDir + sep;
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    const full = join(dir, name);
+    try {
+      const lst = lstatSync(full);
+      if (lst.isSymbolicLink() || !lst.isFile() || lst.size > MAX_TRANSCRIPT_BYTES) continue;
+      if (!realpathSync(full).startsWith(prefix)) continue;
+      out.push(full);
+    } catch { /* unreadable transcript */ }
+  }
+  return out;
 }
 
 /** Context size of the last turn of the newest transcript whose prompt names this stage (0 when none). */
 export function lastStageContext(dataDir, stage) {
+  let realDir = null;
+  try {
+    const dir = join(dataDir, "transcripts");
+    const dirStat = lstatSync(dir);
+    if (!dirStat.isSymbolicLink() && dirStat.isDirectory()) {
+      realDir = realpathSync(dir);
+    }
+  } catch {
+    return 0;
+  }
+  if (!realDir) return 0;
   for (const f of listTranscripts(dataDir).sort().reverse()) {
     try {
-      const row = transcriptRow(f, JSON.parse(readFileSync(f, "utf8")));
+      const parsed = readTranscriptJsonSafe(f, realDir);
+      if (!parsed) continue;
+      const row = transcriptRow(f, parsed);
       if (row?.stage === stage) return row.lastCtx || row.perTurn;
     } catch { /* unreadable transcript */ }
   }
@@ -74,11 +167,19 @@ export function lastStageContext(dataDir, stage) {
 
 /** Files the agent body tells the stage to read (`.github/...` paths in backticks), with their sizes. */
 function referencedChars(skillsRoot, systemPrompt) {
+  let realRoot;
+  try {
+    realRoot = realpathSync(skillsRoot);
+  } catch {
+    return 0;
+  }
   let total = 0;
   // Relative refs resolve against skillsRoot; refs the prompt already made absolute resolve to themselves.
   for (const ref of new Set([...String(systemPrompt).matchAll(/`([^`\s]*\.github\/[^`\s]+)`/g)].map((x) => x[1]))) {
-    const p = resolve(skillsRoot, ref);
-    if (existsSync(p) && !p.endsWith("/")) { try { total += readFileSync(p, "utf8").length; } catch { /* directory */ } }
+    if (!ref.endsWith("/")) {
+      const text = readRegularUtf8Bounded(resolve(skillsRoot, ref), realRoot, MAX_TRANSCRIPT_BYTES);
+      if (text !== null) total += text.length;
+    }
   }
   return total;
 }
@@ -97,50 +198,8 @@ export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outp
   const realDir = realpathSync(dir);
   const rows = [];
   for (const f of readdirSync(dir).filter((x) => x.endsWith(".json")).sort()) {
-    const full = join(dir, f);
-    let lst;
-    try {
-      lst = lstatSync(full);
-    } catch {
-      continue;
-    }
-    if (lst.isSymbolicLink() || !lst.isFile()) continue;
-    let realFull;
-    try {
-      realFull = realpathSync(full);
-    } catch {
-      continue;
-    }
-    if (!realFull.startsWith(realDir + sep)) continue;
-    let t;
-    let fd;
-    try {
-      fd = openSync(full, OPEN_NOFOLLOW_FLAGS);
-      const st = fstatSync(fd);
-      if (!st.isFile() || st.size > MAX_TRANSCRIPT_BYTES) continue;
-      const chunks = [];
-      let total = 0;
-      const chunkBuf = Buffer.allocUnsafe(65536);
-      let tooBig = false;
-      while (true) {
-        const n = readSync(fd, chunkBuf, 0, chunkBuf.length, null);
-        if (n === 0) break;
-        total += n;
-        if (total > MAX_TRANSCRIPT_BYTES) {
-          tooBig = true;
-          break;
-        }
-        chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
-      }
-      if (tooBig) continue;
-      t = JSON.parse(Buffer.concat(chunks, total).toString("utf8"));
-    } catch {
-      continue;
-    } finally {
-      if (fd !== undefined) {
-        try { closeSync(fd); } catch { /* ignore */ }
-      }
-    }
+    const t = readTranscriptJsonSafe(join(dir, f), realDir);
+    if (!t) continue;
     const row = transcriptRow(f, t);
     if (row) rows.push(row);
   }

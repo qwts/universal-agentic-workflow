@@ -395,6 +395,33 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
           `Output path "${canonicalOutput}" overlaps with "${otherOut}" owned by run "${other.run_id ?? "unknown"}" (data_dir: ${other.data_dir ?? "unknown"}).`,
         );
       }
+      const otherLockPath = join(ownersDir, file.replace(/\.json$/, ".lock"));
+      if (existsSync(otherLockPath)) {
+        let otherSt = null;
+        try {
+          otherSt = statSync(otherLockPath);
+        } catch {
+          otherSt = null;
+        }
+        if (otherSt) {
+          const otherLock = readJsonQuiet(otherLockPath);
+          if (otherLock && Number.isInteger(otherLock.pid) && pidAlive(otherLock.pid)) {
+            throw new UsageError(
+              `Output path "${otherOut}" execution lock is held by run "${otherLock.run_id ?? "unknown"}" (pid ${otherLock.pid}).`,
+            );
+          }
+          if (!otherLock && Date.now() - otherSt.mtimeMs <= LOCK_UNREADABLE_STALE_MS) {
+            throw new UsageError(
+              `Could not acquire execution lock for "${otherOut}"; another process is starting.`,
+            );
+          }
+          if (!unlock) {
+            throw new UsageError(
+              `Output path "${otherOut}" has a stale execution lock; pass unlock=true to clear.`,
+            );
+          }
+        }
+      }
     }
   };
   assertNoOverlappingOwner();
@@ -420,6 +447,32 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
   let createdRecord = false;
   let previousRecordRaw = null;
   let updatedRecord = false;
+  const retiredRecords = [];
+
+  const undoRecords = () => {
+    if (createdRecord) {
+      rmSync(recordPath, { force: true });
+      createdRecord = false;
+    } else if (updatedRecord && previousRecordRaw !== null) {
+      const restoreTmp = `${recordPath}.${process.pid}.${Date.now()}.${randomUUID()}.restore.tmp`;
+      try {
+        writeFileSync(restoreTmp, previousRecordRaw, "utf8");
+        renameSync(restoreTmp, recordPath);
+      } finally {
+        rmSync(restoreTmp, { force: true });
+      }
+      updatedRecord = false;
+    }
+    for (const ret of retiredRecords.splice(0)) {
+      const restoreTmp = `${ret.path}.${process.pid}.${Date.now()}.${randomUUID()}.restore.tmp`;
+      try {
+        writeFileSync(restoreTmp, ret.raw, "utf8");
+        renameSync(restoreTmp, ret.path);
+      } finally {
+        rmSync(restoreTmp, { force: true });
+      }
+    }
+  };
 
   try {
     writeFileSync(recordTmp, JSON.stringify(recordPayload, null, 2) + "\n", "utf8");
@@ -436,30 +489,83 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
         withOwnersRegistryLock(ownersDir, () => {
           assertNoOverlappingOwner();
           try {
-            linkSync(recordTmp, recordPath);
-            createdRecord = true;
-          } catch (e) {
-            if (e.code !== "EEXIST") throw e;
-            const existing = readJsonQuiet(recordPath);
-            const sameDataDir = Boolean(existing?.data_dir) && canonicalPathKey(existing.data_dir) === canonicalDataDir;
-            const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
-            if (!existing || !sameDataDir || (!sameRun && !force)) {
-              const ownerDesc = existing?.run_id
-                ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
-                : "another run (unreadable ownership record)";
-              throw new UsageError(
-                `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
-              );
-            }
-            if (!sameRun && force) {
-              try {
-                previousRecordRaw = readFileSync(recordPath, "utf8");
-              } catch {
-                previousRecordRaw = null;
+            try {
+              linkSync(recordTmp, recordPath);
+              createdRecord = true;
+            } catch (e) {
+              if (e.code !== "EEXIST") throw e;
+              const existing = readJsonQuiet(recordPath);
+              const sameDataDir = Boolean(existing?.data_dir) && canonicalPathKey(existing.data_dir) === canonicalDataDir;
+              const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
+              if (!existing || !sameDataDir || (!sameRun && !force)) {
+                const ownerDesc = existing?.run_id
+                  ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
+                  : "another run (unreadable ownership record)";
+                throw new UsageError(
+                  `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
+                );
               }
-              renameSync(recordTmp, recordPath);
-              updatedRecord = true;
+              if (!sameRun && force) {
+                try {
+                  previousRecordRaw = readFileSync(recordPath, "utf8");
+                } catch {
+                  previousRecordRaw = null;
+                }
+                renameSync(recordTmp, recordPath);
+                updatedRecord = true;
+              }
             }
+            // Retire superseded overlapping same-data_dir ownership records atomically so subsequent
+            // non-forced uaw_resume calls do not trip over stale sibling records.
+            const myRecordName = basename(recordPath);
+            const toRetire = [];
+            for (const file of readdirSync(ownersDir)) {
+              if (file === myRecordName || !file.endsWith(".json")) continue;
+              const otherPath = join(ownersDir, file);
+              const other = readJsonQuiet(otherPath);
+              if (!other?.output_path || !other?.data_dir) continue;
+              let otherDataDir;
+              let otherOut;
+              try {
+                otherDataDir = canonicalPathKey(other.data_dir);
+                otherOut = canonicalPathKey(other.output_path);
+              } catch {
+                continue;
+              }
+              if (otherDataDir !== canonicalDataDir) continue;
+              if (!pathsOverlap(canonicalOutput, otherOut)) continue;
+              const sameRun = Boolean(other.run_id) && other.run_id === runId;
+              if (!sameRun && !force) continue;
+              const otherLockPath = join(ownersDir, file.replace(/\.json$/, ".lock"));
+              let raw = null;
+              try {
+                raw = readFileSync(otherPath, "utf8");
+              } catch {
+                raw = null;
+              }
+              toRetire.push({ otherPath, otherLockPath, raw });
+            }
+            for (const item of toRetire) {
+              if (item.raw !== null) {
+                retiredRecords.push({ path: item.otherPath, raw: item.raw });
+              }
+              rmSync(item.otherPath, { force: true });
+            }
+            if (unlock) {
+              for (const item of toRetire) {
+                const otherLock = readJsonQuiet(item.otherLockPath);
+                if (!otherLock || !Number.isInteger(otherLock.pid) || !pidAlive(otherLock.pid)) {
+                  rmSync(item.otherLockPath, { force: true });
+                }
+              }
+            }
+          } catch (err) {
+            try {
+              undoRecords();
+            } catch {
+              /* best-effort rollback on partial failure */
+            }
+            throw err;
           }
         });
       },
@@ -469,20 +575,10 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
       lockPath: acquired.lockPath,
       release: acquired.release,
       rollback() {
-        if (createdRecord) {
-          rmSync(recordPath, { force: true });
-          createdRecord = false;
-          return;
-        }
-        if (updatedRecord && previousRecordRaw !== null) {
-          const restoreTmp = `${recordPath}.${process.pid}.${Date.now()}.restore.tmp`;
-          try {
-            writeFileSync(restoreTmp, previousRecordRaw, "utf8");
-            renameSync(restoreTmp, recordPath);
-          } finally {
-            rmSync(restoreTmp, { force: true });
-          }
-          updatedRecord = false;
+        if (existsSync(ownersDir)) {
+          withOwnersRegistryLock(ownersDir, undoRecords);
+        } else {
+          undoRecords();
         }
       },
     };

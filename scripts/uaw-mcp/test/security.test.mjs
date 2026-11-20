@@ -22,6 +22,7 @@ import { claimDataDirLock, pidAlive } from "../ownership.mjs";
 import { assertAllowedPath, canonicalPathKey, listRegisteredRuns, lookupRunById, readRunMeta, registerRunIndex, writeRunMeta } from "../paths.mjs";
 import { createMcpHandler, MCP_PROTOCOL_VERSION } from "../protocol.mjs";
 import { isOriginAllowed, startHttpServer } from "../server.mjs";
+import { createFixtureWorkspace } from "./helpers.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
@@ -219,14 +220,26 @@ try {
     rmSync(extDir, { recursive: true, force: true });
   }
 
-  // Transcript symlink inside transcripts/ pointing outside must be rejected
-  symlinkSync("/etc/hosts", join(transcriptsDir, "symlink-leak.json"));
-  const symlinkTranscript = await handler.callTool("uaw_read_transcript", {
-    run_id: runId,
-    transcript_id: "symlink-leak",
-  });
-  assert.equal(symlinkTranscript.isError, true);
-  assert.equal(symlinkTranscript.structuredContent.exit_code, 2);
+  // Transcript symlink inside transcripts/ pointing outside must be rejected on read AND resume
+  const symTranscriptPath = join(transcriptsDir, "symlink-leak.json");
+  symlinkSync("/etc/hosts", symTranscriptPath);
+  try {
+    const symlinkTranscript = await handler.callTool("uaw_read_transcript", {
+      run_id: runId,
+      transcript_id: "symlink-leak",
+    });
+    assert.equal(symlinkTranscript.isError, true);
+    assert.equal(symlinkTranscript.structuredContent.exit_code, 2);
+
+    const symlinkResume = await handler.callTool("uaw_resume", {
+      run_id: runId,
+    });
+    assert.equal(symlinkResume.isError, true);
+    assert.equal(symlinkResume.structuredContent.exit_code, 2);
+    assert.match(symlinkResume.structuredContent.error, /symlink|regular file/i);
+  } finally {
+    rmSync(symTranscriptPath, { force: true });
+  }
 
   // Active run.lock prevents uaw_run from clobbering run-meta.json before runner starts
   const lockedMetaBefore = readFileSync(join(dataDir, "run-meta.json"), "utf8");
@@ -1198,7 +1211,13 @@ try {
 
     // Non-existent case-variant paths AND created case-variant paths produce identical keys on case-insensitive FS
     const realNative = realpathSync.native ?? realpathSync;
-    if (realNative(safeRepo.toUpperCase()) === realNative(safeRepo)) {
+    let isCaseInsensitiveFs = false;
+    try {
+      isCaseInsensitiveFs = realNative(safeRepo.toUpperCase()) === realNative(safeRepo);
+    } catch {
+      isCaseInsensitiveFs = false;
+    }
+    if (isCaseInsensitiveFs) {
       assert.equal(
         canonicalPathKey(join(safeRepo, "UncreatedCaseOut")),
         canonicalPathKey(join(safeRepo, "uncreatedcaseout")),
@@ -1235,6 +1254,12 @@ try {
       assert.equal(caseRunB.isError, true);
       assert.equal(caseRunB.structuredContent.exit_code, 2);
       assert.match(caseRunB.structuredContent.error, /already owned|overlaps/i);
+    } else {
+      assert.notEqual(
+        canonicalPathKey(join(safeRepo, "UncreatedCaseOut")),
+        canonicalPathKey(join(safeRepo, "uncreatedcaseout")),
+        "canonicalPathKey must preserve distinct case on case-sensitive filesystems",
+      );
     }
 
     // uaw_gates mode=check requires run_id or data_dir and never inherits ambient UWF_DATA_DIR
@@ -1420,6 +1445,136 @@ setTimeout(() => {}, 30000);
     }
   } finally {
     rmSync(outsideTargetDir, { recursive: true, force: true });
+  }
+
+  // Non-DB skill/agent resource symlinks must be rejected before spawning child CLIs
+  const symlinkResRepo = join(safeRepo, "repo-symlinked-non-db");
+  mkdirSync(join(symlinkResRepo, ".github", "skills", "uwf-evil"), { recursive: true });
+  mkdirSync(join(symlinkResRepo, ".github", "agents"), { recursive: true });
+  const evilStagesSym = join(symlinkResRepo, ".github", "skills", "uwf-evil", "stages.yaml");
+  symlinkSync("/etc/hosts", evilStagesSym);
+  try {
+    const resSymStagesRun = await handler.callTool("uaw_run", {
+      workflow: "sw_dev",
+      goal: "Reject symlinked stages.yaml",
+      adapter: "fake",
+      fake_fixture_dir: join(safeRepo, "missing-fx"),
+      data_dir: join(safeRepo, "sym-stages-data"),
+      repo_root: symlinkResRepo,
+      skills_root: symlinkResRepo,
+    });
+    assert.equal(resSymStagesRun.isError, true);
+    assert.equal(resSymStagesRun.structuredContent.exit_code, 2);
+    assert.match(resSymStagesRun.structuredContent.error, /symlink|regular file/i);
+  } finally {
+    rmSync(evilStagesSym, { force: true });
+  }
+  const evilAgentSym = join(symlinkResRepo, ".github", "agents", "evil.agent.md");
+  symlinkSync("/etc/hosts", evilAgentSym);
+  try {
+    const resSymAgentTrans = await handler.callTool("uaw_stage_transition", {
+      target: "stage",
+      action: "init",
+      workflow: "sw_dev",
+      data_dir: join(safeRepo, "sym-agent-data"),
+      repo_root: symlinkResRepo,
+      skills_root: symlinkResRepo,
+    });
+    assert.equal(resSymAgentTrans.isError, true);
+    assert.equal(resSymAgentTrans.structuredContent.exit_code, 2);
+    assert.match(resSymAgentTrans.structuredContent.error, /symlink|regular file/i);
+  } finally {
+    rmSync(evilAgentSym, { force: true });
+  }
+
+  // Out-of-bounds or non-positive timeout_ms must fail closed with exit_code 2
+  for (const badTimeout of [0, 0.5, -100, 999_999_999_999]) {
+    const badTimeoutRes = await handler.callTool("uaw_run", {
+      workflow: "sw_dev",
+      goal: "Reject unbounded timeout_ms",
+      adapter: "fake",
+      data_dir: join(safeRepo, "bad-timeout-data"),
+      repo_root: safeRepo,
+      timeout_ms: badTimeout,
+    });
+    assert.equal(badTimeoutRes.isError, true, `timeout_ms=${badTimeout} must be rejected`);
+    assert.equal(badTimeoutRes.structuredContent.exit_code, 2);
+    assert.match(badTimeoutRes.structuredContent.error, /timeout_ms/i);
+  }
+
+  // Forced uaw_stage_transition workflow mismatch rejection + forced overlapping output_path transfer & resume
+  const regWs = createFixtureWorkspace({ withQuestions: true, withRoundTrip: false, prefix: "uaw-mcp-reg-" });
+  try {
+    const regHandler = createMcpHandler({ allowedRoots: [regWs.root], stateDir: regWs.stateDir });
+    const overlapData = join(regWs.repoRoot, "overlap-transfer-data");
+    const childOut = join(regWs.repoRoot, "out-overlap", "child");
+    const parentOut = join(regWs.repoRoot, "out-overlap");
+    const childFx = regWs.writeFixturesForOutput(childOut);
+    const parentFx = regWs.writeFixturesForOutput(parentOut);
+
+    const initOverlapRun = await regHandler.callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      goal: "Initial child output_path run",
+      adapter: "fake",
+      fake_fixture_dir: childFx,
+      data_dir: overlapData,
+      output_path: childOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(initOverlapRun.structuredContent.exit_code, 3, initOverlapRun.structuredContent.stderr);
+    const metaBeforeTrans = readFileSync(join(overlapData, "run-meta.json"), "utf8");
+
+    const forcedMismatchTrans = await regHandler.callTool("uaw_stage_transition", {
+      data_dir: overlapData,
+      target: "stage",
+      action: "init",
+      force: true,
+      workflow: "other_workflow",
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(forcedMismatchTrans.isError, true);
+    assert.equal(forcedMismatchTrans.structuredContent.exit_code, 2);
+    assert.match(forcedMismatchTrans.structuredContent.error, /does not match persisted workflow/i);
+    assert.equal(readFileSync(join(overlapData, "run-meta.json"), "utf8"), metaBeforeTrans);
+
+    const forcedOverlapRun = await regHandler.callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      goal: "Forced transfer to overlapping parent output_path",
+      adapter: "fake",
+      fake_fixture_dir: parentFx,
+      data_dir: overlapData,
+      output_path: parentOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+      force: true,
+    });
+    assert.equal(forcedOverlapRun.structuredContent.exit_code, 3, forcedOverlapRun.structuredContent.stderr);
+    const transferredRunId = forcedOverlapRun.structuredContent.run_id;
+    assert.notEqual(transferredRunId, initOverlapRun.structuredContent.run_id);
+
+    const pendingQ = forcedOverlapRun.structuredContent.pending_questions?.[0];
+    assert.ok(pendingQ?.id, "transferred run must pause with pending question");
+    const ansRes = await regHandler.callTool("uaw_question_resolve", {
+      run_id: transferredRunId,
+      action: "answer",
+      id: pendingQ.id,
+      answer: "node",
+    });
+    assert.equal(ansRes.isError, false, ansRes.structuredContent?.error ?? "");
+
+    const resumedTransferred = await regHandler.callTool("uaw_resume", {
+      run_id: transferredRunId,
+      adapter: "fake",
+      fake_fixture_dir: parentFx,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(resumedTransferred.isError, false, resumedTransferred.structuredContent?.stderr ?? resumedTransferred.structuredContent?.error ?? "");
+    assert.equal(resumedTransferred.structuredContent.exit_code, 0);
+  } finally {
+    rmSync(regWs.root, { recursive: true, force: true });
   }
 
   const srv = await startHttpServer({

@@ -291,14 +291,13 @@ const RUNTIME_CONTROL_FILES = new Set([
 
 /**
  * Verify that `dataDir` (if present) is a non-symlink directory whose top-level runtime
- * entries (`*.db`, `-wal`, `-shm`, `-journal`, control files, and `transcripts/`) are
+ * entries (`*.db`, `-wal`, `-shm`, `-journal`, control files, and `transcripts/*`) are
  * regular non-symlink entries contained inside `dataDir`.
  *
- * Does not recurse into `workflow-artifacts/` (agents may leave build/package symlinks
- * there) or `transcripts/` (cost/transcript readers already filter individual entries).
+ * Does not recurse into `workflow-artifacts/` (agents may leave build/package symlinks there).
  * Note: pre-spawn checks are defense-in-depth alongside child-CLI confinement.
  */
-export function assertSafeDataDir(dataDir) {
+export function assertSafeDataDir(dataDir, { strictTranscripts = true } = {}) {
   const absDir = resolve(dataDir);
   let dirLst;
   try {
@@ -334,7 +333,33 @@ export function assertSafeDataDir(dataDir) {
       if (!lst.isDirectory()) {
         throw new UsageError(`data_dir/transcripts must be a directory: "${full}"`);
       }
-    } else if (!lst.isFile()) {
+      const realFull = realpathSync(full);
+      if (!insideRoot(realFull)) {
+        throw new UsageError(`data_dir entry escapes "${absDir}": "${full}"`);
+      }
+      if (strictTranscripts) {
+        const insideTranscripts = (p) => (realFull.endsWith(sep) ? p.startsWith(realFull) : p.startsWith(realFull + sep));
+        for (const tEntry of readdirSync(full, { withFileTypes: true })) {
+          const tFull = join(full, tEntry.name);
+          let tLst;
+          try {
+            tLst = lstatSync(tFull);
+          } catch (e) {
+            if (e.code === "ENOENT") continue;
+            throw e;
+          }
+          if (tLst.isSymbolicLink() || !tLst.isFile()) {
+            throw new UsageError(`data_dir/transcripts entry "${tEntry.name}" must be a regular file (symlinks disallowed): "${tFull}"`);
+          }
+          const realT = realpathSync(tFull);
+          if (!insideTranscripts(realT)) {
+            throw new UsageError(`data_dir/transcripts entry escapes "${full}": "${tFull}"`);
+          }
+        }
+      }
+      continue;
+    }
+    if (!lst.isFile()) {
       throw new UsageError(`data_dir runtime entry "${entry.name}" must be a regular file: "${full}"`);
     }
     const realFull = realpathSync(full);
@@ -345,8 +370,67 @@ export function assertSafeDataDir(dataDir) {
 }
 
 /**
- * Reject symlinked `.github/skills` directories or symlinked SQLite DB/sidecar files
- * under `<rootPath>/.github/skills/<skill>/` before spawning child CLIs.
+ * Recursively verify that `dirPath` (if present) is a non-symlink directory containing only
+ * non-symlink regular files and directories within `rootReal ?? realpathSync(dirPath)`.
+ */
+export function assertSafeRegularTree(dirPath, label = "directory", { rootReal = null, skipNodeModules = false } = {}) {
+  if (!dirPath) return;
+  const absDir = resolve(dirPath);
+  let dirLst;
+  try {
+    dirLst = lstatSync(absDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+    throw new UsageError(`${label} must be a regular directory (symlinks disallowed): "${absDir}"`);
+  }
+  const effectiveRoot = rootReal ?? realpathSync(absDir);
+  const insideRoot = (p) =>
+    p === effectiveRoot || (effectiveRoot.endsWith(sep) ? p.startsWith(effectiveRoot) : p.startsWith(effectiveRoot + sep));
+  const realDir = realpathSync(absDir);
+  if (!insideRoot(realDir)) {
+    throw new UsageError(`${label} escapes root "${effectiveRoot}": "${absDir}"`);
+  }
+
+  const stack = [absDir];
+  while (stack.length > 0) {
+    const curDir = stack.pop();
+    for (const item of readdirSync(curDir, { withFileTypes: true })) {
+      const itemPath = join(curDir, item.name);
+      let itemLst;
+      try {
+        itemLst = lstatSync(itemPath);
+      } catch (e) {
+        if (e.code === "ENOENT") continue;
+        throw e;
+      }
+      if (itemLst.isSymbolicLink()) {
+        throw new UsageError(`${label} entry must not be a symlink: "${itemPath}"`);
+      }
+      const realItem = realpathSync(itemPath);
+      if (!insideRoot(realItem)) {
+        throw new UsageError(`${label} entry escapes root "${effectiveRoot}": "${itemPath}"`);
+      }
+      if (skipNodeModules && item.name === "node_modules") {
+        if (!itemLst.isDirectory()) {
+          throw new UsageError(`${label} node_modules must be a directory: "${itemPath}"`);
+        }
+        continue;
+      }
+      if (itemLst.isDirectory()) {
+        stack.push(itemPath);
+      } else if (!itemLst.isFile()) {
+        throw new UsageError(`${label} entry must be a regular file or directory: "${itemPath}"`);
+      }
+    }
+  }
+}
+
+/**
+ * Reject symlinked, non-regular, or escaping resources under `<rootPath>/.uwf.json` and
+ * `<rootPath>/.github/{skills,agents,instructions,prompts}` before spawning child CLIs.
  */
 export function assertSafeSkillDbs(rootPath, label = "repo_root") {
   if (!rootPath) return;
@@ -362,6 +446,21 @@ export function assertSafeSkillDbs(rootPath, label = "repo_root") {
     throw new UsageError(`${label} must be a regular directory: "${absRoot}"`);
   }
   const realRoot = realpathSync(absRoot);
+  const insideRoot = (p) => (realRoot.endsWith(sep) ? p.startsWith(realRoot) : p.startsWith(realRoot + sep));
+
+  const uwfCfg = join(absRoot, ".uwf.json");
+  try {
+    const cfgLst = lstatSync(uwfCfg);
+    if (cfgLst.isSymbolicLink() || !cfgLst.isFile()) {
+      throw new UsageError(`${label}/.uwf.json must be a regular file (symlinks disallowed): "${uwfCfg}"`);
+    }
+    if (!insideRoot(realpathSync(uwfCfg))) {
+      throw new UsageError(`${label}/.uwf.json escapes root "${absRoot}": "${uwfCfg}"`);
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+
   const dotGithub = join(absRoot, ".github");
   let ghLst;
   try {
@@ -370,58 +469,21 @@ export function assertSafeSkillDbs(rootPath, label = "repo_root") {
     if (e.code === "ENOENT") return;
     throw e;
   }
-  if (ghLst.isSymbolicLink()) {
-    throw new UsageError(`${label}/.github must not be a symlink: "${dotGithub}"`);
+  if (ghLst.isSymbolicLink() || !ghLst.isDirectory()) {
+    throw new UsageError(`${label}/.github must be a regular directory (symlinks disallowed): "${dotGithub}"`);
   }
-  if (!ghLst.isDirectory()) return;
-
-  const skillsDir = join(dotGithub, "skills");
-  let skLst;
-  try {
-    skLst = lstatSync(skillsDir);
-  } catch (e) {
-    if (e.code === "ENOENT") return;
-    throw e;
+  if (!insideRoot(realpathSync(dotGithub))) {
+    throw new UsageError(`${label}/.github escapes root "${absRoot}": "${dotGithub}"`);
   }
-  if (skLst.isSymbolicLink()) {
-    throw new UsageError(`${label}/.github/skills must not be a symlink: "${skillsDir}"`);
-  }
-  if (!skLst.isDirectory()) return;
 
-  for (const skillEntry of readdirSync(skillsDir, { withFileTypes: true })) {
-    const skillPath = join(skillsDir, skillEntry.name);
-    let lst;
-    try {
-      lst = lstatSync(skillPath);
-    } catch (e) {
-      if (e.code === "ENOENT") continue;
-      throw e;
-    }
-    if (lst.isSymbolicLink()) {
-      throw new UsageError(`${label} skill directory must not be a symlink: "${skillPath}"`);
-    }
-    if (!lst.isDirectory()) continue;
-
-    for (const item of readdirSync(skillPath, { withFileTypes: true })) {
-      if (item.name === "node_modules") continue;
-      if (!/\.db(?:-wal|-shm|-journal)?$/i.test(item.name)) continue;
-      const itemPath = join(skillPath, item.name);
-      let itemLst;
-      try {
-        itemLst = lstatSync(itemPath);
-      } catch (e) {
-        if (e.code === "ENOENT") continue;
-        throw e;
-      }
-      if (itemLst.isSymbolicLink() || !itemLst.isFile()) {
-        throw new UsageError(`${label} skill DB file must be a regular file (symlinks disallowed): "${itemPath}"`);
-      }
-      const realItem = realpathSync(itemPath);
-      const inside = realRoot.endsWith(sep) ? realItem.startsWith(realRoot) : realItem.startsWith(realRoot + sep);
-      if (!inside) {
-        throw new UsageError(`${label} skill DB file escapes root "${absRoot}": "${itemPath}"`);
-      }
-    }
+  assertSafeRegularTree(join(dotGithub, "skills"), `${label}/.github/skills`, {
+    rootReal: realRoot,
+    skipNodeModules: true,
+  });
+  for (const sub of ["agents", "instructions", "prompts"]) {
+    assertSafeRegularTree(join(dotGithub, sub), `${label}/.github/${sub}`, {
+      rootReal: realRoot,
+    });
   }
 }
 

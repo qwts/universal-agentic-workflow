@@ -26,6 +26,7 @@ import {
   assertAllowedPath,
   assertRegularFileInDir,
   assertSafeDataDir,
+  assertSafeRegularTree,
   assertSafeSkillDbs,
   canonicalPathKey,
   defaultOutputPath,
@@ -96,6 +97,7 @@ const MAX_CHILD_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_METADATA_CLI_TIMEOUT_MS = 30_000;
 const DEFAULT_RUN_CLI_TIMEOUT_MS = 4 * 60 * 60 * 1_000;
+const MAX_STAGE_TIMEOUT_MS = DEFAULT_RUN_CLI_TIMEOUT_MS - 60_000;
 
 const STRIPPED_ENV_KEYS = new Set([
   "UWF_BOT_TOKEN",
@@ -292,8 +294,12 @@ export function execNodeAsync(scriptPath, args, { cwd, env, maxBytes = MAX_CHILD
     entry = { terminate, killTree, forceSettle, promise: null };
     activeChildren.add(entry);
 
-    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-      killTimer = setTimeout(() => terminate(`child CLI timed out after ${timeoutMs}ms`), timeoutMs);
+    const boundedTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? Math.min(Math.floor(timeoutMs), DEFAULT_RUN_CLI_TIMEOUT_MS)
+        : 0;
+    if (boundedTimeoutMs > 0) {
+      killTimer = setTimeout(() => terminate(`child CLI timed out after ${boundedTimeoutMs}ms`), boundedTimeoutMs);
       killTimer.unref?.();
     }
 
@@ -557,6 +563,15 @@ function assertNoLeadingDash(value, label) {
   return s;
 }
 
+function assertBoundedTimeoutMs(value, label = "timeout_ms") {
+  const raw = assertNoLeadingDash(value, label);
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1 || n > MAX_STAGE_TIMEOUT_MS) {
+    throw new UsageError(`${label} must be an integer number of milliseconds between 1 and ${MAX_STAGE_TIMEOUT_MS}`);
+  }
+  return String(n);
+}
+
 function resolveOptionalPath(value, allowedRoots, label) {
   if (!value) return undefined;
   return assertAllowedPath(value, allowedRoots, label);
@@ -643,7 +658,7 @@ export async function cmdRun(params = {}, ctx = {}) {
   if (params.adapter) assertSafeIdentifier(params.adapter, "adapter");
   if (params.model) assertNoLeadingDash(params.model, "model");
   if (params.from_stage) assertSafeIdentifier(params.from_stage, "from_stage");
-  if (params.timeout_ms !== undefined) assertNoLeadingDash(params.timeout_ms, "timeout_ms");
+  if (params.timeout_ms !== undefined) assertBoundedTimeoutMs(params.timeout_ms, "timeout_ms");
   if (params.max_cost_usd !== undefined) assertNoLeadingDash(params.max_cost_usd, "max_cost_usd");
   if (params.resume_max_context !== undefined) {
     assertNoLeadingDash(params.resume_max_context, "resume_max_context");
@@ -675,6 +690,7 @@ export async function cmdRun(params = {}, ctx = {}) {
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
     const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+    if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
     const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
 
     const args = [
@@ -695,7 +711,7 @@ export async function cmdRun(params = {}, ctx = {}) {
     if (force) args.push("--force");
     if (params.unlock === true) args.push("--unlock");
     if (params.non_interactive === true) args.push("--non-interactive");
-    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertBoundedTimeoutMs(params.timeout_ms, "timeout_ms"));
     if (params.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
       args.push("--repo-root", repoRoot);
     }
@@ -765,6 +781,7 @@ export async function cmdRun(params = {}, ctx = {}) {
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
     const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+    if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
     const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
 
     const args = [
@@ -784,7 +801,7 @@ export async function cmdRun(params = {}, ctx = {}) {
     if (force) args.push("--force");
     if (params.unlock === true) args.push("--unlock");
     if (params.non_interactive === true) args.push("--non-interactive");
-    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertBoundedTimeoutMs(params.timeout_ms, "timeout_ms"));
     if (params.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
       args.push("--repo-root", repoRoot);
     }
@@ -831,15 +848,11 @@ export async function cmdRun(params = {}, ctx = {}) {
       assertSafeDataDir(dataDir);
       assertSafeSkillDbs(repoRoot, "repo_root");
       if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
-      const parsedTimeout = params.timeout_ms !== undefined ? Number(params.timeout_ms) : NaN;
-      const runTimeoutMs =
-        Number.isFinite(parsedTimeout) && parsedTimeout > 0
-          ? Math.max(DEFAULT_RUN_CLI_TIMEOUT_MS, parsedTimeout + 60_000)
-          : DEFAULT_RUN_CLI_TIMEOUT_MS;
+      if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
       res = await execNodeAsync(RUNNER_CLI, args, {
         cwd: repoRoot,
         env,
-        timeoutMs: runTimeoutMs,
+        timeoutMs: DEFAULT_RUN_CLI_TIMEOUT_MS,
       });
     } catch (err) {
       rollbackClaimAndIndex(claim, idxReg, metaWrite);
@@ -889,7 +902,7 @@ export async function cmdResume(params = {}, ctx = {}) {
   if (params.workflow !== undefined) assertSafeWorkflow(params.workflow, "workflow");
   if (params.adapter) assertSafeIdentifier(params.adapter, "adapter");
   if (params.model) assertNoLeadingDash(params.model, "model");
-  if (params.timeout_ms !== undefined) assertNoLeadingDash(params.timeout_ms, "timeout_ms");
+  if (params.timeout_ms !== undefined) assertBoundedTimeoutMs(params.timeout_ms, "timeout_ms");
   if (params.max_cost_usd !== undefined) assertNoLeadingDash(params.max_cost_usd, "max_cost_usd");
   if (params.resume_max_context !== undefined) {
     assertNoLeadingDash(params.resume_max_context, "resume_max_context");
@@ -961,7 +974,10 @@ export async function cmdResume(params = {}, ctx = {}) {
       allowedRoots,
       "skills_root",
     );
+    assertSafeSkillDbs(repoRoot, "repo_root");
+    if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
     const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+    if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
 
     const args = [
       "resume",
@@ -976,7 +992,7 @@ export async function cmdResume(params = {}, ctx = {}) {
     if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
     if (params.unlock === true) args.push("--unlock");
     if (params.non_interactive === true) args.push("--non-interactive");
-    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertBoundedTimeoutMs(params.timeout_ms, "timeout_ms"));
     if (params.repo_root || meta?.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
       args.push("--repo-root", repoRoot);
     }
@@ -1032,16 +1048,12 @@ export async function cmdResume(params = {}, ctx = {}) {
       assertSafeDataDir(dataDir);
       assertSafeSkillDbs(repoRoot, "repo_root");
       if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
+      if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
 
-      const parsedTimeout = params.timeout_ms !== undefined ? Number(params.timeout_ms) : NaN;
-      const resumeTimeoutMs =
-        Number.isFinite(parsedTimeout) && parsedTimeout > 0
-          ? Math.max(DEFAULT_RUN_CLI_TIMEOUT_MS, parsedTimeout + 60_000)
-          : DEFAULT_RUN_CLI_TIMEOUT_MS;
       res = await execNodeAsync(RUNNER_CLI, args, {
         cwd: repoRoot,
         env,
-        timeoutMs: resumeTimeoutMs,
+        timeoutMs: DEFAULT_RUN_CLI_TIMEOUT_MS,
       });
     } catch (err) {
       if (resumeIdxReg || resumeMetaWrite) {
@@ -1267,7 +1279,7 @@ export async function cmdCost(params = {}, ctx = {}) {
     "output_path",
   );
 
-  assertSafeDataDir(dataDir);
+  assertSafeDataDir(dataDir, { strictTranscripts: false });
   assertSafeSkillDbs(repoRoot, "repo_root");
   if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
 
@@ -1354,9 +1366,7 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
     if (action !== "init" && !meta && !existsSync(join(dataDir, "uwf-state.db")) && !existsSync(join(dataDir, "uwf-stages.db"))) {
       throw new UsageError(`No initialized run found in "${dataDir}" (uaw_stage_transition action=${action})`);
     }
-    if (!(params.force === true && action === "init")) {
-      assertWorkflowMatchesMeta(params.workflow, meta?.workflow, "uaw_stage_transition");
-    }
+    assertWorkflowMatchesMeta(params.workflow, meta?.workflow, "uaw_stage_transition");
     const workflow = scope === "stage"
       ? assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow")
       : (params.workflow ? assertSafeWorkflow(params.workflow, "workflow") : meta?.workflow ?? null);
@@ -1377,6 +1387,8 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       allowedRoots,
       "skills_root",
     );
+    assertSafeSkillDbs(repoRoot, "repo_root");
+    if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
 
     const common = ["--data-dir", dataDir, "--output-path", outputPath];
     const env = { UWF_DATA_DIR: dataDir, ...(skillsRoot ? { UWF_SKILLS_ROOT: skillsRoot } : {}) };
