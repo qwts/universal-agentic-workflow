@@ -1063,14 +1063,14 @@ function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
   const absPattern = isAbsolute(expanded) ? expanded : resolve(repoRoot, expanded);
   assertSafeOutputAncestors(absPattern, { outputPath, repoRoot, skillsRoot });
   if (!/[*?[\]]/.test(basename(absPattern))) {
-    let st = null;
+    let st;
     try {
       st = lstatSync(absPattern);
     } catch (err) {
-      if (err.code !== "ENOENT") {
-        throw new Error(`Cannot inspect declared output "${absPattern}": ${err.message}`);
+      if (err.code === "ENOENT") {
+        throw new Error(`Declared output missing on disk: "${absPattern}"`);
       }
-      return [];
+      throw new Error(`Cannot inspect declared output "${absPattern}": ${err.message}`);
     }
     if (st.isSymbolicLink()) {
       throw new Error(`Declared output "${absPattern}" must not be a symlink`);
@@ -1082,14 +1082,14 @@ function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
   }
   const dir = dirname(absPattern);
   const basePattern = basename(absPattern);
-  let dirSt = null;
+  let dirSt;
   try {
     dirSt = lstatSync(dir);
   } catch (err) {
-    if (err.code !== "ENOENT") {
-      throw new Error(`Cannot inspect declared output directory "${dir}": ${err.message}`);
+    if (err.code === "ENOENT") {
+      throw new Error(`Declared output pattern "${absPattern}" matched no files (directory "${dir}" does not exist)`);
     }
-    return [];
+    throw new Error(`Cannot inspect declared output directory "${dir}": ${err.message}`);
   }
   if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) {
     throw new Error(`Declared output directory "${dir}" must be a regular directory`);
@@ -1117,6 +1117,9 @@ function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
       throw new Error(`Declared output "${entryPath}" must be a regular file`);
     }
     matches.push(entryPath);
+  }
+  if (matches.length === 0) {
+    throw new Error(`Declared output pattern "${absPattern}" matched no files`);
   }
   return matches;
 }
@@ -1756,6 +1759,7 @@ const SUPPORTED_SCHEMA_KEYWORDS = new Set([
   "required",
   "properties",
   "additionalProperties",
+  "minItems",
   "items",
 ]);
 
@@ -1831,10 +1835,15 @@ function validateAgainstSchema(val, rawSchema, rootSchema, ptr, errs) {
     }
   }
 
-  if (Array.isArray(val) && schema.items) {
-    val.forEach((item, i) => {
-      validateAgainstSchema(item, schema.items, rootSchema, `${ptr}/${i}`, errs);
-    });
+  if (Array.isArray(val)) {
+    if (typeof schema.minItems === "number" && val.length < schema.minItems) {
+      errs.push(`${label} must have >= ${schema.minItems} item(s)`);
+    }
+    if (schema.items) {
+      val.forEach((item, i) => {
+        validateAgainstSchema(item, schema.items, rootSchema, `${ptr}/${i}`, errs);
+      });
+    }
   }
 }
 
@@ -2232,33 +2241,42 @@ export function buildManifest({
 
   const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
   const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
-  if (stagesDb) {
-    try {
-      if (tableExists(stagesDb, "stage_runs")) {
-        const rows = queryAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", resolvedWorkflow);
-        for (const row of rows) {
-          if (row.stage === "blueprint" && row.status === "passed") blueprintRan = true;
-          const outputs = parseStageOutputsJson(row.outputs_json, row.stage, row.status);
-          stages.push({
-            stage: row.stage,
-            status: row.status,
-            gate_verdict: extractGateVerdict(row.status, row.gate_result),
-            outputs,
-          });
-          auditStages.push({
-            stage: row.stage,
-            started_at: row.started_at ?? null,
-            completed_at: row.completed_at ?? null,
-            retry_count: Number(row.retry_count ?? 0),
-            round_trips: roundTrips.get(row.stage) ?? 0,
-            session_id: row.session_id ?? null,
-            transcript_sha256: transcriptDigests.get(row.stage) ?? null,
-          });
-        }
-      }
-    } finally {
-      stagesDb.close();
+  if (!stagesDb) {
+    throw new Error(
+      `Stage ledger not found at ${stagesChecked.path}; cannot build ${phase} manifest without stage history`,
+    );
+  }
+  try {
+    if (!tableExists(stagesDb, "stage_runs")) {
+      throw new Error(`Stage ledger missing stage_runs table at ${stagesChecked.path}`);
     }
+    const rows = queryAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", resolvedWorkflow);
+    if (rows.length === 0) {
+      throw new Error(
+        `Stage ledger has no stage_runs records for workflow "${resolvedWorkflow}" at ${stagesChecked.path}`,
+      );
+    }
+    for (const row of rows) {
+      if (row.stage === "blueprint" && row.status === "passed") blueprintRan = true;
+      const outputs = parseStageOutputsJson(row.outputs_json, row.stage, row.status);
+      stages.push({
+        stage: row.stage,
+        status: row.status,
+        gate_verdict: extractGateVerdict(row.status, row.gate_result),
+        outputs,
+      });
+      auditStages.push({
+        stage: row.stage,
+        started_at: row.started_at ?? null,
+        completed_at: row.completed_at ?? null,
+        retry_count: Number(row.retry_count ?? 0),
+        round_trips: roundTrips.get(row.stage) ?? 0,
+        session_id: row.session_id ?? null,
+        transcript_sha256: transcriptDigests.get(row.stage) ?? null,
+      });
+    }
+  } finally {
+    stagesDb.close();
   }
 
   const stores = {
@@ -2636,6 +2654,21 @@ export async function sealManifest({
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
   const manifestPath = join(absDataDir, MANIFEST_FILE);
+
+  if (headCommitSha && (String(headCommitSha).startsWith("-") || /[\s\0]/.test(String(headCommitSha)))) {
+    return {
+      ok: false,
+      exitCode: 1,
+      error: `Invalid git commit ref "${headCommitSha}"`,
+    };
+  }
+  if (!isGitRepo(absRepoRoot) && (commitGitDir || headCommitSha)) {
+    return {
+      ok: false,
+      exitCode: 1,
+      error: `Cannot verify git commit against non-git repoRoot "${absRepoRoot}"`,
+    };
+  }
 
   let hasManifestFile = true;
   try {

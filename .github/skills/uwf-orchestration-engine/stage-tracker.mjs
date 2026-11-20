@@ -735,60 +735,61 @@ function captureStageOutputsJson(stageDef) {
     if (/[*?[\]]/.test(basename(absPattern))) {
       const dir = dirname(absPattern);
       const basePattern = basename(absPattern);
-      let dirSt = null;
+      let dirSt;
       try {
         dirSt = lstatSync(dir);
       } catch (err) {
-        if (err.code !== "ENOENT") {
-          fail(`Stage "${stageDef?.name}": cannot inspect declared output directory "${dir}": ${err.message}`);
+        if (err.code === "ENOENT") {
+          fail(`Stage "${stageDef?.name}": declared output pattern "${absPattern}" matched no files (directory "${dir}" does not exist).`);
         }
+        fail(`Stage "${stageDef?.name}": cannot inspect declared output directory "${dir}": ${err.message}`);
       }
-      if (dirSt) {
-        if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) {
-          fail(`Stage "${stageDef?.name}": declared output directory "${dir}" must be a regular directory.`);
-        }
-        let entries;
+      if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) {
+        fail(`Stage "${stageDef?.name}": declared output directory "${dir}" must be a regular directory.`);
+      }
+      let entries;
+      try {
+        entries = readdirSync(dir);
+      } catch (err) {
+        fail(`Stage "${stageDef?.name}": cannot read declared output directory "${dir}": ${err.message}`);
+      }
+      for (const name of entries) {
+        if (!matchGlobSegment(basePattern, name)) continue;
+        const entryPath = join(dir, name);
+        let st;
         try {
-          entries = readdirSync(dir);
+          st = lstatSync(entryPath);
         } catch (err) {
-          fail(`Stage "${stageDef?.name}": cannot read declared output directory "${dir}": ${err.message}`);
+          fail(`Stage "${stageDef?.name}": cannot inspect declared output "${entryPath}": ${err.message}`);
         }
-        for (const name of entries) {
-          if (!matchGlobSegment(basePattern, name)) continue;
-          const entryPath = join(dir, name);
-          let st;
-          try {
-            st = lstatSync(entryPath);
-          } catch (err) {
-            fail(`Stage "${stageDef?.name}": cannot inspect declared output "${entryPath}": ${err.message}`);
-          }
-          if (st.isSymbolicLink()) {
-            fail(`Stage "${stageDef?.name}": declared output "${entryPath}" must not be a symlink.`);
-          }
-          if (!st.isFile()) {
-            fail(`Stage "${stageDef?.name}": declared output "${entryPath}" must be a regular file.`);
-          }
-          paths.push(entryPath);
+        if (st.isSymbolicLink()) {
+          fail(`Stage "${stageDef?.name}": declared output "${entryPath}" must not be a symlink.`);
         }
+        if (!st.isFile()) {
+          fail(`Stage "${stageDef?.name}": declared output "${entryPath}" must be a regular file.`);
+        }
+        paths.push(entryPath);
+      }
+      if (paths.length === 0) {
+        fail(`Stage "${stageDef?.name}": declared output pattern "${absPattern}" matched no files.`);
       }
     } else {
-      let st = null;
+      let st;
       try {
         st = lstatSync(absPattern);
       } catch (err) {
-        if (err.code !== "ENOENT") {
-          fail(`Stage "${stageDef?.name}": cannot inspect declared output "${absPattern}": ${err.message}`);
+        if (err.code === "ENOENT") {
+          fail(`Stage "${stageDef?.name}": declared output missing on disk: "${absPattern}".`);
         }
+        fail(`Stage "${stageDef?.name}": cannot inspect declared output "${absPattern}": ${err.message}`);
       }
-      if (st) {
-        if (st.isSymbolicLink()) {
-          fail(`Stage "${stageDef?.name}": declared output "${absPattern}" must not be a symlink.`);
-        }
-        if (!st.isFile()) {
-          fail(`Stage "${stageDef?.name}": declared output "${absPattern}" must be a regular file.`);
-        }
-        paths = [absPattern];
+      if (st.isSymbolicLink()) {
+        fail(`Stage "${stageDef?.name}": declared output "${absPattern}" must not be a symlink.`);
       }
+      if (!st.isFile()) {
+        fail(`Stage "${stageDef?.name}": declared output "${absPattern}" must be a regular file.`);
+      }
+      paths = [absPattern];
     }
     for (const abs of paths) {
       const buf = readRegularFileNoFollow(abs, stageDef?.name);

@@ -908,6 +908,11 @@ try {
     writeFileSync(outsideDomainDb, "");
     const dataSymlinkDomain = join(runRoot, "data-symlink-domain");
     mkdirSync(dataSymlinkDomain, { recursive: true });
+    execFileSync(
+      process.execPath,
+      [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", dataSymlinkDomain, "--repo-root", rootScrub, "--skills-root", REPO_ROOT],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
     symlinkSync(outsideDomainDb, join(dataSymlinkDomain, "uwf-requirements.db"));
     let symlinkDomainExit = 0;
     let symlinkDomainStderr = "";
@@ -957,6 +962,11 @@ try {
     execFileSync("git", ["-C", repoFsMon, "commit", "-q", "-m", "init"]);
     execFileSync("git", ["-C", repoFsMon, "config", "core.fsmonitor", "false_nonexistent_attacker_cmd"]);
     mkdirSync(dataFsMon, { recursive: true });
+    execFileSync(
+      process.execPath,
+      [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", dataFsMon, "--repo-root", repoFsMon, "--skills-root", REPO_ROOT],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
     const fsMonSeal = execFileSync(
       process.execPath,
       [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
@@ -1064,6 +1074,11 @@ try {
     execFileSync("git", ["-C", bareCommitStore, "init", "--bare", "-q"]);
     execFileSync("git", ["-C", bareCommitStore, "fetch", "--depth=1", "--no-tags", remoteSrc, remoteHead]);
     mkdirSync(dataBareSeal, { recursive: true });
+    execFileSync(
+      process.execPath,
+      [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", dataBareSeal, "--repo-root", localTarget, "--skills-root", REPO_ROOT],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
     const bareSealOut = execFileSync(
       process.execPath,
       [
@@ -1469,6 +1484,11 @@ try {
     mkdirSync(botRawRepo, { recursive: true });
     mkdirSync(botRawStore, { recursive: true });
     mkdirSync(botRawData, { recursive: true });
+    execFileSync(
+      process.execPath,
+      [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", botRawData, "--repo-root", botRawRepo, "--skills-root", REPO_ROOT],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
     execFileSync("git", ["-C", botRawRepo, "init", "-q"]);
     execFileSync("git", ["-C", botRawRepo, "config", "user.email", "test@example.com"]);
     execFileSync("git", ["-C", botRawRepo, "config", "user.name", "Test"]);
@@ -1824,6 +1844,8 @@ try {
     const schemaTestData = join(runRoot, "schema-test-data");
     mkdirSync(schemaTestData, { recursive: true });
     const schemaMutators = [
+      (m) => { m.stages = []; },
+      (m) => { m.execution_audit.stages = []; },
       (m) => { m.stores.requirements = {}; },
       (m) => { m.stores.adrs = { sha256: "a".repeat(64), total: 0, records: [{}] }; },
       (m) => { m.architecture.drs = { path: "x" }; },
@@ -2721,6 +2743,8 @@ try {
             status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
             started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
           );
+          INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
+            ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]');
         `);
         sdb.close();
       }
@@ -2873,6 +2897,162 @@ try {
       assert.throws(
         () => readRoutingState(symDataDir),
         /Refusing unsafe or symlinked directory/i,
+      );
+    }
+
+    // 5e. Require stage ledger for manifest materialization/sealing AND reject missing declared outputs at stage-complete
+    {
+      const ledgerRepo = join(runRoot, "ledger-req-repo");
+      const ledgerData = join(runRoot, "ledger-req-data");
+      mkdirSync(ledgerRepo, { recursive: true });
+      mkdirSync(ledgerData, { recursive: true });
+      writeFileSync(join(ledgerRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+
+      // Missing uwf-stages.db fails closed across build, materialize (snapshot & closed), seal, and CLI
+      assert.throws(
+        () => buildManifest({ dataDir: ledgerData, workflow: "sw_dev", repoRoot: ledgerRepo, phase: "closed" }),
+        /Stage ledger not found/i,
+      );
+      await assert.rejects(
+        () => materializeManifest({ dataDir: ledgerData, workflow: "sw_dev", repoRoot: ledgerRepo, phase: "snapshot", deferSeal: false, dispatchSink: false }),
+        /Stage ledger not found/i,
+      );
+      await assert.rejects(
+        () => materializeManifest({ dataDir: ledgerData, workflow: "sw_dev", repoRoot: ledgerRepo, phase: "closed", deferSeal: true, dispatchSink: false }),
+        /Stage ledger not found/i,
+      );
+      const missingLedgerSeal = await sealManifest({ dataDir: ledgerData, workflow: "sw_dev", repoRoot: ledgerRepo });
+      assert.equal(missingLedgerSeal.ok, false);
+      assert.equal(missingLedgerSeal.exitCode, 1);
+      assert.match(missingLedgerSeal.error ?? "", /Stage ledger not found/i);
+
+      const cliMissingLedger = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", ledgerData, "--workflow", "sw_dev", "--repo-root", ledgerRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(cliMissingLedger.status, 1);
+      assert.match(cliMissingLedger.stdout, /Stage ledger not found/i);
+
+      // Missing stage_runs table fails closed
+      {
+        const badTblDb = new Database(join(ledgerData, "uwf-stages.db"));
+        badTblDb.exec("CREATE TABLE other_table (id INTEGER PRIMARY KEY);");
+        badTblDb.close();
+      }
+      assert.throws(
+        () => buildManifest({ dataDir: ledgerData, workflow: "sw_dev", repoRoot: ledgerRepo, phase: "closed" }),
+        /missing stage_runs table/i,
+      );
+      rmSync(join(ledgerData, "uwf-stages.db"), { force: true });
+
+      // stage_runs table with zero rows for workflow fails closed
+      {
+        const emptyRowsDb = new Database(join(ledgerData, "uwf-stages.db"));
+        emptyRowsDb.exec(`
+          CREATE TABLE stage_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
+          );
+        `);
+        emptyRowsDb.close();
+      }
+      assert.throws(
+        () => buildManifest({ dataDir: ledgerData, workflow: "sw_dev", repoRoot: ledgerRepo, phase: "closed" }),
+        /no stage_runs records/i,
+      );
+
+      // runner.mjs resume during pending finalization when uwf-stages.db was deleted must fail closed (exit 1) without writing manifest
+      const delLedgerData = join(runRoot, "del-ledger-data");
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Delete ledger before resume", "--adapter", "fake", "--repo-root", ledgerRepo, "--data-dir", delLedgerData, "--defer-seal"],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" }, stdio: "pipe" },
+      );
+      rmSync(join(delLedgerData, "uaw-manifest.json"), { force: true });
+      rmSync(join(delLedgerData, "uwf-stages.db"), { force: true });
+      writeFileSync(join(delLedgerData, "runner-finalize-pending.json"), JSON.stringify({ phase: "closed", defer_seal: true }));
+      const delLedgerResume = spawnSync(
+        process.execPath,
+        [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", ledgerRepo, "--data-dir", delLedgerData, "--defer-seal"],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" } },
+      );
+      assert.equal(delLedgerResume.status, 2, "runner resume with missing uwf-stages.db must fail closed (exit 2)");
+      assert.match(delLedgerResume.stderr ?? "", /No stage records in/i);
+      assert.equal(existsSync(join(delLedgerData, "uaw-manifest.json")), false);
+
+      // stage-complete rejects missing literal outputs, partial multi-output sets, and 0-match globs
+      const missOutRepo = join(runRoot, "miss-out-repo");
+      const missOutData = join(runRoot, "miss-out-data");
+      const missOutDir = join(missOutRepo, "tmp", "workflow-artifacts");
+      mkdirSync(missOutDir, { recursive: true });
+      mkdirSync(missOutData, { recursive: true });
+      const runMissTracker = (args) =>
+        spawnSync(
+          process.execPath,
+          [TRACKER_CLI, ...args, "--workflow", "sw_dev", "--data-dir", missOutData, "--repo-root", missOutRepo, "--skills-root", REPO_ROOT, "--output-path", missOutDir],
+          { cwd: missOutRepo, encoding: "utf8" },
+        );
+      assert.equal(runMissTracker(["init"]).status, 0);
+      const missDb = new Database(join(missOutData, "uwf-stages.db"), { readonly: true });
+      try {
+        // Missing single literal output
+        const scMissLiteral = runMissTracker(["stage-complete", "--stage", "intake"]);
+        assert.notEqual(scMissLiteral.status, 0, "stage-complete must reject missing literal output");
+        assert.match(scMissLiteral.stdout, /declared output missing on disk/i);
+        assert.deepEqual(
+          missDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'intake'").get(),
+          { status: "pending", outputs_json: null },
+        );
+
+        // Partial multi-output stage (issues-review.md present, issues-review.result.json missing)
+        writeFileSync(join(missOutDir, "issues-review.md"), "# Review\nDone\n");
+        const scPartialMulti = runMissTracker(["stage-complete", "--stage", "review"]);
+        assert.notEqual(scPartialMulti.status, 0, "stage-complete must reject missing second declared output");
+        assert.match(scPartialMulti.stdout, /declared output missing on disk/i);
+        assert.deepEqual(
+          missDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'review'").get(),
+          { status: "pending", outputs_json: null },
+        );
+
+        // Glob output with missing directory AND existing empty directory
+        const scMissGlobDir = runMissTracker(["stage-complete", "--stage", "adr"]);
+        assert.notEqual(scMissGlobDir.status, 0, "stage-complete must reject missing glob directory");
+        assert.match(scMissGlobDir.stdout, /matched no files/i);
+        mkdirSync(join(missOutRepo, "docs", "adr"), { recursive: true });
+        writeFileSync(join(missOutRepo, "docs", "adr", "README.md"), "# ADRs\n");
+        const scEmptyGlob = runMissTracker(["stage-complete", "--stage", "adr"]);
+        assert.notEqual(scEmptyGlob.status, 0, "stage-complete must reject 0-match glob directory");
+        assert.match(scEmptyGlob.stdout, /matched no files/i);
+        assert.deepEqual(
+          missDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'adr'").get(),
+          { status: "pending", outputs_json: null },
+        );
+
+        // Skipping adr when globs have no matches still succeeds with empty outputs_json="[]"
+        const skipAdr = runMissTracker(["stage-skip", "--stage", "adr"]);
+        assert.equal(skipAdr.status, 0, skipAdr.stderr || skipAdr.stdout);
+        assert.deepEqual(
+          missDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'adr'").get(),
+          { status: "skipped", outputs_json: "[]" },
+        );
+      } finally {
+        missDb.close();
+      }
+
+      // captureStageOutputs throws directly on missing literal and 0-match glob
+      assert.throws(
+        () => captureStageOutputs(["{{output_path}}/nonexistent-literal.md"], { outputPath: missOutDir, repoRoot: missOutRepo, skillsRoot: REPO_ROOT }),
+        /Declared output missing on disk/i,
+      );
+      assert.throws(
+        () => captureStageOutputs(["{{cwd}}/docs/adr/ADR-[0-9]*.md"], { outputPath: missOutDir, repoRoot: missOutRepo, skillsRoot: REPO_ROOT }),
+        /matched no files/i,
+      );
+      assert.throws(
+        () => captureStageOutputs(["{{cwd}}/docs/missing-dir/ADR-[0-9]*.md"], { outputPath: missOutDir, repoRoot: missOutRepo, skillsRoot: REPO_ROOT }),
+        /matched no files/i,
       );
     }
   } finally {

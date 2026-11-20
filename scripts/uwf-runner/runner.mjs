@@ -790,7 +790,7 @@ async function stageLoop(ctx) {
           }
           const scErr = sc.data?.error ?? sc.error ?? "stage-complete failed";
           failures = [scErr];
-          prescriptions = [`Replace any symlinked or non-regular stage output with a regular file so stage-complete succeeds (${scErr}).`];
+          prescriptions = [`Ensure all declared stage outputs exist as regular non-symlink files so stage-complete succeeds (${scErr}).`];
           log(`${tag} stage-complete: FAIL — ${scErr}`);
         } else {
           failures = g.data?.failures ?? [g.error];
