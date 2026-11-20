@@ -531,11 +531,8 @@ function assertWorkflowMatchesMeta(requestedWorkflow, persistedWorkflow, toolNam
   }
 }
 
-const STATE_DEFAULT_ARTIFACT_PATH = "./tmp/workflow-artifacts";
-
 function resolveStateArtifactPath(raw, repoRoot) {
-  // Treat state.mjs schema placeholder as unset so raw CLI init defaults don't hijack per-run isolation.
-  if (typeof raw !== "string" || !raw.trim() || raw === STATE_DEFAULT_ARTIFACT_PATH) return null;
+  if (typeof raw !== "string" || !raw.trim()) return null;
   return isAbsolute(raw) ? raw : resolve(repoRoot, raw);
 }
 

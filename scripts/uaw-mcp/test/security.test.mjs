@@ -2247,27 +2247,98 @@ setTimeout(() => {}, 30000);
       assert.equal(okSecret.isError, false, `${label}: ${okSecret.structuredContent?.error ?? ""}`);
     }
 
-    // Schema placeholder './tmp/workflow-artifacts' in uwf-state.db (when run-meta.json is absent) must not block explicit output_path
-    const placeholderData = join(regWs.repoRoot, "placeholder-db-data");
-    mkdirSync(placeholderData, { recursive: true });
+    // Relative './tmp/workflow-artifacts' persisted by direct runner.mjs runs (without run-meta.json)
+    // must resolve against repo_root across all MCP tools rather than falling back to <data_dir>/workflow-artifacts.
+    const directRunnerData = join(regWs.repoRoot, "direct-runner-db-data");
+    const expectedDirectOut = join(regWs.repoRoot, "tmp", "workflow-artifacts");
+    mkdirSync(directRunnerData, { recursive: true });
+    mkdirSync(expectedDirectOut, { recursive: true });
     {
-      const phDb = new Database(join(placeholderData, "uwf-state.db"));
+      const phDb = new Database(join(directRunnerData, "uwf-state.db"));
       phDb.exec("CREATE TABLE workflow_state (id INTEGER PRIMARY KEY, phase TEXT, mode TEXT, status TEXT, current_agent TEXT, artifact_path TEXT, ready_for_implementation INTEGER);");
       phDb.exec("INSERT INTO workflow_state (id, phase, status, artifact_path, ready_for_implementation) VALUES (1, 'idea', 'idle', './tmp/workflow-artifacts', 0);");
       phDb.close();
     }
-    const okPlaceholderRun = await regHandler.callTool("uaw_run", {
+    const directDefaultDryRun = await regHandler.callTool("uaw_run", {
       workflow: "mcp_fixture",
-      goal: "Schema placeholder in DB must be treated as unset",
+      goal: "Resolve persisted './tmp/workflow-artifacts' against repo_root",
       adapter: "fake",
       fake_fixture_dir: secretFx,
-      data_dir: placeholderData,
-      output_path: secretOut,
+      data_dir: directRunnerData,
       repo_root: regWs.repoRoot,
       skills_root: regWs.skillsRoot,
       dry_run: true,
     });
-    assert.equal(okPlaceholderRun.isError, false, okPlaceholderRun.structuredContent?.error ?? "");
+    assert.equal(directDefaultDryRun.isError, false, directDefaultDryRun.structuredContent?.error ?? "");
+    assert.equal(
+      directDefaultDryRun.structuredContent.output_path,
+      realpathSync(expectedDirectOut),
+      "uaw_run without output_path must adopt repo_root/tmp/workflow-artifacts from uwf-state.db",
+    );
+    const directExplicitMatch = await regHandler.callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      goal: "Accept explicit matching repo_root/tmp/workflow-artifacts",
+      adapter: "fake",
+      fake_fixture_dir: secretFx,
+      data_dir: directRunnerData,
+      output_path: expectedDirectOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+      dry_run: true,
+    });
+    assert.equal(directExplicitMatch.isError, false, directExplicitMatch.structuredContent?.error ?? "");
+
+    for (const [label, invoke] of [
+      ["uaw_run dry_run=true", () => regHandler.callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Reject mismatch against direct runner default",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: directRunnerData,
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+        dry_run: true,
+      })],
+      ["uaw_resume", () => regHandler.callTool("uaw_resume", {
+        workflow: "mcp_fixture",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: directRunnerData,
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_stage_transition", () => regHandler.callTool("uaw_stage_transition", {
+        data_dir: directRunnerData,
+        target: "stage",
+        action: "init",
+        workflow: "mcp_fixture",
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_gates", () => regHandler.callTool("uaw_gates", {
+        data_dir: directRunnerData,
+        workflow: "mcp_fixture",
+        mode: "list",
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_cost", () => regHandler.callTool("uaw_cost", {
+        data_dir: directRunnerData,
+        workflow: "mcp_fixture",
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+    ]) {
+      const directMismatch = await invoke();
+      assert.equal(directMismatch.isError, true, `${label} must reject mismatch against './tmp/workflow-artifacts'`);
+      assert.equal(directMismatch.structuredContent.exit_code, 2, `${label} exit_code`);
+      assert.match(directMismatch.structuredContent.error, /output_path.*does not match persisted output_path/i);
+    }
 
     // Corrupt and symlinked uwf-state.db must fail closed when run-meta.json is absent; force=true uaw_run skips corrupt DB read
     for (const sidecar of ["", "-wal", "-shm", "-journal"]) {
