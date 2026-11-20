@@ -14,8 +14,8 @@
  * Also used by the runner: attemptUsage() (one transcript) and listTranscripts() (all transcripts in a data dir).
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { materializePrompt } from "./prompt.mjs";
 
 export const AVG_LIMIT = 50_000;
@@ -83,11 +83,35 @@ function referencedChars(skillsRoot, systemPrompt) {
 
 export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outputPath }) {
   const dir = join(dataDir, "transcripts");
-  if (!existsSync(dir)) throw new Error(`No transcripts directory at ${dir}`);
+  let dirStat;
+  try {
+    dirStat = lstatSync(dir);
+  } catch {
+    throw new Error(`No transcripts directory at ${dir}`);
+  }
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+    throw new Error(`Invalid transcripts directory at ${dir}`);
+  }
+  const realDir = realpathSync(dir);
   const rows = [];
   for (const f of readdirSync(dir).filter((x) => x.endsWith(".json")).sort()) {
+    const full = join(dir, f);
+    let lst;
+    try {
+      lst = lstatSync(full);
+    } catch {
+      continue;
+    }
+    if (lst.isSymbolicLink() || !lst.isFile()) continue;
+    let realFull;
+    try {
+      realFull = realpathSync(full);
+    } catch {
+      continue;
+    }
+    if (!realFull.startsWith(realDir + sep)) continue;
     let t;
-    try { t = JSON.parse(readFileSync(join(dir, f), "utf8")); } catch { continue; }
+    try { t = JSON.parse(readFileSync(realFull, "utf8")); } catch { continue; }
     const row = transcriptRow(f, t);
     if (row) rows.push(row);
   }

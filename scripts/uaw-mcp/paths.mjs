@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export class UsageError extends Error {
   constructor(message) {
@@ -201,13 +201,32 @@ export function registerRunIndex(stateDir, meta) {
     );
   }
   const idxPath = runIndexPath(stateDir, meta.run_id);
-  mkdirSync(dirname(idxPath), { recursive: true });
+  const runsDir = dirname(idxPath);
+  mkdirSync(runsDir, { recursive: true });
   const tmpPath = `${idxPath}.${process.pid}.${Date.now()}.tmp`;
   try {
     writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
     renameSync(tmpPath, idxPath);
   } finally {
     rmSync(tmpPath, { force: true });
+  }
+  const canonicalDataDir = canonicalizePath(meta.data_dir);
+  const currentName = basename(idxPath);
+  for (const name of readdirSync(runsDir).filter((f) => f.endsWith(".json"))) {
+    if (name === currentName) continue;
+    const otherPath = join(runsDir, name);
+    try {
+      const parsed = JSON.parse(readFileSync(otherPath, "utf8"));
+      if (
+        parsed?.data_dir &&
+        parsed?.run_id !== meta.run_id &&
+        canonicalizePath(parsed.data_dir) === canonicalDataDir
+      ) {
+        rmSync(otherPath, { force: true });
+      }
+    } catch {
+      /* ignore corrupt sibling index entry */
+    }
   }
   return idxPath;
 }
@@ -231,7 +250,15 @@ export function listRegisteredRuns(stateDir) {
   for (const name of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
     try {
       const parsed = JSON.parse(readFileSync(join(dir, name), "utf8"));
-      if (parsed?.run_id && parsed?.data_dir) runs.push(parsed);
+      if (parsed?.run_id && parsed?.data_dir) {
+        try {
+          const liveMeta = readRunMeta(parsed.data_dir);
+          if (liveMeta?.run_id && liveMeta.run_id !== parsed.run_id) continue;
+        } catch {
+          continue;
+        }
+        runs.push(parsed);
+      }
     } catch {
       /* ignore corrupt index entry */
     }

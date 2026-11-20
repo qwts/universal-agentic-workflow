@@ -10,13 +10,14 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SECRET_PATTERNS } from "../../hooks/secret-patterns.mjs";
 import { claimDataDirLock } from "../ownership.mjs";
-import { assertAllowedPath, lookupRunById, readRunMeta, registerRunIndex, writeRunMeta } from "../paths.mjs";
+import { assertAllowedPath, listRegisteredRuns, lookupRunById, readRunMeta, registerRunIndex, writeRunMeta } from "../paths.mjs";
 import { createMcpHandler, MCP_PROTOCOL_VERSION } from "../protocol.mjs";
 import { isOriginAllowed, startHttpServer } from "../server.mjs";
 
@@ -475,6 +476,107 @@ try {
     data_dir: transDataA,
   });
   assert.equal(allowedList.isError, false, allowedList.structuredContent?.error ?? "");
+
+  // 13. uaw_cost skips transcript symlinks escaping root and non-regular FIFOs during costReport
+  const costSecDir = join(safeRepo, "cost-sec-dir");
+  mkdirSync(join(costSecDir, "transcripts"), { recursive: true });
+  writeRunMeta(costSecDir, {
+    run_id: "uaw-cost-sec",
+    workflow: "sw_dev",
+    data_dir: costSecDir,
+    output_path: transOutA,
+    repo_root: safeRepo,
+  });
+  writeFileSync(
+    join(costSecDir, "transcripts", "0001-intake.json"),
+    JSON.stringify({
+      prompt: "Run the intake stage for the test fixture.",
+      stdout: JSON.stringify({
+        num_turns: 2,
+        total_cost_usd: 0.05,
+        usage: {
+          input_tokens: 100,
+          cache_read_input_tokens: 50,
+          cache_creation_input_tokens: 20,
+          output_tokens: 30,
+        },
+      }),
+    }),
+    "utf8",
+  );
+  symlinkSync("/etc/hosts", join(costSecDir, "transcripts", "evil-link.json"));
+  try {
+    execFileSync("mkfifo", [join(costSecDir, "transcripts", "hang-pipe.json")], { stdio: "ignore" });
+  } catch {
+    /* mkfifo unavailable on platform; symlink test still exercises lstat/realpath */
+  }
+  const costSecRes = await handler.callTool("uaw_cost", {
+    data_dir: costSecDir,
+    workflow: "sw_dev",
+    repo_root: safeRepo,
+    skills_root: safeRepo,
+  });
+  assert.equal(costSecRes.isError, false, costSecRes.structuredContent?.error ?? "");
+  assert.equal(costSecRes.structuredContent.ok, true);
+  assert.equal(costSecRes.structuredContent.stages.length, 1);
+  assert.equal(typeof costSecRes.structuredContent.report, "string");
+  assert.match(costSecRes.structuredContent.report, /intake/);
+
+  // 14. uaw_run force=true generating a new run_id retires the superseded <stateDir>/runs index entry
+  const forceDataDir = join(safeRepo, "force-retire-data");
+  const forceOutDir = join(safeRepo, "force-out-sub");
+  const forceFxDir = join(safeRepo, "fx-force");
+  mkdirSync(forceFxDir, { recursive: true });
+  writeFileSync(
+    join(forceFxDir, "intake.json"),
+    JSON.stringify({
+      files: { "force-out-sub/out.md": "# Forced output\n" },
+      transcript: "ok",
+      sessionId: "sess-force-retire",
+    }),
+    "utf8",
+  );
+  const run1 = await handler.callTool("uaw_run", {
+    workflow: "sw_dev",
+    goal: "Initial run before force rotation",
+    adapter: "fake",
+    fake_fixture_dir: forceFxDir,
+    data_dir: forceDataDir,
+    output_path: forceOutDir,
+    repo_root: safeRepo,
+    skills_root: safeRepo,
+  });
+  assert.equal(run1.structuredContent.exit_code, 0, run1.structuredContent.stderr);
+  const firstRunId = run1.structuredContent.run_id;
+  assert.ok(listRegisteredRuns(stateDir).some((r) => r.run_id === firstRunId));
+
+  const run2 = await handler.callTool("uaw_run", {
+    workflow: "sw_dev",
+    goal: "Forced replacement run",
+    adapter: "fake",
+    fake_fixture_dir: forceFxDir,
+    data_dir: forceDataDir,
+    output_path: forceOutDir,
+    repo_root: safeRepo,
+    skills_root: safeRepo,
+    force: true,
+  });
+  assert.equal(run2.structuredContent.exit_code, 0, run2.structuredContent.stderr);
+  const secondRunId = run2.structuredContent.run_id;
+  assert.notEqual(secondRunId, firstRunId);
+  assert.equal(lookupRunById(stateDir, firstRunId), null, "superseded run_id index entry must be deleted");
+  assert.equal(lookupRunById(stateDir, secondRunId)?.data_dir, forceDataDir);
+  const listedAfterForce = await handler.handleJsonRpc({ jsonrpc: "2.0", id: 98, method: "resources/list", params: {} });
+  const listedUris = listedAfterForce.result.resources.map((r) => r.uri);
+  assert.equal(listedUris.some((u) => u.includes(firstRunId)), false, "stale run_id URI must not appear in resources/list");
+  assert.ok(listedUris.includes(`uaw://${secondRunId}/state`), "new run_id state URI must appear in resources/list");
+  const readNewState = await handler.handleJsonRpc({
+    jsonrpc: "2.0",
+    id: 99,
+    method: "resources/read",
+    params: { uri: `uaw://${secondRunId}/state` },
+  });
+  assert.equal(readNewState.error, undefined);
 
   const srv = await startHttpServer({
     host: "127.0.0.1",
