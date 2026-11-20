@@ -124,16 +124,73 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
       }
       const key = req.headers["idempotency-key"];
       const sig = req.headers["x-uaw-signature-256"];
-      received.push({ url: req.url, key, sig, auth: req.headers["authorization"], body });
+      received.push({
+        url: req.url,
+        key,
+        sig,
+        auth: req.headers["authorization"],
+        accept: req.headers["accept"],
+        sessionId: req.headers["mcp-session-id"] ?? null,
+        body,
+      });
       if (key && !dedupStore.has(key)) {
         dedupStore.set(key, body);
       }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      if (req.url === "/mcp") {
+      if (req.url === "/mcp-session") {
+        const accept = String(req.headers["accept"] ?? "");
+        if (!accept.includes("application/json") || !accept.includes("text/event-stream")) {
+          res.writeHead(406, { "Content-Type": "text/plain" });
+          res.end("Not Acceptable: must accept application/json and text/event-stream");
+          return;
+        }
         const rpcReq = JSON.parse(body);
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, result: { ok: true, deduplicated: dedupStore.size } }));
+        if (rpcReq.method === "initialize") {
+          dedupStore.set("mcp-session:hub-sess-42", { initialized: false });
+          res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": "hub-sess-42" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id: rpcReq.id,
+            result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "session-hub", version: "1.0.0" } },
+          }));
+          return;
+        }
+        const sid = req.headers["mcp-session-id"];
+        const sessState = dedupStore.get(`mcp-session:${sid}`);
+        if (!sessState) {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end("Missing or unknown Mcp-Session-Id");
+          return;
+        }
+        if (rpcReq.method === "notifications/initialized" && !Object.hasOwn(rpcReq, "id")) {
+          sessState.initialized = true;
+          res.writeHead(202, { "Mcp-Session-Id": sid });
+          res.end();
+          return;
+        }
+        if (!sessState.initialized) {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end("MCP session not initialized");
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": sid });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, result: { ok: true, session: sid } }));
         return;
       }
+      if (req.url === "/mcp") {
+        const rpcReq = JSON.parse(body);
+        if (!Object.hasOwn(rpcReq, "id")) {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        const result = rpcReq.method === "initialize"
+          ? { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "mock-hub", version: "1.0.0" } }
+          : { ok: true, deduplicated: dedupStore.size };
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, result }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, deduplicated: dedupStore.size }));
     });
   });
@@ -220,12 +277,42 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
     });
     assert.equal(mcpHttpRes.ok, true);
     assert.equal(mcpHttpRes.status, "delivered");
-    const mcpWire = received.find((r) => r.url === "/mcp");
-    const parsedRpc = JSON.parse(mcpWire.body);
+    const mcpWires = received.filter((r) => r.url === "/mcp");
+    assert.deepEqual(
+      mcpWires.map((w) => JSON.parse(w.body).method),
+      ["initialize", "notifications/initialized", "tools/call"],
+      "HTTP MCP sink must perform initialize -> notifications/initialized -> tools/call handshake",
+    );
+    assert.equal(mcpWires[0].key, undefined, "initialize must not carry Idempotency-Key");
+    assert.equal(mcpWires[1].key, undefined, "notifications/initialized must not carry Idempotency-Key");
+    assert.equal(mcpWires[2].key, expectedKey);
+    const parsedRpc = JSON.parse(mcpWires[2].body);
     assert.equal(parsedRpc.method, "tools/call");
     assert.equal(parsedRpc.params.name, "context_hub.ingest_manifest");
     assert.equal(parsedRpc.params.arguments.idempotency_key, expectedKey);
-    assert.equal(mcpWire.auth, `Bearer ${HUB_SECRET}`);
+    assert.equal(mcpWires[2].auth, `Bearer ${HUB_SECRET}`);
+
+    const mcpSessionRes = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "mcp",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/mcp-session`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "strict",
+      },
+      baseDelayMs: 5,
+    });
+    assert.equal(mcpSessionRes.ok, true, mcpSessionRes.error ?? "");
+    assert.equal(mcpSessionRes.status, "delivered");
+    assert.equal(mcpSessionRes.response?.session, "hub-sess-42");
+    const sessWires = received.filter((r) => r.url === "/mcp-session");
+    assert.deepEqual(
+      sessWires.map((w) => [JSON.parse(w.body).method, w.sessionId]),
+      [
+        ["initialize", null],
+        ["notifications/initialized", "hub-sess-42"],
+        ["tools/call", "hub-sess-42"],
+      ],
+    );
 
     const mcpCalls = [];
     const mcpClientRes = await dispatchToContextHub(baseEnvelope, {

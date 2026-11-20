@@ -17,6 +17,9 @@ import { redactSecrets } from "../hooks/secret-patterns.mjs";
 
 const VALID_SINKS = new Set(["none", "mcp", "webhook"]);
 const VALID_MODES = new Set(["best_effort", "strict"]);
+const MCP_PROTOCOL_VERSION = "2025-03-26";
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
+const MCP_ACCEPT_HEADER = "application/json, text/event-stream";
 
 // ---------------------------------------------------------------------------
 // RFC 8785 JSON Canonicalization Scheme (JCS) & Hashing
@@ -228,7 +231,7 @@ function validateMcpPayload(parsed, token, { requireJsonRpcResult = false } = {}
   return toolResult;
 }
 
-async function parseMcpHttpResponse(res, token) {
+async function parseMcpHttpResponse(res, token, { expectedId = null } = {}) {
   const contentType = String(res.headers?.get?.("content-type") ?? "").toLowerCase();
   let parsed;
   if (typeof res.text === "function") {
@@ -245,11 +248,18 @@ async function parseMcpHttpResponse(res, token) {
       if (dataLines.length === 0) {
         throw new Error("Empty SSE stream response from MCP sink");
       }
-      try {
-        parsed = JSON.parse(dataLines[dataLines.length - 1]);
-      } catch {
-        throw new Error("Invalid JSON in MCP SSE response");
+      const parsedMessages = [];
+      for (const line of dataLines) {
+        try {
+          parsedMessages.push(JSON.parse(line));
+        } catch {
+          throw new Error("Invalid JSON in MCP SSE response");
+        }
       }
+      parsed =
+        (expectedId !== null
+          ? parsedMessages.findLast((m) => m && typeof m === "object" && m.id === expectedId)
+          : null) ?? parsedMessages[parsedMessages.length - 1];
     } else {
       try {
         parsed = JSON.parse(rawText);
@@ -262,7 +272,72 @@ async function parseMcpHttpResponse(res, token) {
   } else {
     throw new Error("Unreadable response object from MCP sink");
   }
-  return validateMcpPayload(parsed, token, { requireJsonRpcResult: true });
+  const validated = validateMcpPayload(parsed, token, { requireJsonRpcResult: true });
+  if (expectedId !== null && Object.hasOwn(parsed, "id") && parsed.id !== expectedId) {
+    throw new Error(`MCP JSON-RPC response id mismatch (expected ${expectedId}, got ${parsed.id})`);
+  }
+  return validated;
+}
+
+function isRetryableClientStatus(status) {
+  return status === 408 || status === 425 || status === 429;
+}
+
+function extractMcpSessionId(headers) {
+  const raw =
+    headers?.get?.("mcp-session-id") ??
+    headers?.["mcp-session-id"] ??
+    headers?.["Mcp-Session-Id"] ??
+    null;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || /[\r\n]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+async function sendMcpHttpStep(
+  fetchImpl,
+  targetUrl,
+  { headers, body, timeoutMs, token, expectJsonRpcResult, expectedId = null },
+) {
+  const res = await fetchImpl(targetUrl, {
+    method: "POST",
+    headers,
+    body,
+    redirect: "error",
+    ...(typeof AbortSignal?.timeout === "function" ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+  });
+  const sessionId = extractMcpSessionId(res.headers);
+  if (!res.ok) {
+    const respText = typeof res.text === "function" ? (await res.text()).slice(0, 200) : "";
+    const err = new Error(sanitizeError(`HTTP ${res.status}${respText ? `: ${respText}` : ""}`, token));
+    // Do not retry non-transient 4xx client errors.
+    if (res.status >= 400 && res.status < 500 && !isRetryableClientStatus(res.status)) err.noRetry = true;
+    throw err;
+  }
+  if (expectJsonRpcResult) {
+    const payload = await parseMcpHttpResponse(res, token, { expectedId });
+    return { res, payload, sessionId };
+  }
+  const contentType = String(res.headers?.get?.("content-type") ?? "").toLowerCase();
+  if (contentType.includes("text/event-stream")) {
+    await res.body?.cancel?.().catch(() => {});
+  } else if (typeof res.text === "function") {
+    const rawText = (await res.text()).trim();
+    if (rawText) {
+      try {
+        const parsed = JSON.parse(rawText);
+        if (parsed && typeof parsed === "object" && parsed.error) {
+          validateMcpPayload(parsed, token, { requireJsonRpcResult: false });
+        }
+      } catch (err) {
+        if (!(err instanceof SyntaxError)) {
+          throw err;
+        }
+      }
+    }
+  }
+  return { res, payload: null, sessionId };
 }
 
 // ---------------------------------------------------------------------------
@@ -370,22 +445,27 @@ export async function dispatchToContextHub(
         throw new Error("Fetch API is unavailable in this Node runtime");
       }
 
-      const headers = {
-        "Content-Type": "application/json",
-        "Idempotency-Key": idempotencyKey,
-      };
-
-      let bodyToSend = canonicalBody;
-      if (cfg.sink === "webhook") {
-        if (!cfg.token || !cfg.token.trim()) {
-          throw new Error("UAW_CONTEXT_HUB_TOKEN is required when UAW_CONTEXT_HUB_SINK=webhook");
-        }
-        headers["X-UAW-Signature-256"] = signWebhookPayload(canonicalBody, cfg.token);
-      } else if (cfg.sink === "mcp") {
-        if (cfg.token) {
-          headers["Authorization"] = `Bearer ${cfg.token}`;
-        }
-        bodyToSend = canonicalizeJcs({
+      if (cfg.sink === "mcp") {
+        const baseHeaders = {
+          "Content-Type": "application/json",
+          Accept: MCP_ACCEPT_HEADER,
+          ...(cfg.token ? { Authorization: `Bearer ${cfg.token}` } : {}),
+        };
+        const initBody = canonicalizeJcs({
+          jsonrpc: "2.0",
+          id: `init-${idempotencyKey}`,
+          method: "initialize",
+          params: {
+            protocolVersion: MCP_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "uaw-context-hub-sink", version: "1.0.0" },
+          },
+        });
+        const notifBody = canonicalizeJcs({
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+        });
+        const callBody = canonicalizeJcs({
           jsonrpc: "2.0",
           id: idempotencyKey,
           method: "tools/call",
@@ -394,23 +474,60 @@ export async function dispatchToContextHub(
             arguments: scrubbedEnvelope,
           },
         });
-      }
 
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        attempts = attempt;
-        try {
-          const res = await fetchImpl(targetUrl, {
-            method: "POST",
-            headers,
-            body: bodyToSend,
-            redirect: "error",
-            ...(typeof AbortSignal?.timeout === "function" ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
-          });
-          if (res.ok) {
-            let responsePayload = null;
-            if (cfg.sink === "mcp") {
-              responsePayload = await parseMcpHttpResponse(res, cfg.token);
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          attempts = attempt;
+          try {
+            const initId = `init-${idempotencyKey}`;
+            const initStep = await sendMcpHttpStep(fetchImpl, targetUrl, {
+              headers: baseHeaders,
+              body: initBody,
+              timeoutMs,
+              token: cfg.token,
+              expectJsonRpcResult: true,
+              expectedId: initId,
+            });
+            const serverVersion = initStep.payload?.protocolVersion;
+            if (typeof serverVersion === "string") {
+              const trimmedVer = serverVersion.trim();
+              if (!SUPPORTED_MCP_PROTOCOL_VERSIONS.has(trimmedVer) || /[\r\n]/.test(trimmedVer)) {
+                const err = new Error(`Unsupported MCP protocolVersion from sink: "${trimmedVer}"`);
+                err.noRetry = true;
+                throw err;
+              }
             }
+            const negotiatedVersion =
+              typeof serverVersion === "string" ? serverVersion.trim() : MCP_PROTOCOL_VERSION;
+            let sessionId = initStep.sessionId;
+
+            const notifHeaders = {
+              ...baseHeaders,
+              "MCP-Protocol-Version": negotiatedVersion,
+              ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+            };
+            const notifStep = await sendMcpHttpStep(fetchImpl, targetUrl, {
+              headers: notifHeaders,
+              body: notifBody,
+              timeoutMs,
+              token: cfg.token,
+              expectJsonRpcResult: false,
+            });
+            sessionId = notifStep.sessionId ?? sessionId;
+
+            const callHeaders = {
+              ...baseHeaders,
+              "MCP-Protocol-Version": negotiatedVersion,
+              "Idempotency-Key": idempotencyKey,
+              ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+            };
+            const callStep = await sendMcpHttpStep(fetchImpl, targetUrl, {
+              headers: callHeaders,
+              body: callBody,
+              timeoutMs,
+              token: cfg.token,
+              expectJsonRpcResult: true,
+              expectedId: idempotencyKey,
+            });
             return {
               ok: true,
               status: "delivered",
@@ -418,19 +535,56 @@ export async function dispatchToContextHub(
               attempts,
               strict,
               exitCode: 0,
-              http_status: res.status,
-              ...(responsePayload !== null ? { response: responsePayload } : {}),
+              http_status: callStep.res.status,
+              ...(callStep.payload !== null ? { response: callStep.payload } : {}),
             };
+          } catch (err) {
+            lastError = sanitizeError(err, cfg.token);
+            if (err?.noRetry) break;
           }
-          const respText = typeof res.text === "function" ? (await res.text()).slice(0, 200) : "";
-          lastError = sanitizeError(`HTTP ${res.status}${respText ? `: ${respText}` : ""}`, cfg.token);
-          // Do not retry non-429 4xx client errors.
-          if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
-        } catch (err) {
-          lastError = sanitizeError(err, cfg.token);
-          if (err?.noRetry) break;
+          if (attempt < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempt - 1));
         }
-        if (attempt < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempt - 1));
+      } else {
+        if (!cfg.token || !cfg.token.trim()) {
+          throw new Error("UAW_CONTEXT_HUB_TOKEN is required when UAW_CONTEXT_HUB_SINK=webhook");
+        }
+        const headers = {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+          "X-UAW-Signature-256": signWebhookPayload(canonicalBody, cfg.token),
+        };
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          attempts = attempt;
+          try {
+            const res = await fetchImpl(targetUrl, {
+              method: "POST",
+              headers,
+              body: canonicalBody,
+              redirect: "error",
+              ...(typeof AbortSignal?.timeout === "function" ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+            });
+            if (res.ok) {
+              return {
+                ok: true,
+                status: "delivered",
+                idempotency_key: idempotencyKey,
+                attempts,
+                strict,
+                exitCode: 0,
+                http_status: res.status,
+              };
+            }
+            const respText = typeof res.text === "function" ? (await res.text()).slice(0, 200) : "";
+            lastError = sanitizeError(`HTTP ${res.status}${respText ? `: ${respText}` : ""}`, cfg.token);
+            // Do not retry non-transient 4xx client errors.
+            if (res.status >= 400 && res.status < 500 && !isRetryableClientStatus(res.status)) break;
+          } catch (err) {
+            lastError = sanitizeError(err, cfg.token);
+            if (err?.noRetry) break;
+          }
+          if (attempt < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempt - 1));
+        }
       }
     }
   } catch (err) {

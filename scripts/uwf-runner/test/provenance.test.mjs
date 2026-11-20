@@ -578,6 +578,25 @@ try {
     );
     const sealedManifest = JSON.parse(readFileSync(join(runData, "uaw-manifest.json"), "utf8"));
     assert.equal(sealedManifest.phase, "sealed");
+
+    // Step L: provenance.mjs seal without --output-path or --workflow reuses run-meta.json (./tmp/workflow-artifacts)
+    assert.equal(existsSync(join(runData, "workflow-artifacts")), false);
+    const drsAbs = join(runRoot, "tmp", "workflow-artifacts", "issues-drs.json");
+    const brAbs = join(runRoot, "tmp", "workflow-artifacts", "issues-br.json");
+    const changelogAbs = join(runRoot, "tmp", "workflow-artifacts", "uwf-changelog.md");
+    execFileSync(
+      process.execPath,
+      [PROVENANCE_CLI, "seal", "--data-dir", runData, "--repo-root", runRoot],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const cliSealedManifest = JSON.parse(readFileSync(join(runData, "uaw-manifest.json"), "utf8"));
+    assert.equal(cliSealedManifest.phase, "sealed");
+    assert.equal(cliSealedManifest.architecture.drs?.path, "tmp/workflow-artifacts/issues-drs.json");
+    assert.equal(cliSealedManifest.architecture.drs?.sha256, sha256Hex(readFileSync(drsAbs)));
+    assert.equal(cliSealedManifest.architecture.br?.path, "tmp/workflow-artifacts/issues-br.json");
+    assert.equal(cliSealedManifest.architecture.br?.sha256, sha256Hex(readFileSync(brAbs)));
+    assert.equal(cliSealedManifest.architecture.changelog_snapshot?.path, "tmp/workflow-artifacts/uwf-changelog.md");
+    assert.equal(cliSealedManifest.architecture.changelog_snapshot?.sha256, sha256Hex(readFileSync(changelogAbs)));
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

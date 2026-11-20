@@ -28,7 +28,6 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -809,31 +808,66 @@ function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
 // Architecture Strata (DRS, BR, Changelog [SNAPSHOT])
 // ---------------------------------------------------------------------------
 
+function assertSafeIdentifierSegment(value, label) {
+  const s = String(value ?? "");
+  if (!s || s === "." || s === ".." || /[\\/]/.test(s) || !/^[A-Za-z0-9._-]+$/.test(s)) {
+    throw new Error(`Unsafe ${label} identifier: "${s}"`);
+  }
+  return s;
+}
+
 function resolveArtifactPrefix(workflow, skillsRoot, repoRoot) {
+  const safeWorkflow = assertSafeIdentifierSegment(workflow, "workflow");
   const yaml = loadYamlLib();
   const candidates = [
-    skillsRoot ? join(skillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml") : null,
-    join(repoRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml"),
-    join(SKILLS_DIR, `uwf-${workflow}`, "stages.yaml"),
+    skillsRoot ? join(skillsRoot, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml") : null,
+    join(repoRoot, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml"),
+    join(SKILLS_DIR, `uwf-${safeWorkflow}`, "stages.yaml"),
   ].filter(Boolean);
   for (const p of candidates) {
     if (existsSync(p)) {
       try {
         const doc = yaml.load(readFileSync(p, "utf8"));
-        if (doc?.artifact_prefix) return String(doc.artifact_prefix);
+        if (doc?.artifact_prefix) {
+          return assertSafeIdentifierSegment(doc.artifact_prefix, "artifact_prefix");
+        }
       } catch { /* try next */ }
     }
   }
   return "issues";
 }
 
+function resolveContainedRegularFile(absOut, realOut, relName) {
+  if (!realOut) return null;
+  const candidate = join(absOut, relName);
+  try {
+    const st = lstatSync(candidate);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    const realFile = realpathSync(candidate);
+    if (!isInsideOrEqual(realFile, realOut)) return null;
+    return { absPath: candidate, realPath: realFile };
+  } catch {
+    return null;
+  }
+}
+
 function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
+  const safePrefix = assertSafeIdentifierSegment(artifactPrefix, "artifact_prefix");
   const absOut = isAbsolute(outputPath) ? outputPath : resolve(repoRoot, outputPath);
+  let realOut = null;
+  try {
+    const outStat = lstatSync(absOut);
+    if (!outStat.isSymbolicLink() && outStat.isDirectory()) {
+      realOut = realpathSync(absOut);
+    }
+  } catch {
+    realOut = null;
+  }
 
   let drs = null;
-  const drsAbs = join(absOut, `${artifactPrefix}-drs.json`);
-  if (existsSync(drsAbs) && statSync(drsAbs).isFile()) {
-    const raw = readFileSync(drsAbs);
+  const drsFile = resolveContainedRegularFile(absOut, realOut, `${safePrefix}-drs.json`);
+  if (drsFile) {
+    const raw = readFileSync(drsFile.realPath);
     const sha256 = sha256Hex(raw);
     try {
       const parsed = scrubDeep(JSON.parse(raw.toString("utf8")));
@@ -842,7 +876,7 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
       const gapLog = Array.isArray(parsed.gap_log) ? parsed.gap_log : [];
       const divergenceLog = Array.isArray(parsed.divergence_log) ? parsed.divergence_log : [];
       drs = {
-        path: normalizeArtifactPath(drsAbs, repoRoot),
+        path: normalizeArtifactPath(drsFile.absPath, repoRoot),
         sha256,
         schema_version: parsed.schema_version ?? null,
         summary: {
@@ -856,7 +890,7 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
       };
     } catch {
       drs = {
-        path: normalizeArtifactPath(drsAbs, repoRoot),
+        path: normalizeArtifactPath(drsFile.absPath, repoRoot),
         sha256,
         schema_version: null,
         summary: {
@@ -872,9 +906,9 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
   }
 
   let br = null;
-  const brAbs = join(absOut, `${artifactPrefix}-br.json`);
-  if (existsSync(brAbs) && statSync(brAbs).isFile()) {
-    const raw = readFileSync(brAbs);
+  const brFile = resolveContainedRegularFile(absOut, realOut, `${safePrefix}-br.json`);
+  if (brFile) {
+    const raw = readFileSync(brFile.realPath);
     const sha256 = sha256Hex(raw);
     try {
       const parsed = scrubDeep(JSON.parse(raw.toString("utf8")));
@@ -894,14 +928,14 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
         });
       }
       br = {
-        path: normalizeArtifactPath(brAbs, repoRoot),
+        path: normalizeArtifactPath(brFile.absPath, repoRoot),
         sha256,
         schema_version: parsed.version ?? parsed.schema_version ?? null,
         strata: strataOut,
       };
     } catch {
       br = {
-        path: normalizeArtifactPath(brAbs, repoRoot),
+        path: normalizeArtifactPath(brFile.absPath, repoRoot),
         sha256,
         schema_version: null,
         strata: {},
@@ -910,9 +944,9 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
   }
 
   let changelogSnapshot = null;
-  const changelogAbs = join(absOut, "uwf-changelog.md");
-  if (existsSync(changelogAbs) && statSync(changelogAbs).isFile()) {
-    const raw = readFileSync(changelogAbs);
+  const changelogFile = resolveContainedRegularFile(absOut, realOut, "uwf-changelog.md");
+  if (changelogFile) {
+    const raw = readFileSync(changelogFile.realPath);
     const text = raw.toString("utf8");
     const matches = [...text.matchAll(/^##\s+\[SNAPSHOT\][^\r\n]*/gm)];
     let heading = null;
@@ -927,7 +961,7 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
       entrySha256 = sha256Hex(section.trim());
     }
     changelogSnapshot = {
-      path: normalizeArtifactPath(changelogAbs, repoRoot),
+      path: normalizeArtifactPath(changelogFile.absPath, repoRoot),
       sha256: sha256Hex(raw),
       heading,
       entry_sha256: entrySha256,
@@ -1167,12 +1201,24 @@ function readRoundTrips(dataDir) {
   return byStage;
 }
 
+function readExistingRunMeta(absDataDir) {
+  const metaPath = join(absDataDir, RUN_META_FILE);
+  try {
+    const st = lstatSync(metaPath);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build the complete UAW provenance manifest object (not yet written to disk).
  */
 export function buildManifest({
   dataDir,
-  workflow = "sw_dev",
+  workflow = null,
   repoRoot = OWN_ROOT,
   skillsRoot = null,
   outputPath = null,
@@ -1183,21 +1229,12 @@ export function buildManifest({
   const Database = loadDatabaseCtor();
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
-  const resolvedOutputPath = outputPath ?? join(absDataDir, "workflow-artifacts");
-  const meta = ensureRunMeta(absDataDir, {
-    workflow,
-    outputPath: resolvedOutputPath,
-    repoRoot: absRepoRoot,
-    baseCommitSha: deliverableOverrides.base_commit_sha ?? null,
-  });
-  const runId = meta.run_id;
-
-  const goalPath = join(absDataDir, GOAL_FILE);
-  const goalSha256 = existsSync(goalPath) ? sha256Hex(readFileSync(goalPath)) : null;
+  const existingMeta = readExistingRunMeta(absDataDir);
 
   let modelProfile = null;
   let modelName = null;
-  let startedAt = meta.created_at ?? null;
+  let stateArtifactPath = null;
+  let firstHistTs = null;
   const stateDb = openReadOnly(Database, join(absDataDir, "uwf-state.db"));
   if (stateDb) {
     try {
@@ -1206,16 +1243,40 @@ export function buildManifest({
         if (ws) {
           modelProfile = ws.model_profile ?? null;
           modelName = ws.model_name ?? null;
+          stateArtifactPath = ws.artifact_path ?? null;
         }
       }
       if (tableExists(stateDb, "workflow_history")) {
         const firstHist = stateDb.prepare("SELECT ts FROM workflow_history ORDER BY id ASC LIMIT 1").get();
-        if (firstHist?.ts) startedAt = firstHist.ts;
+        if (firstHist?.ts) firstHistTs = firstHist.ts;
       }
     } finally {
       stateDb.close();
     }
   }
+
+  if (workflow && existingMeta?.workflow && workflow !== existingMeta.workflow) {
+    throw new Error(
+      `Workflow mismatch for ${absDataDir}: run-meta.json records "${existingMeta.workflow}", requested "${workflow}"`,
+    );
+  }
+  const effectiveWorkflow = workflow ?? existingMeta?.workflow ?? "sw_dev";
+  const meta = ensureRunMeta(absDataDir, {
+    workflow: effectiveWorkflow,
+    outputPath: outputPath ?? existingMeta?.output_path ?? stateArtifactPath ?? null,
+    runId: phase === "sealed" && existingMeta?.run_id ? existingMeta.run_id : null,
+    repoRoot: absRepoRoot,
+    baseCommitSha: deliverableOverrides.base_commit_sha ?? null,
+  });
+  const runId = meta.run_id;
+  const resolvedWorkflow = workflow ?? meta.workflow ?? "sw_dev";
+  const resolvedOutputPath =
+    outputPath ?? meta.output_path ?? stateArtifactPath ?? join(absDataDir, "workflow-artifacts");
+  const resolvedSkillsRoot = skillsRoot ?? meta.skills_root ?? null;
+  const startedAt = firstHistTs ?? meta.created_at ?? null;
+
+  const goalPath = join(absDataDir, GOAL_FILE);
+  const goalSha256 = existsSync(goalPath) ? sha256Hex(readFileSync(goalPath)) : null;
 
   const stages = [];
   const auditStages = [];
@@ -1227,7 +1288,7 @@ export function buildManifest({
   if (stagesDb) {
     try {
       if (tableExists(stagesDb, "stage_runs")) {
-        const rows = safeAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", workflow);
+        const rows = safeAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", resolvedWorkflow);
         for (const row of rows) {
           if (row.stage === "blueprint" && row.status === "passed") blueprintRan = true;
           const isSkipped = row.status === "skipped";
@@ -1275,7 +1336,7 @@ export function buildManifest({
     cbs: readCbsStore(Database, absDataDir, absRepoRoot, blueprintRan),
   };
 
-  const artifactPrefix = resolveArtifactPrefix(workflow, skillsRoot, absRepoRoot);
+  const artifactPrefix = resolveArtifactPrefix(resolvedWorkflow, resolvedSkillsRoot, absRepoRoot);
   const architecture = readArchitectureStrata({
     outputPath: resolvedOutputPath,
     repoRoot: absRepoRoot,
@@ -1296,7 +1357,7 @@ export function buildManifest({
   const contentPayload = scrubDeep({
     schema_version: SCHEMA_VERSION,
     run_id: runId,
-    workflow,
+    workflow: resolvedWorkflow,
     goal_sha256: goalSha256,
     phase,
     deliverable_key: deliverableKey,
@@ -1351,7 +1412,7 @@ export function buildManifest({
  */
 export async function materializeManifest({
   dataDir,
-  workflow = "sw_dev",
+  workflow = null,
   repoRoot = OWN_ROOT,
   skillsRoot = null,
   outputPath = null,
@@ -1396,7 +1457,7 @@ export async function materializeManifest({
     const envelope = buildSinkEnvelope({
       event: isStageEvent ? "stage.completed" : "run.finalized",
       runId: built.runId,
-      workflow,
+      workflow: built.manifest.workflow,
       stage: isStageEvent ? "snapshot" : phase === "sealed" ? "seal" : "retro",
       sha256: eventSha256,
       deliverableKey: built.deliverableKey,
@@ -1407,7 +1468,7 @@ export async function materializeManifest({
 
   upsertRunManifest(Database, absDataDir, {
     runId: built.runId,
-    workflow,
+    workflow: built.manifest.workflow,
     phase,
     manifestSha256: built.manifestSha256,
     deliverableKey: built.deliverableKey,
@@ -1531,7 +1592,7 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
  */
 export async function sealManifest({
   dataDir,
-  workflow = "sw_dev",
+  workflow = null,
   repoRoot = OWN_ROOT,
   skillsRoot = null,
   outputPath = null,
@@ -1560,10 +1621,17 @@ export async function sealManifest({
 
   let resolvedHead = headCommitSha;
   let committedTreeSha = null;
+  if (resolvedHead && (String(resolvedHead).startsWith("-") || /[\s\0]/.test(String(resolvedHead)))) {
+    return {
+      ok: false,
+      exitCode: 1,
+      error: `Invalid git commit ref "${resolvedHead}"`,
+    };
+  }
   if (isGitRepo(absRepoRoot)) {
     const ref = resolvedHead || "HEAD";
     try {
-      resolvedHead = gitExec(absRepoRoot, ["rev-parse", ref]).trim();
+      resolvedHead = gitExec(absRepoRoot, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
     } catch (err) {
       return {
         ok: false,
@@ -1642,7 +1710,7 @@ async function runCliMain(argv) {
     process.stderr.write("Usage: provenance.mjs materialize|seal|verify|read --data-dir <dir> [--workflow <w>] [options]\n");
     return 2;
   }
-  const workflow = flags.workflow ?? "sw_dev";
+  const workflow = flags.workflow ?? null;
   const repoRoot = flags["repo-root"] ?? process.cwd();
   const skillsRoot = flags["skills-root"] ?? process.env.UWF_SKILLS_ROOT ?? null;
   const outputPath = flags["output-path"] ?? null;
