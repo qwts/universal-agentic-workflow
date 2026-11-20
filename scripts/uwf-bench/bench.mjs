@@ -181,6 +181,73 @@ export function buildOutcomes(stageRuns, transcripts, gated) {
   return out;
 }
 
+/** Read `<dataDir>/monolith-metrics.json` for `nocli` runs, or null if absent/unreadable. */
+export function readMonolithMetrics(dataDir) {
+  const path = join(dataDir, "monolith-metrics.json");
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convert `monolith-metrics.json` into `stage_outcomes` rows matching the `cli` condition schema.
+ */
+export function buildMonolithOutcomes(metrics) {
+  if (!metrics || !Array.isArray(metrics.stages)) return [];
+  const out = [];
+  const sid = metrics.sessionId ?? null;
+  for (const s of metrics.stages) {
+    if (s.skipped) {
+      out.push({
+        stage: s.stage, attempt: 1, skipped: true, gated: false, passed: false,
+        first_try_pass: false, never_passed: false, gate_failure_reason: s.note ?? null,
+        session_id: sid,
+      });
+      continue;
+    }
+    const attempts = Array.isArray(s.attemptResults) ? s.attemptResults : [];
+    if (attempts.length > 0) {
+      attempts.forEach((att, idx) => {
+        const isLast = idx === attempts.length - 1;
+        out.push({
+          stage: s.stage,
+          attempt: att.attempt ?? (idx + 1),
+          skipped: false,
+          gated: s.gated !== false,
+          passed: Boolean(att.passed),
+          first_try_pass: idx === 0 && Boolean(att.passed),
+          never_passed: isLast && !s.passed,
+          gate_failure_reason: att.passed
+            ? null
+            : (Array.isArray(att.failures) && att.failures.length ? att.failures.join("; ") : (s.failures?.join("; ") || null)),
+          tokens_input: null, tokens_output: null, tokens_cache_read: null, tokens_cache_write: null,
+          cost_usd: null, wall_seconds: null, prompt_tokens: null, session_id: sid,
+        });
+      });
+      continue;
+    }
+    const failParts = [];
+    if (s.neverMarked) failParts.push("never_marked");
+    if (Array.isArray(s.failures) && s.failures.length) failParts.push(s.failures.join("; "));
+    out.push({
+      stage: s.stage,
+      attempt: 1,
+      skipped: false,
+      gated: s.gated !== false,
+      passed: Boolean(s.passed),
+      first_try_pass: Boolean(s.firstTryPass),
+      never_passed: !s.passed,
+      gate_failure_reason: s.passed ? null : (failParts.join(": ") || null),
+      tokens_input: null, tokens_output: null, tokens_cache_read: null, tokens_cache_write: null,
+      cost_usd: null, wall_seconds: null, prompt_tokens: null, session_id: sid,
+    });
+  }
+  return out;
+}
+
 const sum = (rows, k) => (rows.some((r) => r[k] != null) ? rows.reduce((a, r) => a + (r[k] ?? 0), 0) : null);
 
 // ---------------------------------------------------------------------------
@@ -272,10 +339,7 @@ export async function executeRun(matrix, entry, ctx) {
     fixture: fixture.name, run_index, block, seed: null, claude_cli_version: cliVersion(cell.adapter), runner_sha: ctx.runnerSha,
     stages_yaml_sha: ctx.stagesYamlSha, started_at: new Date().toISOString(), usage_incomplete: true, notes: null,
   };
-  if (cell.state_location === "nocli") {
-    return { run: { ...base, ended_at: base.started_at, wall_seconds: 0, terminal_state: "not_implemented", failure_class: null,
-      notes: "no-CLI protocol is not implemented (later issue); run skipped" }, outcomes: [] };
-  }
+  const isNoCli = cell.state_location === "nocli";
   const dir = join(ctx.work, cell.name, fixture.name, String(run_index));
   if (!(dir + sep).startsWith(resolve(ctx.work) + sep)) throw new Error(`run directory escapes the work dir: ${dir}`);
   const repo = join(dir, "repo");
@@ -288,32 +352,69 @@ export async function executeRun(matrix, entry, ctx) {
     mkdirSync(dataDir, { recursive: true });
     prepareRepo(fixture, repo, ctx.baseDir, matrix.workflow);
     base.fixture_sha = git(repo, ["rev-parse", "HEAD"]);
-    const args = [RUNNER, "run", "--workflow", matrix.workflow, "--goal", fixture.goal, "--adapter", cell.adapter,
-      ...(cell.model ? ["--model", cell.model] : []), "--data-dir", dataDir, "--repo-root", repo, "--non-interactive",
-      "--timeout-ms", String(matrix.timeout_ms)];
+    const args = [
+      RUNNER,
+      "run",
+      "--workflow",
+      matrix.workflow,
+      "--goal",
+      fixture.goal,
+      "--adapter",
+      isNoCli ? "monolith" : cell.adapter,
+      ...(isNoCli ? ["--backend", cell.adapter] : []),
+      ...(cell.model ? ["--model", cell.model] : []),
+      "--data-dir",
+      dataDir,
+      "--repo-root",
+      repo,
+      "--non-interactive",
+      "--timeout-ms",
+      String(matrix.timeout_ms),
+    ];
     const env = { ...process.env, UWF_DATA_DIR: "" };
     if (cell.fake_fixture_dir) env.UWF_FAKE_FIXTURE_DIR = resolve(ctx.baseDir, cell.fake_fixture_dir);
     const r = await runProcess(args, { cwd: repo, env, timeout: matrix.timeout_ms * 30 });
     if (r.error) throw r.error;
     const code = r.status;
     const transcripts = readTranscripts(dataDir);
-    outcomes = buildOutcomes(readStageRuns(dataDir, matrix.workflow), transcripts, ctx.gated);
+    let monolithMetrics = null;
+    if (isNoCli) {
+      monolithMetrics = readMonolithMetrics(dataDir);
+      if (!monolithMetrics) {
+        outcomes = [];
+      } else {
+        outcomes = buildMonolithOutcomes(monolithMetrics);
+      }
+    } else {
+      outcomes = buildOutcomes(readStageRuns(dataDir, matrix.workflow), transcripts, ctx.gated);
+    }
+    const missingMetrics = isNoCli && !monolithMetrics;
     const first = outcomes.filter((o) => o.gated && !o.skipped && o.attempt === 1);
     const attempts = transcripts.map((t) => t.usage);
-    const status = code === null ? "ambiguous" : FAILURE[code] ?? "harness_error";
+    const status = code === null ? "ambiguous" : missingMetrics ? "harness_error" : FAILURE[code] ?? "harness_error";
     const changed = isGitDir(repo) ? changedPaths(repo) : null;
+    const neverMarkedNote = missingMetrics
+      ? "nocli run did not produce monolith-metrics.json"
+      : isNoCli && monolithMetrics?.summary?.neverMarkedStages
+        ? `never_marked=${monolithMetrics.summary.neverMarkedStages}`
+        : null;
     run = {
       ...base, model: attempts.find((a) => a.model)?.model ?? base.model, exit_code: code, stderr_tail: r.stderr.slice(-2000),
       tokens_input: sum(attempts, "tokens_input"), tokens_output: sum(attempts, "tokens_output"),
       tokens_cache_read: sum(attempts, "tokens_cache_read"), tokens_cache_write: sum(attempts, "tokens_cache_write"),
       cost_usd: sum(attempts, "cost_usd"), max_prompt_tokens: null,
       usage_incomplete: !attempts.length || attempts.some((a) => ["tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write", "cost_usd"].some((k) => a[k] == null)),
-      terminal_state: code === null ? "timeout" : STATE[code] ?? "unknown", failure_class: status,
+      terminal_state: code === null ? "timeout" : missingMetrics ? "harness_error" : STATE[code] ?? "unknown", failure_class: status,
       test_file_modified: changed ? changed.some((f) => TEST_FILE.test(f)) : null,
-      first_try_pass_rate: first.length ? first.filter((o) => o.first_try_pass).length / first.length : null,
+      first_try_pass_rate: missingMetrics
+        ? null
+        : monolithMetrics?.summary
+          ? monolithMetrics.summary.firstTryPassRate
+          : (first.length ? first.filter((o) => o.first_try_pass).length / first.length : null),
       retries_total: outcomes.filter((o) => o.attempt > 1).length,
       artifact_missing: outcomes.filter((o) => o.never_passed && MISSING.test(o.gate_failure_reason ?? "")).length,
       acceptance_pass: fixture.acceptance_cmd ? acceptance(fixture.acceptance_cmd, repo, ctx.acceptanceTimeoutMs) : null,
+      notes: neverMarkedNote,
     };
   } catch (e) {
     run = { ...base, terminal_state: "harness_error", failure_class: "harness_error", notes: String(e.message ?? e).slice(0, 1000) };

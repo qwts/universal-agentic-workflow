@@ -104,11 +104,14 @@ an underlying harness backend (`--backend claude-code|codex|fake|grokbot` or `UW
 or `fake` when `UWF_FAKE_FIXTURE` / `UWF_FAKE_FIXTURE_DIR` is set).
 
 During the session the model must self-track workflow state, phase transitions, retries, and review fix-loops in context
-without invoking `stage-tracker.mjs`, `state.mjs`, `run.mjs`, or `questions.mjs`. Afterward, `evaluateMonolithGates` runs
-`run.mjs --check-gate <stage>` across every stage so first-try pass rate and per-stage results are measured identically to the
-runner condition, recording summary metrics to `<dataDir>/monolith-metrics.json` and the session transcript to
-`<dataDir>/transcripts/`. Pass `--mark-stage-cmd <cmd>` (or `UWF_MONOLITH_MARK_STAGE`) to instruct the model to emit
-stage-completion timestamps for post-hoc telemetry. `resume` is intentionally unsupported (single-session control).
+without invoking `stage-tracker.mjs`, `state.mjs`, `run.mjs`, or `questions.mjs`. By default, `monolith` configures
+`mark-stage-cmd` to `node scripts/uwf-runner/mark-stage.mjs` so each stage completion captures an immutable snapshot of
+gate-visible paths under `<dataDir>/monolith-snapshots/`. Afterward, `evaluateMonolithGates` runs `run.mjs --check-gate <stage>`
+against the first snapshot for each stage to compute `firstTryPassRate` (scoring unmarked stages as `never_marked` first-try
+failures, matching `docs/research/cli-offload-design.md` §3.1) and against the final tree for terminal pass/fail, recording
+summary metrics to `<dataDir>/monolith-metrics.json` and the session transcript to `<dataDir>/transcripts/`.
+Pass `--mark-stage-cmd <cmd>` (or `--mark-stage-cmd none` / `UWF_MONOLITH_MARK_STAGE=none` to disable) to override.
+`resume` is intentionally unsupported (single-session control).
 
 ```sh
 node scripts/uwf-runner/runner.mjs run --workflow sw_dev --goal goal.md \

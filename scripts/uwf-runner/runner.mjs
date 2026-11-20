@@ -405,14 +405,15 @@ async function main(argv) {
 
     const adapter = await loadAdapter(adapterName);
     if (adapterName === "monolith") {
+      const runGateAt = (script, args, opts = {}) => runCli(script, args, { cwd: opts.cwd ?? repoRoot, env: cliEnv });
       const res = await adapter.runMonolith({
         workflow, stages: stages.slice(start), runScript, trackerScript: TRACKER, stateScript: STATE,
         repoRoot, skillsRoot, outputPath, dataDir, goal, flags, fixtureDir, timeoutMs, maxCostUsd,
-        phaseFlags, cli, log, EXIT,
+        phaseFlags, cli, runGateAt, log, EXIT,
       });
       const msg = res.exitCode === EXIT.OK ? "workflow complete (monolith control)"
         : res.exitCode === EXIT.COST ? `monolith control exceeded --max-cost-usd $${maxCostUsd}`
-        : `monolith control: ${res.metrics.summary.gatedPassed}/${res.metrics.summary.gatedEvaluated} gated stages passed on first try`;
+        : `monolith control: ${res.metrics.summary.gatedPassed}/${res.metrics.summary.gatedEvaluated} gated stages passed (${res.metrics.summary.firstTryPassed ?? res.metrics.summary.gatedPassed}/${res.metrics.summary.gatedEvaluated} on first try)`;
       return finish(res.exitCode, res.rows, msg, note);
     }
     const rows = command === "resume" ? priorRows : [];

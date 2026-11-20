@@ -42,8 +42,9 @@ See `matrix.example.yaml`.
 
 ## Not implemented / NULL today
 
-- `state_location: nocli` cells are a stub: the run is recorded with `terminal_state='not_implemented'` and skipped.
-  The no-CLI protocol is a later issue.
+- `state_location: nocli` cells run `runner.mjs --adapter monolith --backend <cell.adapter>`, capturing
+  stage-completion snapshots via `scripts/uwf-runner/mark-stage.mjs` and reading per-stage outcomes and
+  `first_try_pass_rate` from `<data dir>/monolith-metrics.json` (plus run-level token/cost usage from `<data dir>/transcripts`).
 - `seed` is always NULL: Claude Code has no seed flag. The matrix `seed` only orders runs.
 - `tokens_*`, `cost_usd`: only the claude-code adapter reports usage (cache read/write and cost included, parsed from the
   CLI JSON in the transcript). `fake` and `codex` give NULL, and `usage_incomplete=1` marks any run with a NULL usage field.

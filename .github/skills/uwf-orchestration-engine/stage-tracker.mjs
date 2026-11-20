@@ -498,6 +498,13 @@ function cmdGatePrescriptions() {
     stage: s.name,
     gated: s.gated !== false,
     conditional: s.conditional === true,
+    condition: s.condition
+      ? {
+          ...s.condition,
+          ...(typeof s.condition.file === "string" ? { file: resolveTemplates(s.condition.file) } : {}),
+          ...(typeof s.condition.path === "string" ? { path: resolveTemplates(s.condition.path) } : {}),
+        }
+      : null,
     on_gate_failure: s.on_gate_failure ?? "retry",
     max_retries: s.max_retries ?? 2,
     retry_mode: s.retry_mode ?? "resume",
