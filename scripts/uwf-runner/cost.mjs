@@ -14,9 +14,12 @@
  * Also used by the runner: attemptUsage() (one transcript) and listTranscripts() (all transcripts in a data dir).
  */
 
-import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
-import { materializePrompt } from "./prompt.mjs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
+
+const DEFAULT_REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 export const AVG_LIMIT = 50_000;
 export const TURN_LIMIT = 100_000;
@@ -47,7 +50,7 @@ export function transcriptRow(file, t) {
   };
 }
 
-function readRegularUtf8Bounded(fullPath, expectedRealDir = null, maxBytes = MAX_TRANSCRIPT_BYTES) {
+function readRegularUtf8Bounded(fullPath, expectedRealDirs = null, maxBytes = MAX_TRANSCRIPT_BYTES) {
   let lst;
   try {
     lst = lstatSync(fullPath);
@@ -55,15 +58,19 @@ function readRegularUtf8Bounded(fullPath, expectedRealDir = null, maxBytes = MAX
     return null;
   }
   if (lst.isSymbolicLink() || !lst.isFile() || lst.size > maxBytes) return null;
-  if (expectedRealDir !== null) {
+  if (expectedRealDirs !== null) {
     let realFull;
     try {
       realFull = realpathSync(fullPath);
     } catch {
       return null;
     }
-    const prefix = expectedRealDir.endsWith(sep) ? expectedRealDir : expectedRealDir + sep;
-    if (!realFull.startsWith(prefix)) return null;
+    const dirs = Array.isArray(expectedRealDirs) ? expectedRealDirs : [expectedRealDirs];
+    const allowed = dirs.some((d) => {
+      const prefix = d.endsWith(sep) ? d : d + sep;
+      return realFull === d || realFull.startsWith(prefix);
+    });
+    if (!allowed) return null;
   }
   let fd;
   try {
@@ -166,19 +173,34 @@ export function lastStageContext(dataDir, stage) {
 }
 
 /** Files the agent body tells the stage to read (`.github/...` paths in backticks), with their sizes. */
-function referencedChars(skillsRoot, systemPrompt) {
-  let realRoot;
-  try {
-    realRoot = realpathSync(skillsRoot);
-  } catch {
-    return 0;
+function referencedChars({ workflow, repoRoot, skillsRoot }, systemPrompt) {
+  const effectiveSkillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot, workflow }).root;
+  const orderedRoots = skillsRoot
+    ? [effectiveSkillsRoot, repoRoot, DEFAULT_REPO]
+    : [repoRoot, effectiveSkillsRoot, DEFAULT_REPO];
+  const candidateRoots = [
+    ...new Set(orderedRoots.filter(Boolean).map((r) => resolve(r))),
+  ];
+  const trustedRealRoots = [];
+  for (const r of candidateRoots) {
+    try {
+      if (statSync(r).isDirectory()) trustedRealRoots.push(realpathSync(r));
+    } catch { /* ignore absent root */ }
   }
+  if (trustedRealRoots.length === 0) return 0;
   let total = 0;
-  // Relative refs resolve against skillsRoot; refs the prompt already made absolute resolve to themselves.
+  // Relative refs check repo/skills/fallback roots; refs the prompt already made absolute resolve to themselves.
   for (const ref of new Set([...String(systemPrompt).matchAll(/`([^`\s]*\.github\/[^`\s]+)`/g)].map((x) => x[1]))) {
-    if (!ref.endsWith("/")) {
-      const text = readRegularUtf8Bounded(resolve(skillsRoot, ref), realRoot, MAX_TRANSCRIPT_BYTES);
-      if (text !== null) total += text.length;
+    if (ref.endsWith("/")) continue;
+    const candidates = isAbsolute(ref)
+      ? [resolve(ref)]
+      : candidateRoots.map((r) => resolve(r, ref));
+    for (const cand of candidates) {
+      const text = readRegularUtf8Bounded(cand, trustedRealRoots, MAX_TRANSCRIPT_BYTES);
+      if (text !== null) {
+        total += text.length;
+        break;
+      }
     }
   }
   return total;
@@ -210,7 +232,13 @@ export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outp
     for (const st of new Set(rows.map((r) => r.stage))) {
       try {
         const mp = await materializePrompt({ workflow, stage: st, repoRoot, skillsRoot, outputPath, dataDir });
-        statics[st] = { prompt: mp.prompt.length, system: mp.systemPrompt.length, refs: referencedChars(skillsRoot ?? repoRoot, mp.systemPrompt) };
+        let refs = 0;
+        try {
+          refs = referencedChars({ workflow, repoRoot, skillsRoot }, mp.systemPrompt);
+        } catch {
+          refs = 0;
+        }
+        statics[st] = { prompt: mp.prompt.length, system: mp.systemPrompt.length, refs };
       } catch { /* stage not in this workflow */ }
     }
   }

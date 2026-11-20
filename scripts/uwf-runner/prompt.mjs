@@ -345,7 +345,7 @@ function buildStageInputContext(repoRoot, outputPath, extraRoots = []) {
   const insideRealRoot = (realP) =>
     allowedRealRoots.some((r) => realP === r || realP.startsWith(r.endsWith(sep) ? r : r + sep));
   const isOutsideRel = (rel) => rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
-  const findContainer = (absTarget) => {
+  const findContainerOrNull = (absTarget) => {
     let best = null;
     for (const c of containerRoots) {
       const rel = relative(c, absTarget);
@@ -353,6 +353,11 @@ function buildStageInputContext(repoRoot, outputPath, extraRoots = []) {
         if (!best || c.length > best.length) best = c;
       }
     }
+    return best;
+  };
+  const hasContainer = (absTarget) => findContainerOrNull(absTarget) !== null;
+  const findContainer = (absTarget) => {
+    const best = findContainerOrNull(absTarget);
     if (!best) {
       throw new PromptError(`Stage input escapes repo_root and output_path: ${absTarget}`);
     }
@@ -403,7 +408,57 @@ function buildStageInputContext(repoRoot, outputPath, extraRoots = []) {
     if (!insideRealRoot(realTarget)) {
       throw new PromptError(`Stage input escapes allowed root: ${absTarget}`);
     }
+    let fd;
+    try {
+      fd = openSync(absTarget, OPEN_NOFOLLOW_FLAGS);
+      const fst = fstatSync(fd);
+      if (!fst.isFile()) {
+        throw new PromptError(`Stage input must be a regular file: ${absTarget}`);
+      }
+      if (fst.size > MAX_INPUT_BYTES) {
+        throw new PromptError(`Stage input exceeds ${MAX_INPUT_BYTES} byte limit: ${absTarget}`);
+      }
+    } catch (err) {
+      if (err instanceof PromptError) throw err;
+      throw new PromptError(`Cannot validate stage input ${absTarget}: ${err.message}`);
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
     return true;
+  };
+  const assertSafeGateDir = (dirSpec) => {
+    const absDir = resolve(absRepo, dirSpec);
+    const container = findContainer(absDir);
+    const walkRes = assertNoSymlinkAncestors(container, absDir);
+    if (!walkRes.exists) return;
+    if (!walkRes.leafLst.isDirectory()) {
+      throw new PromptError(`Gate directory must be a regular directory: ${absDir}`);
+    }
+    if (!insideRealRoot(realpathSync(absDir))) {
+      throw new PromptError(`Gate directory escapes allowed root: ${absDir}`);
+    }
+  };
+  const assertSafeGateArgPath = (absTarget, { enforceSizeLimit = false } = {}) => {
+    const container = findContainer(absTarget);
+    const walkRes = assertNoSymlinkAncestors(container, absTarget);
+    if (!walkRes.exists) return;
+    if (walkRes.leafLst.isDirectory()) {
+      if (!insideRealRoot(realpathSync(absTarget))) {
+        throw new PromptError(`Gate directory escapes allowed root: ${absTarget}`);
+      }
+      return;
+    }
+    if (!walkRes.leafLst.isFile()) {
+      throw new PromptError(`Gate path must be a regular file or directory: ${absTarget}`);
+    }
+    if (!insideRealRoot(realpathSync(absTarget))) {
+      throw new PromptError(`Gate path escapes allowed root: ${absTarget}`);
+    }
+    if (enforceSizeLimit) {
+      assertRegularContainedInput(absTarget);
+    }
   };
   const expandOne = (subPat, outSet) => {
     const absP = resolve(absRepo, subPat);
@@ -510,14 +565,23 @@ function buildStageInputContext(repoRoot, outputPath, extraRoots = []) {
       }
     }
   };
-  return { abs: (p) => resolve(absRepo, p), expand, readSafeInputUtf8 };
+  return {
+    abs: (p) => resolve(absRepo, p),
+    expand,
+    readSafeInputUtf8,
+    assertRegularContainedInput,
+    assertSafeGateDir,
+    assertSafeGateArgPath,
+    hasContainer,
+  };
 }
 
 /**
- * Validate every declared `inputs` entry in a workflow's `stages.yaml` (literal and glob)
- * against symlinks, non-regular files (e.g., FIFOs), size bounds, and root containment.
+ * Validate declared stage `inputs` (literal and glob) and, when `validateGates` is true,
+ * gate/condition file & directory paths against symlinks, non-regular files (e.g., FIFOs),
+ * size bounds, and root containment.
  */
-export function validateWorkflowStageInputs({ workflow, repoRoot, skillsRoot, outputPath, dataDir } = {}) {
+export function validateWorkflowStageInputs({ workflow, stage = null, validateGates = Boolean(stage), repoRoot, skillsRoot, outputPath, dataDir } = {}) {
   const absRepo = resolve(repoRoot ?? DEFAULT_REPO);
   const effectiveSkillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot: absRepo, workflow }).root;
   const stagesPath = join(effectiveSkillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml");
@@ -528,11 +592,67 @@ export function validateWorkflowStageInputs({ workflow, repoRoot, skillsRoot, ou
   const effectiveDataDir = resolve(absRepo, chosenDataDir ?? "./tmp/uwf");
   const rawOut = outputPath ?? (chosenDataDir ? join(chosenDataDir, "workflow-artifacts") : "./tmp/workflow-artifacts");
   const resolvedOut = resolve(absRepo, rawOut);
-  const { expand } = buildStageInputContext(absRepo, resolvedOut, [effectiveSkillsRoot, effectiveDataDir]);
-  const subst = (s) => String(s).replace(/\{\{output_path\}\}/g, () => resolvedOut).replace(/\{\{cwd\}\}/g, () => absRepo);
-  for (const st of stagesDoc?.stages ?? []) {
+  const { expand, assertSafeGateDir, assertSafeGateArgPath, hasContainer } = buildStageInputContext(
+    absRepo,
+    resolvedOut,
+    [effectiveSkillsRoot, effectiveDataDir, DEFAULT_REPO],
+  );
+  const subst = (s) =>
+    String(s)
+      .replace(/\{\{output_path\}\}/g, () => resolvedOut)
+      .replace(/\{\{cwd\}\}/g, () => absRepo)
+      .replace(/\{\{skills_root\}\}/g, () => effectiveSkillsRoot);
+  const stages = Array.isArray(stagesDoc?.stages) ? stagesDoc.stages : [];
+  const targetStages = stage ? stages.filter((st) => st?.name === stage) : stages;
+  if (stage && stages.length > 0 && targetStages.length === 0) {
+    throw new PromptError(`Unknown stage "${stage}" in workflow "${workflow}"`);
+  }
+  for (const st of targetStages) {
     for (const raw of st?.inputs ?? []) {
       expand(subst(raw));
+    }
+    if (!validateGates) continue;
+    if (typeof st?.condition?.path === "string") {
+      assertSafeGateArgPath(resolve(absRepo, subst(st.condition.path)), { enforceSizeLimit: true });
+    }
+    for (const check of st?.gate?.checks ?? []) {
+      if (typeof check?.path === "string") {
+        const readsFile = check?.type === "require_contains" || check?.type === "require_json_field";
+        assertSafeGateArgPath(resolve(absRepo, subst(check.path)), { enforceSizeLimit: readsFile });
+      }
+      if ((check?.type === "require_files_with_prefix" || check?.type === "require_file_matching_pattern") && typeof check?.dir === "string") {
+        assertSafeGateDir(subst(check.dir));
+      }
+      if (check?.type === "run_script" && Array.isArray(check?.args)) {
+        for (let i = 0; i < check.args.length; i++) {
+          const rawArg = check.args[i];
+          if (typeof rawArg !== "string" || /[\n;]/.test(rawArg)) continue;
+          if (i > 0 && /^(-e|-p|--eval|--print)$/.test(String(check.args[i - 1]))) continue;
+          const candidates = [];
+          if (rawArg.startsWith("-")) {
+            const eq = rawArg.indexOf("=");
+            if (eq > 0) candidates.push(rawArg.slice(eq + 1));
+          } else {
+            candidates.push(rawArg);
+            const eq = rawArg.indexOf("=");
+            if (eq > 0) candidates.push(rawArg.slice(eq + 1));
+          }
+          for (const candidate of candidates) {
+            if (!candidate) continue;
+            const resolvedArg = resolve(absRepo, subst(candidate));
+            let existsOnDisk = false;
+            try {
+              lstatSync(resolvedArg);
+              existsOnDisk = true;
+            } catch (e) {
+              if (e.code !== "ENOENT" && e.code !== "ENOTDIR" && e.code !== "ENAMETOOLONG") throw e;
+            }
+            if (hasContainer(resolvedArg) || existsOnDisk || /\{\{(?:output_path|cwd|skills_root)\}\}/.test(candidate)) {
+              assertSafeGateArgPath(resolvedArg, { enforceSizeLimit: false });
+            }
+          }
+        }
+      }
     }
   }
 }

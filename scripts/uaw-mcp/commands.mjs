@@ -573,9 +573,9 @@ function assertBoundedTimeoutMs(value, label = "timeout_ms") {
   return String(n);
 }
 
-function assertSafeStageInputsForRun({ workflow, repoRoot, skillsRoot, outputPath, dataDir }) {
+function assertSafeStageInputsForRun({ workflow, stage = null, validateGates = Boolean(stage), repoRoot, skillsRoot, outputPath, dataDir }) {
   try {
-    validateWorkflowStageInputs({ workflow, repoRoot, skillsRoot, outputPath, dataDir });
+    validateWorkflowStageInputs({ workflow, stage, validateGates, repoRoot, skillsRoot, outputPath, dataDir });
   } catch (err) {
     if (err instanceof UsageError) throw err;
     throw new UsageError(err?.message ?? String(err));
@@ -1207,6 +1207,7 @@ export async function cmdGates(params = {}, ctx = {}) {
       ];
       if (outputPath) args.push("--output-path", outputPath);
       if (skillsRoot) args.push("--skills-root", skillsRoot);
+      assertSafeStageInputsForRun({ workflow, stage: safeStage, validateGates: true, repoRoot, skillsRoot, outputPath, dataDir });
       const res = await execNodeAsync(TRACKER_CLI, args, {
         cwd: repoRoot,
         env: { ...env, UWF_DATA_DIR: dataDir },
@@ -1529,6 +1530,19 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       assertSafeDataDir(dataDir);
       assertSafeSkillDbs(repoRoot, "repo_root");
       if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
+      if (action === "stage-complete" && !params.stage) {
+        throw new UsageError(`stage is required for uaw_stage_transition action="${action}"`);
+      }
+      const checkedStage = params.stage ? assertSafeIdentifier(params.stage, "stage") : null;
+      assertSafeStageInputsForRun({
+        workflow,
+        stage: checkedStage,
+        validateGates: action === "stage-complete",
+        repoRoot,
+        skillsRoot,
+        outputPath,
+        dataDir,
+      });
 
       res = await execNodeAsync(TRACKER_CLI, args, {
         cwd: repoRoot,

@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SECRET_PATTERNS } from "../../hooks/secret-patterns.mjs";
+import { costReport } from "../../uwf-runner/cost.mjs";
 import { materializePrompt, validateWorkflowStageInputs } from "../../uwf-runner/prompt.mjs";
 import { execNodeAsync } from "../commands.mjs";
 import { claimDataDirLock, pidAlive } from "../ownership.mjs";
@@ -1874,6 +1875,208 @@ setTimeout(() => {}, 30000);
     });
     assert.equal(resumeViaRunId.isError, false, resumeViaRunId.structuredContent?.stderr ?? resumeViaRunId.structuredContent?.error ?? "");
     assert.equal(resumeViaRunId.structuredContent.exit_code, 3);
+
+    // P1: uaw_gates mode=check and uaw_stage_transition must reject symlinked and FIFO gate files BEFORE spawning stage-tracker.mjs
+    const gateSecData = join(regWs.repoRoot, "gate-sec-data");
+    const gateSecOut = join(regWs.repoRoot, "gate-sec-out");
+    mkdirSync(gateSecOut, { recursive: true });
+    const gateInit = await regHandler.callTool("uaw_stage_transition", {
+      target: "stage",
+      action: "init",
+      workflow: "mcp_fixture",
+      data_dir: gateSecData,
+      output_path: gateSecOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(gateInit.isError, false, gateInit.structuredContent?.error ?? "");
+    const gateRunId = gateInit.structuredContent.run_id;
+
+    const outsideGateJson = join(root, "outside-gate-secret.json");
+    writeFileSync(outsideGateJson, JSON.stringify({ verdict: "TOP_SECRET_LEAK_999" }));
+    const reviewGatePath = join(gateSecOut, "review.result.json");
+    symlinkSync(outsideGateJson, reviewGatePath);
+
+    const symGateCheck = await regHandler.callTool("uaw_gates", {
+      run_id: gateRunId,
+      mode: "check",
+      stage: "review",
+      repo_root: regWs.repoRoot,
+    });
+    assert.equal(symGateCheck.isError, true, "uaw_gates must reject symlinked gate JSON before stage-tracker.mjs");
+    assert.match(JSON.stringify(symGateCheck), /symlink/i);
+    assert.equal(JSON.stringify(symGateCheck).includes("TOP_SECRET_LEAK_999"), false);
+
+    const symStageTrans = await regHandler.callTool("uaw_stage_transition", {
+      target: "stage",
+      action: "stage-complete",
+      stage: "review",
+      run_id: gateRunId,
+      repo_root: regWs.repoRoot,
+    });
+    assert.equal(symStageTrans.isError, true, "uaw_stage_transition must reject symlinked gate JSON before stage-tracker.mjs");
+    assert.match(JSON.stringify(symStageTrans), /symlink/i);
+    assert.equal(JSON.stringify(symStageTrans).includes("TOP_SECRET_LEAK_999"), false);
+
+    const fifoGatePath = join(gateSecOut, "plan.md");
+    execFileSync("mkfifo", [fifoGatePath]);
+    const t0 = Date.now();
+    const fifoGateCheck = await regHandler.callTool("uaw_gates", {
+      run_id: gateRunId,
+      mode: "check",
+      stage: "plan",
+      repo_root: regWs.repoRoot,
+    });
+    assert.equal(fifoGateCheck.isError, true, "uaw_gates must reject FIFO gate file before stage-tracker.mjs");
+    assert.match(JSON.stringify(fifoGateCheck), /regular file/i);
+    assert.ok(Date.now() - t0 < 3000, "uaw_gates FIFO rejection must fail fast without hanging");
+
+    const t1 = Date.now();
+    const fifoStageTrans = await regHandler.callTool("uaw_stage_transition", {
+      target: "stage",
+      action: "stage-complete",
+      stage: "plan",
+      run_id: gateRunId,
+      repo_root: regWs.repoRoot,
+    });
+    assert.equal(fifoStageTrans.isError, true, "uaw_stage_transition must reject FIFO gate file before stage-tracker.mjs");
+    assert.match(JSON.stringify(fifoStageTrans), /regular file/i);
+    assert.ok(Date.now() - t1 < 3000, "uaw_stage_transition FIFO rejection must fail fast without hanging");
+    rmSync(fifoGatePath, { force: true });
+    rmSync(reviewGatePath, { force: true });
+
+    // Bare relative run_script args (without ./ or {{output_path}}) must still validate symlinks/FIFOs
+    const bareArgSkills = join(regWs.root, "bare-arg-skills");
+    mkdirSync(join(bareArgSkills, ".github", "skills", "uwf-bare_gate"), { recursive: true });
+    writeFileSync(
+      join(bareArgSkills, ".github", "skills", "uwf-bare_gate", "stages.yaml"),
+      [
+        "workflow: bare_gate",
+        "stages:",
+        "  - name: check",
+        "    agent: uwf-fixture",
+        "    gate:",
+        "      checks:",
+        "        - type: run_script",
+        "          cmd: node",
+        "          args:",
+        "            - -e",
+        "            - \"process.exit(0)\"",
+        "            - \"bare-rel-artifacts/gate-arg.json\"",
+        "          label: bare-arg-check",
+        "",
+      ].join("\n"),
+    );
+    const bareArgDir = join(regWs.repoRoot, "bare-rel-artifacts");
+    mkdirSync(bareArgDir, { recursive: true });
+    const bareArgPath = join(bareArgDir, "gate-arg.json");
+    symlinkSync(outsideGateJson, bareArgPath);
+    try {
+      const bareData = join(regWs.repoRoot, "bare-gate-data");
+      const bareInit = await regHandler.callTool("uaw_stage_transition", {
+        target: "stage",
+        action: "init",
+        workflow: "bare_gate",
+        data_dir: bareData,
+        repo_root: regWs.repoRoot,
+        skills_root: bareArgSkills,
+      });
+      assert.equal(bareInit.isError, false, bareInit.structuredContent?.error ?? "");
+      const bareGateRes = await regHandler.callTool("uaw_gates", {
+        run_id: bareInit.structuredContent.run_id,
+        mode: "check",
+        stage: "check",
+        repo_root: regWs.repoRoot,
+        skills_root: bareArgSkills,
+      });
+      assert.equal(bareGateRes.isError, true, "uaw_gates must reject symlinked bare relative run_script arg");
+      assert.match(JSON.stringify(bareGateRes), /symlink/i);
+    } finally {
+      rmSync(bareArgDir, { recursive: true, force: true });
+    }
+
+    // P2: costReport / uaw_cost counts fallback skill references resolved to this checkout in agent+refs(ch)
+    const partialRepo = join(regWs.root, "partial-cost-repo");
+    const partialWfDir = join(partialRepo, ".github", "skills", "uwf-partial_cost");
+    const partialAgentsDir = join(partialRepo, ".github", "agents");
+    const partialDataDir = join(partialRepo, "cost-data");
+    const partialTxDir = join(partialDataDir, "transcripts");
+    mkdirSync(partialWfDir, { recursive: true });
+    mkdirSync(partialAgentsDir, { recursive: true });
+    mkdirSync(partialTxDir, { recursive: true });
+    const localSkillText = "# Partial Cost Skill\nNo external refs here.\n";
+    writeFileSync(join(partialWfDir, "SKILL.md"), localSkillText);
+    writeFileSync(
+      join(partialWfDir, "stages.yaml"),
+      [
+        "workflow: partial_cost",
+        "stages:",
+        "  - name: plan",
+        "    agent: uwf-partial-agent",
+        "    outputs:",
+        "      - '{{output_path}}/plan.md'",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(partialAgentsDir, "uwf-partial-agent.agent.md"),
+      [
+        "---",
+        "name: uwf-partial-agent",
+        "---",
+        "Read `.github/skills/uwf-partial_cost/SKILL.md` and `.github/skills/uwf-question-protocol/SKILL.md`.",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(partialTxDir, "0001-plan.json"),
+      JSON.stringify({
+        adapter: "claude-code",
+        prompt: "Run the plan stage for the partial_cost workflow.",
+        stdout: JSON.stringify({
+          num_turns: 1,
+          total_cost_usd: 0.01,
+          usage: {
+            input_tokens: 100,
+            cache_read_input_tokens: 200,
+            cache_creation_input_tokens: 50,
+            output_tokens: 20,
+            iterations: [{ input_tokens: 100, cache_read_input_tokens: 200, cache_creation_input_tokens: 50 }],
+          },
+        }),
+      }),
+    );
+    const mpPartial = await materializePrompt({
+      workflow: "partial_cost",
+      stage: "plan",
+      repoRoot: partialRepo,
+      dataDir: partialDataDir,
+    });
+    const fallbackQuestionSkillText = readFileSync(join(REPO_ROOT, ".github", "skills", "uwf-question-protocol", "SKILL.md"), "utf8");
+    const expectedAgentPlusRefs = mpPartial.systemPrompt.length + localSkillText.length + fallbackQuestionSkillText.length;
+    const partialReport = await costReport({
+      dataDir: partialDataDir,
+      workflow: "partial_cost",
+      repoRoot: partialRepo,
+    });
+    const planReportLine = partialReport.split("\n").find((l) => l.startsWith("plan "));
+    assert.ok(planReportLine, `expected plan row in costReport:\n${partialReport}`);
+    const reportedAgentRefs = Number(planReportLine.trim().split(/\s+/).at(-1));
+    assert.equal(reportedAgentRefs, expectedAgentPlusRefs, "costReport agent+refs(ch) must include both local and fallback skill reference lengths");
+
+    writeRunMeta(partialDataDir, {
+      run_id: "partial-cost-run",
+      workflow: "partial_cost",
+      data_dir: partialDataDir,
+      output_path: join(partialRepo, "tmp", "workflow-artifacts"),
+      repo_root: partialRepo,
+    });
+    registerRunIndex(regWs.stateDir, readRunMeta(partialDataDir), { pruneSuperseded: true });
+    const costRes = await regHandler.callTool("uaw_cost", { run_id: "partial-cost-run", repo_root: partialRepo });
+    assert.equal(costRes.isError, false, costRes.structuredContent?.error ?? "");
+    assert.ok(costRes.structuredContent.report, "uaw_cost must include formatted report");
+    const mcpPlanLine = costRes.structuredContent.report.split("\n").find((l) => l.startsWith("plan "));
+    assert.equal(Number(mcpPlanLine.trim().split(/\s+/).at(-1)), expectedAgentPlusRefs);
   } finally {
     rmSync(regWs.root, { recursive: true, force: true });
   }
