@@ -18,6 +18,7 @@ import {
   linkSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -70,7 +71,7 @@ function readJsonQuiet(filePath) {
  * Returns `{ recordPath, lockPath, release }` where `release()` removes ONLY the
  * `.lock` file (preserving `.json` ownership across pauses and completions).
  */
-export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock = false }) {
+export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock = false, force = false }) {
   if (!outputPath) throw new UsageError("outputPath is required for ownership claim");
   if (!runId) throw new UsageError("runId is required for ownership claim");
   if (!dataDir) throw new UsageError("dataDir is required for ownership claim");
@@ -80,7 +81,7 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
   const { ownersDir, recordPath, lockPath } = outputOwnerPaths(canonicalOutput, stateDir);
   mkdirSync(ownersDir, { recursive: true });
 
-  // 1. Atomic first-claim durable ownership record (<sha256>.json)
+  // 1. Atomic first-claim durable ownership record (<sha256>.json) & paired execution lock (<sha256>.lock)
   const recordPayload = {
     run_id: runId,
     data_dir: canonicalDataDir,
@@ -88,27 +89,6 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
     claimed_at: new Date().toISOString(),
   };
   const recordTmp = `${recordPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  try {
-    writeFileSync(recordTmp, JSON.stringify(recordPayload, null, 2) + "\n", "utf8");
-    try {
-      linkSync(recordTmp, recordPath);
-    } catch (e) {
-      if (e.code !== "EEXIST") throw e;
-      const existing = readJsonQuiet(recordPath);
-      if (!existing || existing.run_id !== runId || canonicalizePath(existing.data_dir ?? "") !== canonicalDataDir) {
-        const ownerDesc = existing?.run_id
-          ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
-          : "another run (unreadable ownership record)";
-        throw new UsageError(
-          `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
-        );
-      }
-    }
-  } finally {
-    rmSync(recordTmp, { force: true });
-  }
-
-  // 2. Paired atomic execution lock (<sha256>.lock)
   const lockToken = `${runId}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const lockPayload = {
     run_id: runId,
@@ -121,12 +101,35 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
   const lockTmp = `${lockPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   let allowUnlock = unlock === true;
+  let needsOwnershipUpdate = false;
 
   try {
+    writeFileSync(recordTmp, JSON.stringify(recordPayload, null, 2) + "\n", "utf8");
+    try {
+      linkSync(recordTmp, recordPath);
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      const existing = readJsonQuiet(recordPath);
+      const sameDataDir = Boolean(existing?.data_dir) && canonicalizePath(existing.data_dir) === canonicalDataDir;
+      const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
+      if (!existing || !sameDataDir || (!sameRun && !force)) {
+        const ownerDesc = existing?.run_id
+          ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
+          : "another run (unreadable ownership record)";
+        throw new UsageError(
+          `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
+        );
+      }
+      if (!sameRun && force) needsOwnershipUpdate = true;
+    }
+
     writeFileSync(lockTmp, JSON.stringify(lockPayload, null, 2) + "\n", "utf8");
     while (true) {
       try {
         linkSync(lockTmp, lockPath);
+        if (needsOwnershipUpdate) {
+          renameSync(recordTmp, recordPath);
+        }
         const release = () => {
           try {
             if (readJsonQuiet(lockPath)?.token === lockToken) {
@@ -175,6 +178,7 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
       allowUnlock = false;
     }
   } finally {
+    rmSync(recordTmp, { force: true });
     rmSync(lockTmp, { force: true });
   }
 }

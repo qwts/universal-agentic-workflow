@@ -15,9 +15,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import { costReport, transcriptRow } from "../uwf-runner/cost.mjs";
@@ -146,10 +146,20 @@ export function computeCostSummary(dataDir) {
       flags: [],
     };
   }
+  const dirLst = lstatSync(dir);
+  if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+    throw new UsageError(`Invalid transcripts directory at ${dir}`);
+  }
+  const realDir = realpathSync(dir);
   const rows = [];
   for (const f of readdirSync(dir).filter((x) => x.endsWith(".json")).sort()) {
     try {
-      const parsed = JSON.parse(readFileSync(join(dir, f), "utf8"));
+      const full = join(dir, f);
+      const lst = lstatSync(full);
+      if (lst.isSymbolicLink() || !lst.isFile()) continue;
+      const realFull = realpathSync(full);
+      if (!realFull.startsWith(realDir + "/") && !realFull.startsWith(realDir + "\\")) continue;
+      const parsed = JSON.parse(readFileSync(realFull, "utf8"));
       const row = transcriptRow(f, parsed);
       if (row) rows.push(row);
     } catch {
@@ -257,9 +267,98 @@ function buildRunEnvelope({ runId, dataDir, outputPath, workflow, exitCode, stdo
   };
 }
 
+const SAFE_WORKFLOW_RE = /^[A-Za-z0-9_-]+$/;
+const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+function assertSafeWorkflow(value, label = "workflow") {
+  if (!value || typeof value !== "string" || !SAFE_WORKFLOW_RE.test(value)) {
+    throw new UsageError(`${label} must match [A-Za-z0-9_-]+`);
+  }
+  return value;
+}
+
+function assertSafeIdentifier(value, label) {
+  if (!value || typeof value !== "string" || value.startsWith("-") || value.includes("..") || !SAFE_ID_RE.test(value)) {
+    throw new UsageError(`${label} contains invalid characters`);
+  }
+  return value;
+}
+
+function assertNoLeadingDash(value, label) {
+  const s = String(value);
+  if (s.startsWith("-")) {
+    throw new UsageError(`${label} must not start with "-"`);
+  }
+  return s;
+}
+
 function resolveOptionalPath(value, allowedRoots, label) {
   if (!value) return undefined;
   return assertAllowedPath(value, allowedRoots, label);
+}
+
+function resolveRepoRoot(explicitRepoRoot, metaRepoRoot, allowedRoots) {
+  const raw = explicitRepoRoot ?? metaRepoRoot ?? null;
+  if (raw) return assertAllowedPath(raw, allowedRoots, "repo_root");
+  if (Array.isArray(allowedRoots) && allowedRoots.length > 0) {
+    throw new UsageError("repo_root is required when workspace root allowlist is configured");
+  }
+  return OWN_REPO_ROOT;
+}
+
+/**
+ * Constrain file-backed `goal` or `goal_file` so `runner.mjs` (`existsSync(flags.goal)`)
+ * can never read files outside `allowedRoots` or traverse symlinks.
+ */
+function resolveGoalArg(params, effectiveRepoRoot, allowedRoots) {
+  if (params.goal_file !== undefined) {
+    if (typeof params.goal_file !== "string" || !params.goal_file.trim()) {
+      throw new UsageError("goal_file must be a non-empty string");
+    }
+    const candidate = isAbsolute(params.goal_file)
+      ? params.goal_file
+      : resolve(effectiveRepoRoot, params.goal_file);
+    const safePath = assertAllowedPath(candidate, allowedRoots, "goal_file");
+    let lst;
+    try {
+      lst = lstatSync(safePath);
+    } catch {
+      throw new UsageError(`goal_file not found: "${params.goal_file}"`);
+    }
+    if (lst.isSymbolicLink() || !statSync(safePath).isFile()) {
+      throw new UsageError(`goal_file "${params.goal_file}" must be a regular file inside allowedRoots`);
+    }
+    return safePath;
+  }
+
+  if (!params.goal || typeof params.goal !== "string") {
+    throw new UsageError("goal is required");
+  }
+  const goalStr = params.goal;
+  if (goalStr.startsWith("--")) {
+    throw new UsageError('goal cannot start with "--" (pass literal text not starting with --, or use goal_file)');
+  }
+  const candidate = isAbsolute(goalStr) ? goalStr : resolve(effectiveRepoRoot, goalStr);
+  const looksLikePath = isAbsolute(goalStr) || goalStr.startsWith("./") || goalStr.startsWith("../") || goalStr.includes("/../");
+  if (Array.isArray(allowedRoots) && allowedRoots.length > 0 && looksLikePath) {
+    // Validate BEFORE any filesystem stat so non-existent paths outside allowlist don't probe host FS.
+    assertAllowedPath(candidate, allowedRoots, "goal");
+  }
+
+  let lst = null;
+  try {
+    lst = lstatSync(candidate);
+  } catch {
+    lst = null;
+  }
+  if (lst) {
+    const safePath = assertAllowedPath(candidate, allowedRoots, "goal");
+    if (lst.isSymbolicLink() || !statSync(safePath).isFile()) {
+      throw new UsageError(`goal path "${goalStr}" must reference a regular file inside allowedRoots`);
+    }
+    return safePath;
+  }
+  return goalStr;
 }
 
 /**
@@ -270,13 +369,9 @@ export async function cmdRun(params = {}, ctx = {}) {
   const allowedRoots = ctx.allowedRoots ?? [];
   const stateDir = resolveUawStateDir(ctx.stateDir);
   const dryRun = params.dry_run === true;
+  const force = params.force === true;
 
-  if (!params.workflow || typeof params.workflow !== "string") {
-    throw new UsageError("workflow is required");
-  }
-  if (!params.goal || typeof params.goal !== "string") {
-    throw new UsageError("goal is required");
-  }
+  const workflow = assertSafeWorkflow(params.workflow, "workflow");
 
   const target = resolveRunTarget({
     run_id: params.run_id,
@@ -288,63 +383,72 @@ export async function cmdRun(params = {}, ctx = {}) {
 
   const dataDir = target.dataDir;
   const existingMeta = target.meta;
-  const runId = existingMeta?.run_id ?? params.run_id ?? generateRunId(params.workflow);
+  const runId = force && !params.run_id && !params.from_stage
+    ? generateRunId(workflow)
+    : (existingMeta?.run_id ?? params.run_id ?? generateRunId(workflow));
   const rawOutputPath = params.output_path ?? existingMeta?.output_path ?? defaultOutputPath(dataDir);
   const outputPath = assertAllowedPath(rawOutputPath, allowedRoots, "output_path");
-  const repoRoot = resolveOptionalPath(params.repo_root, allowedRoots, "repo_root");
-  const skillsRoot = resolveOptionalPath(params.skills_root, allowedRoots, "skills_root");
+  const repoRoot = resolveRepoRoot(params.repo_root, existingMeta?.repo_root, allowedRoots);
+  const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
   const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+  const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
 
   const args = [
     "run",
     "--workflow",
-    params.workflow,
+    workflow,
     "--goal",
-    params.goal,
+    goalArg,
     "--data-dir",
     dataDir,
     "--output-path",
     outputPath,
   ];
-  if (params.adapter) args.push("--adapter", String(params.adapter));
-  if (params.model) args.push("--model", String(params.model));
-  if (params.from_stage) args.push("--from-stage", String(params.from_stage));
-  if (params.force === true) args.push("--force");
+  if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
+  if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
+  if (params.from_stage) args.push("--from-stage", assertSafeIdentifier(params.from_stage, "from_stage"));
+  if (force) args.push("--force");
   if (params.unlock === true) args.push("--unlock");
   if (params.non_interactive === true) args.push("--non-interactive");
   if (dryRun) args.push("--dry-run");
-  if (params.timeout_ms !== undefined) args.push("--timeout-ms", String(params.timeout_ms));
-  if (repoRoot) args.push("--repo-root", repoRoot);
+  if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+  if (params.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
+    args.push("--repo-root", repoRoot);
+  }
   if (skillsRoot) args.push("--skills-root", skillsRoot);
-  if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", String(params.max_cost_usd));
+  if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
   if (params.resume_max_context !== undefined) {
-    args.push("--resume-max-context", String(params.resume_max_context));
+    args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
   }
 
-  const env = {};
+  const env = { UAW_RUN_ID: runId };
   if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
 
   let claim = null;
   if (!dryRun) {
+    assertNoActiveRunLock(dataDir);
     claim = claimOutputPath({
       outputPath,
       runId,
       dataDir,
       stateDir,
       unlock: params.unlock === true,
+      force,
     });
   }
 
   try {
     if (!dryRun) {
+      const preserved = existingMeta && !force ? existingMeta : {};
       const meta = {
+        ...preserved,
         run_id: runId,
-        workflow: params.workflow,
+        workflow,
         data_dir: dataDir,
         output_path: outputPath,
-        repo_root: repoRoot ?? existingMeta?.repo_root ?? null,
-        skills_root: skillsRoot ?? existingMeta?.skills_root ?? null,
-        created_at: existingMeta?.created_at ?? new Date().toISOString(),
+        repo_root: repoRoot,
+        skills_root: skillsRoot ?? preserved.skills_root ?? null,
+        created_at: !force && existingMeta?.created_at ? existingMeta.created_at : new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
       writeRunMeta(dataDir, meta);
@@ -352,7 +456,7 @@ export async function cmdRun(params = {}, ctx = {}) {
     }
 
     const res = await execNodeAsync(RUNNER_CLI, args, {
-      cwd: repoRoot ?? OWN_REPO_ROOT,
+      cwd: repoRoot,
       env,
     });
 
@@ -360,7 +464,7 @@ export async function cmdRun(params = {}, ctx = {}) {
       runId,
       dataDir,
       outputPath,
-      workflow: params.workflow,
+      workflow,
       exitCode: res.code,
       stdout: res.stdout,
       stderr: res.stderr,
@@ -396,10 +500,8 @@ export async function cmdResume(params = {}, ctx = {}) {
     /* ignore */
   }
 
-  const workflow = params.workflow ?? meta?.workflow;
-  if (!workflow || typeof workflow !== "string") {
-    throw new UsageError("workflow is required (not found in run-meta.json)");
-  }
+  const rawWorkflow = params.workflow ?? meta?.workflow;
+  const workflow = assertSafeWorkflow(rawWorkflow, "workflow");
 
   const runId = meta?.run_id ?? params.run_id ?? generateRunId(workflow);
   const persistedOutput =
@@ -408,7 +510,7 @@ export async function cmdResume(params = {}, ctx = {}) {
     stateFallback?.state?.artifact_path ??
     defaultOutputPath(dataDir);
   const outputPath = assertAllowedPath(persistedOutput, allowedRoots, "output_path");
-  const repoRoot = resolveOptionalPath(params.repo_root ?? meta?.repo_root, allowedRoots, "repo_root");
+  const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
   const skillsRoot = resolveOptionalPath(
     params.skills_root ?? meta?.skills_root,
     allowedRoots,
@@ -433,24 +535,26 @@ export async function cmdResume(params = {}, ctx = {}) {
     "--output-path",
     outputPath,
   ];
-  if (params.adapter) args.push("--adapter", String(params.adapter));
-  if (params.model) args.push("--model", String(params.model));
+  if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
+  if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
   if (params.unlock === true) args.push("--unlock");
   if (params.non_interactive === true) args.push("--non-interactive");
-  if (params.timeout_ms !== undefined) args.push("--timeout-ms", String(params.timeout_ms));
-  if (repoRoot) args.push("--repo-root", repoRoot);
+  if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+  if (params.repo_root || meta?.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
+    args.push("--repo-root", repoRoot);
+  }
   if (skillsRoot) args.push("--skills-root", skillsRoot);
-  if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", String(params.max_cost_usd));
+  if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
   if (params.resume_max_context !== undefined) {
-    args.push("--resume-max-context", String(params.resume_max_context));
+    args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
   }
 
-  const env = {};
+  const env = { UAW_RUN_ID: runId };
   if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
 
   try {
     const res = await execNodeAsync(RUNNER_CLI, args, {
-      cwd: repoRoot ?? OWN_REPO_ROOT,
+      cwd: repoRoot,
       env,
     });
     return buildRunEnvelope({
@@ -490,12 +594,9 @@ export async function cmdGates(params = {}, ctx = {}) {
     meta = target.meta;
   }
 
-  const workflow = params.workflow ?? meta?.workflow;
-  if (!workflow || typeof workflow !== "string") {
-    throw new UsageError("workflow is required");
-  }
+  const workflow = assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow");
 
-  const repoRoot = resolveOptionalPath(params.repo_root ?? meta?.repo_root, allowedRoots, "repo_root");
+  const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
   const skillsRoot = resolveOptionalPath(
     params.skills_root ?? meta?.skills_root,
     allowedRoots,
@@ -515,7 +616,7 @@ export async function cmdGates(params = {}, ctx = {}) {
       const args = ["list-stages", "--workflow", workflow, "--data-dir", scratch];
       if (outputPath) args.push("--output-path", outputPath);
       if (skillsRoot) args.push("--skills-root", skillsRoot);
-      const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot ?? OWN_REPO_ROOT, env });
+      const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot, env });
       return redactDeep({
         ok: res.code === 0,
         exit_code: res.code,
@@ -531,6 +632,7 @@ export async function cmdGates(params = {}, ctx = {}) {
 
   if (mode === "check") {
     if (!params.stage) throw new UsageError("stage is required for mode=check");
+    const safeStage = assertSafeIdentifier(params.stage, "stage");
     // Use a scratch DB path so checking gates never mutates uwf-stages.db
     const scratch = mkdtempSync(join(tmpdir(), "uaw-mcp-gate-check-"));
     try {
@@ -540,7 +642,7 @@ export async function cmdGates(params = {}, ctx = {}) {
         "--workflow",
         workflow,
         "--stage",
-        params.stage,
+        safeStage,
         "--db-path",
         dbPath,
       ];
@@ -548,7 +650,7 @@ export async function cmdGates(params = {}, ctx = {}) {
       if (outputPath) args.push("--output-path", outputPath);
       if (skillsRoot) args.push("--skills-root", skillsRoot);
       const res = await execNodeAsync(TRACKER_CLI, args, {
-        cwd: repoRoot ?? OWN_REPO_ROOT,
+        cwd: repoRoot,
         env: { ...env, ...(dataDir ? { UWF_DATA_DIR: dataDir } : {}) },
       });
       return redactDeep({
@@ -557,7 +659,7 @@ export async function cmdGates(params = {}, ctx = {}) {
         mode: "check",
         run_id: runId,
         workflow,
-        stage: params.stage,
+        stage: safeStage,
         gate: res.json,
         error: res.code === 0 ? null : res.json?.failures?.join("; ") || res.stderr.trim() || null,
       }).value;
@@ -579,7 +681,7 @@ export async function cmdGates(params = {}, ctx = {}) {
       scratch,
     ];
     if (skillsRoot) args.push("--skills-root", skillsRoot);
-    const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot ?? OWN_REPO_ROOT, env });
+    const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot, env });
     return redactDeep({
       ok: res.code === 0,
       exit_code: res.code,
@@ -610,7 +712,10 @@ export async function cmdCost(params = {}, ctx = {}) {
   const dataDir = target.dataDir;
   const meta = target.meta;
   const workflow = params.workflow ?? meta?.workflow;
-  const repoRoot = resolveOptionalPath(params.repo_root ?? meta?.repo_root, allowedRoots, "repo_root");
+  if (workflow) assertSafeWorkflow(workflow, "workflow");
+  const repoRoot = params.repo_root || meta?.repo_root
+    ? resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots)
+    : OWN_REPO_ROOT;
   const skillsRoot = resolveOptionalPath(
     params.skills_root ?? meta?.skills_root,
     allowedRoots,
@@ -627,7 +732,7 @@ export async function cmdCost(params = {}, ctx = {}) {
       report = await costReport({
         dataDir,
         workflow,
-        repoRoot: repoRoot ?? OWN_REPO_ROOT,
+        repoRoot,
         skillsRoot,
         outputPath,
       });
@@ -669,7 +774,7 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
     allowedRoots,
     "output_path",
   );
-  const repoRoot = resolveOptionalPath(params.repo_root ?? meta?.repo_root, allowedRoots, "repo_root");
+  const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
   const skillsRoot = resolveOptionalPath(
     params.skills_root ?? meta?.skills_root,
     allowedRoots,
@@ -695,20 +800,21 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       );
     }
     const args = [action];
-    if (params.mode) args.push("--mode", String(params.mode));
-    if (params.to) args.push("--to", String(params.to));
-    if (params.agent) args.push("--agent", String(params.agent));
-    if (params.note) args.push("--note", String(params.note));
+    if (params.mode) args.push("--mode", assertNoLeadingDash(params.mode, "mode"));
+    if (params.to) args.push("--to", assertSafeIdentifier(params.to, "to"));
+    if (params.agent) args.push("--agent", assertNoLeadingDash(params.agent, "agent"));
+    if (params.note) args.push("--note", assertNoLeadingDash(params.note, "note"));
     if (params.phases) {
-      args.push("--phases", Array.isArray(params.phases) ? params.phases.join(",") : String(params.phases));
+      const phasesVal = Array.isArray(params.phases) ? params.phases.join(",") : String(params.phases);
+      args.push("--phases", assertNoLeadingDash(phasesVal, "phases"));
     }
-    if (params.status) args.push("--status", String(params.status));
-    if (params.profile) args.push("--profile", String(params.profile));
-    if (params.model) args.push("--model", String(params.model));
+    if (params.status) args.push("--status", assertSafeIdentifier(params.status, "status"));
+    if (params.profile) args.push("--profile", assertSafeIdentifier(params.profile, "profile"));
+    if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
     if (params.force === true) args.push("--force");
     args.push(...common);
 
-    const res = await execNodeAsync(STATE_CLI, args, { cwd: repoRoot ?? OWN_REPO_ROOT, env });
+    const res = await execNodeAsync(STATE_CLI, args, { cwd: repoRoot, env });
     return redactDeep({
       ok: res.code === 0 && res.json?.ok !== false,
       exit_code: res.code,
@@ -727,17 +833,16 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       `Invalid stage action "${action}". Expected one of: ${[...STAGE_ACTIONS].join(", ")}`,
     );
   }
-  const workflow = params.workflow ?? meta?.workflow;
-  if (!workflow) throw new UsageError("workflow is required for stage transitions");
+  const workflow = assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow");
 
   const args = [action, "--workflow", workflow];
-  if (params.stage) args.push("--stage", String(params.stage));
-  if (params.note) args.push("--note", String(params.note));
-  if (params.session_id) args.push("--session-id", String(params.session_id));
+  if (params.stage) args.push("--stage", assertSafeIdentifier(params.stage, "stage"));
+  if (params.note) args.push("--note", assertNoLeadingDash(params.note, "note"));
+  if (params.session_id) args.push("--session-id", assertNoLeadingDash(params.session_id, "session_id"));
   if (skillsRoot) args.push("--skills-root", skillsRoot);
   args.push(...common);
 
-  const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot ?? OWN_REPO_ROOT, env });
+  const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot, env });
   return redactDeep({
     ok: res.code === 0 && res.json?.ok !== false,
     exit_code: res.code,
@@ -779,13 +884,14 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
   }
 
   const args = [action, "--data-dir", dataDir];
-  if (params.stage) args.push("--stage", String(params.stage));
-  if (params.status) args.push("--status", String(params.status));
-  if (params.id !== undefined) args.push("--id", String(params.id));
+  if (params.stage) args.push("--stage", assertSafeIdentifier(params.stage, "stage"));
+  if (params.status) args.push("--status", assertSafeIdentifier(params.status, "status"));
+  if (params.id !== undefined) args.push("--id", assertNoLeadingDash(params.id, "id"));
   if (params.ids !== undefined) {
-    args.push("--ids", Array.isArray(params.ids) ? params.ids.join(",") : String(params.ids));
+    const idsVal = Array.isArray(params.ids) ? params.ids.join(",") : String(params.ids);
+    args.push("--ids", assertNoLeadingDash(idsVal, "ids"));
   }
-  if (params.answer !== undefined) args.push("--answer", String(params.answer));
+  if (params.answer !== undefined) args.push("--answer", assertNoLeadingDash(params.answer, "answer"));
 
   const res = await execNodeAsync(QUESTIONS_CLI, args, {
     cwd: OWN_REPO_ROOT,

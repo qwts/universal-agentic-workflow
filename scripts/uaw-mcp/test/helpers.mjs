@@ -4,7 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -36,7 +36,7 @@ export function createFixtureWorkspace({
   delayMs = 0,
   prefix = "uaw-mcp-test-",
 } = {}) {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const skillsRoot = join(root, "skills-root");
   const repoRoot = join(root, "repo-root");
   const fixtureDir = join(root, "fixtures");

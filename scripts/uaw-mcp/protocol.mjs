@@ -41,6 +41,7 @@ import {
 
 export const CONTRACT_VERSION = "uaw-mcp/v1";
 export const MCP_PROTOCOL_VERSION = "2025-03-26";
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([MCP_PROTOCOL_VERSION]);
 
 const RUN_SCOPE_PROPS = {
   run_id: { type: "string", description: "Durable logical UAW run identifier" },
@@ -60,9 +61,10 @@ export const TOOL_DEFINITIONS = [
         ...RUN_SCOPE_PROPS,
         workflow: { type: "string", description: "Workflow name (e.g., sw_dev)" },
         goal: { type: "string", description: "Goal text or path to goal file" },
+        goal_file: { type: "string", description: "Optional path to goal file (must lie within allowedRoots)" },
         adapter: {
           type: "string",
-          enum: ["claude-code", "codex", "fake", "grokbot"],
+          enum: ["claude-code", "codex", "fake", "grokbot", "monolith"],
           description: "Execution harness adapter",
         },
         model: { type: "string" },
@@ -537,7 +539,9 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
       switch (method) {
         case "initialize":
           result = {
-            protocolVersion: params?.protocolVersion ?? MCP_PROTOCOL_VERSION,
+            protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(params?.protocolVersion)
+              ? params.protocolVersion
+              : MCP_PROTOCOL_VERSION,
             capabilities: {
               tools: { listChanged: false },
               resources: { subscribe: false, listChanged: false },

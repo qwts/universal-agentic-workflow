@@ -10,7 +10,7 @@
  *     in `scripts/hooks/secret-patterns.mjs` before returning.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,7 +62,12 @@ export function redactDeep(value) {
     if (v && typeof v === "object") {
       const out = {};
       for (const [k, val] of Object.entries(v)) {
-        out[k] = walk(val);
+        Object.defineProperty(out, k, {
+          value: walk(val),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
       }
       return out;
     }
@@ -361,14 +366,24 @@ export function readReviews(dataDir, { role, stage, verdict, severity, status } 
       sql += " ORDER BY id DESC";
       reviews = db.prepare(sql).all(...params);
     }
+    const reviewFiltered = Boolean(role || stage || verdict);
     let findings = [];
     if (tableExists(db, "findings")) {
-      let sql = "SELECT * FROM findings WHERE 1=1";
-      const params = [];
-      if (severity) { sql += " AND severity = ?"; params.push(severity); }
-      if (status) { sql += " AND status = ?"; params.push(status); }
-      sql += " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'major' THEN 1 ELSE 2 END, id ASC";
-      findings = db.prepare(sql).all(...params);
+      if (reviewFiltered && reviews.length === 0) {
+        findings = [];
+      } else {
+        let sql = "SELECT * FROM findings WHERE 1=1";
+        const params = [];
+        if (reviewFiltered) {
+          const ids = reviews.map((r) => r.id);
+          sql += ` AND review_id IN (${ids.map(() => "?").join(", ")})`;
+          params.push(...ids);
+        }
+        if (severity) { sql += " AND severity = ?"; params.push(severity); }
+        if (status) { sql += " AND status = ?"; params.push(status); }
+        sql += " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'major' THEN 1 ELSE 2 END, id ASC";
+        findings = db.prepare(sql).all(...params);
+      }
     }
     return { reviews, findings };
   });
@@ -425,20 +440,31 @@ export function listTranscriptRecords(dataDir) {
       transcripts: [],
     };
   }
-  const transcripts = readdirSync(dir)
-    .filter((f) => f.endsWith(".json"))
-    .sort()
-    .map((file) => {
-      const full = join(dir, file);
-      const st = statSync(full);
-      const id = file.slice(0, -5);
-      return {
-        id,
-        file,
-        size_bytes: st.size,
-        mtime: st.mtime.toISOString(),
-      };
+  const dirLst = lstatSync(dir);
+  if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+    throw new UsageError(`Invalid transcripts directory at ${dir}`);
+  }
+  const realDir = realpathSync(dir);
+  const transcripts = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
+    const full = join(dir, file);
+    let lst;
+    try {
+      lst = lstatSync(full);
+    } catch {
+      continue;
+    }
+    if (lst.isSymbolicLink() || !lst.isFile()) continue;
+    const realFile = realpathSync(full);
+    if (!realFile.startsWith(realDir + "/") && !realFile.startsWith(realDir + "\\")) continue;
+    const id = file.slice(0, -5);
+    transcripts.push({
+      id,
+      file,
+      size_bytes: lst.size,
+      mtime: lst.mtime.toISOString(),
     });
+  }
   return {
     run_id: meta?.run_id ?? null,
     data_dir: absDir,
@@ -449,7 +475,7 @@ export function listTranscriptRecords(dataDir) {
 
 /**
  * Read one transcript by ID (filename with or without `.json`) and scrub every string
- * through `redactSecrets()`. Rejects path traversal attempts with UsageError (exit 2).
+ * through `redactSecrets()`. Rejects path traversal and symlinks with UsageError (exit 2).
  */
 export function readTranscriptRecord(dataDir, transcriptId) {
   if (!transcriptId || typeof transcriptId !== "string") {
@@ -462,14 +488,31 @@ export function readTranscriptRecord(dataDir, transcriptId) {
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dir = resolve(absDir, "transcripts");
+  if (!existsSync(dir)) {
+    throw new UsageError(`Transcript "${cleanId}" not found in ${dir}`);
+  }
+  if (lstatSync(dir).isSymbolicLink()) {
+    throw new UsageError(`Transcripts directory must not be a symlink: "${dir}"`);
+  }
   const full = resolve(dir, `${cleanId}.json`);
   if (!full.startsWith(dir + "/") && !full.startsWith(dir + "\\")) {
     throw new UsageError(`Transcript path escapes transcripts directory: "${transcriptId}"`);
   }
-  if (!existsSync(full)) {
+  let lst;
+  try {
+    lst = lstatSync(full);
+  } catch {
     throw new UsageError(`Transcript "${cleanId}" not found in ${dir}`);
   }
-  const rawText = readFileSync(full, "utf8");
+  if (lst.isSymbolicLink() || !lst.isFile()) {
+    throw new UsageError(`Transcript "${cleanId}" must be a regular file (symlinks disallowed)`);
+  }
+  const realDir = realpathSync(dir);
+  const realFull = realpathSync(full);
+  if (!realFull.startsWith(realDir + "/") && !realFull.startsWith(realDir + "\\")) {
+    throw new UsageError(`Transcript path escapes transcripts directory: "${transcriptId}"`);
+  }
+  const rawText = readFileSync(realFull, "utf8");
   let parsed;
   try {
     parsed = JSON.parse(rawText);

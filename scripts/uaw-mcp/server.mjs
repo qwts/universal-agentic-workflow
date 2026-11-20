@@ -37,14 +37,65 @@ export function verifyBearerToken(authHeader, expectedToken) {
   return timingSafeEqual(provided, expected);
 }
 
+const ORIGIN_RE = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(\[[^\]]+\]|[^/:?#\s]+)(?::(\d+))?$/;
+
+function parseOriginTuple(raw) {
+  if (typeof raw !== "string") return null;
+  const m = raw.match(ORIGIN_RE);
+  if (!m) return null;
+  return {
+    scheme: m[1].toLowerCase(),
+    host: m[2].toLowerCase(),
+    port: m[3] ?? "",
+  };
+}
+
+function matchOriginPattern(origin, pattern) {
+  if (pattern === "*") return true;
+  const parsedOrigin = parseOriginTuple(origin);
+  if (!parsedOrigin) return false;
+
+  // Scheme wildcard: <scheme>://* (e.g., chrome-extension://*)
+  const schemeWild = pattern.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/\*$/);
+  if (schemeWild) {
+    return parsedOrigin.scheme === schemeWild[1].toLowerCase();
+  }
+
+  // Port wildcard: <scheme>://<host>:* (e.g., http://127.0.0.1:*)
+  const portWild = pattern.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(\[[^\]]+\]|[^/:?#\s*]+):\*$/);
+  if (portWild) {
+    return (
+      parsedOrigin.scheme === portWild[1].toLowerCase() &&
+      parsedOrigin.host === portWild[2].toLowerCase()
+    );
+  }
+
+  // Subdomain wildcard: <scheme>://*.<domain>[:<port>]
+  const subWild = pattern.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/\*\.([^/:?#\s*]+)(?::(\d+))?$/);
+  if (subWild) {
+    const domain = subWild[2].toLowerCase();
+    return (
+      parsedOrigin.scheme === subWild[1].toLowerCase() &&
+      parsedOrigin.host.endsWith(`.${domain}`) &&
+      parsedOrigin.host.length > domain.length + 1 &&
+      (!subWild[3] || parsedOrigin.port === subWild[3])
+    );
+  }
+
+  // Exact origin only (rejects unsafe host-prefix wildcards like https://example.com*)
+  const parsedPattern = parseOriginTuple(pattern);
+  if (!parsedPattern) return false;
+  return (
+    parsedOrigin.scheme === parsedPattern.scheme &&
+    parsedOrigin.host === parsedPattern.host &&
+    parsedOrigin.port === parsedPattern.port
+  );
+}
+
 export function isOriginAllowed(origin, allowedOrigins = []) {
   if (!origin) return true;
   if (allowedOrigins.length > 0) {
-    return allowedOrigins.some((pattern) => {
-      if (pattern === "*") return true;
-      if (pattern.endsWith("*")) return origin.startsWith(pattern.slice(0, -1));
-      return origin === pattern;
-    });
+    return allowedOrigins.some((pattern) => matchOriginPattern(origin, pattern));
   }
   // Default policy when Origin header is present: allow only loopback origins.
   return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(origin);
@@ -101,6 +152,11 @@ export function startHttpServer({
   if (!LOOPBACK_HOSTS.has(host) && !authToken) {
     throw new Error(
       `Refusing to bind HTTP server to non-loopback host "${host}" without --auth-token or UAW_MCP_AUTH_TOKEN`,
+    );
+  }
+  if (!LOOPBACK_HOSTS.has(host) && (!Array.isArray(allowedRoots) || allowedRoots.length === 0)) {
+    throw new Error(
+      `Refusing to bind HTTP server to non-loopback host "${host}" without --allowed-roots or UAW_MCP_ALLOWED_ROOTS`,
     );
   }
 
@@ -196,20 +252,24 @@ export function startHttpServer({
       let tooLarge = false;
 
       req.on("data", (chunk) => {
+        if (tooLarge) return;
         totalBytes += chunk.length;
         if (totalBytes > MAX_HTTP_BODY_BYTES) {
           tooLarge = true;
+          chunks.length = 0;
+          if (!res.headersSent) {
+            res.writeHead(413, { "Content-Type": "application/json", Connection: "close" });
+            res.end(JSON.stringify({ error: "Payload too large" }), () => req.destroy());
+          } else {
+            req.destroy();
+          }
           return;
         }
         chunks.push(chunk);
       });
 
       req.on("end", async () => {
-        if (tooLarge) {
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Payload too large" }));
-          return;
-        }
+        if (tooLarge || res.writableEnded) return;
 
         let body;
         try {
@@ -277,6 +337,7 @@ export function startHttpServer({
             }
             sessions.clear();
             server.close(() => resClose());
+            server.closeAllConnections?.();
           }),
       });
     });

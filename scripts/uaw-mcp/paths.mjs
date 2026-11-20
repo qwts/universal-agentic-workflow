@@ -6,9 +6,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -39,26 +41,49 @@ export function resolveUawStateDir(explicit) {
 }
 
 /**
- * Canonicalize a path even if the leaf does not yet exist:
- * resolves symlinks on the deepest existing ancestor and re-appends remaining segments.
+ * Canonicalize a path even if the leaf does not yet exist or traverses a dangling symlink:
+ * resolves symlinks at every existing/symlinked ancestor with hop limit.
  */
-export function canonicalizePath(targetPath) {
+export function canonicalizePath(targetPath, _hops = 0) {
+  if (_hops > 40) {
+    throw new UsageError(`Too many symbolic link levels resolving "${targetPath}"`);
+  }
   const abs = resolve(targetPath);
+  try {
+    return realpathSync(abs);
+  } catch {
+    /* leaf or intermediate component absent or dangling symlink */
+  }
   const trailing = [];
   let cur = abs;
-  while (!existsSync(cur)) {
+  while (true) {
+    let lst = null;
+    try {
+      lst = lstatSync(cur);
+    } catch {
+      lst = null;
+    }
+    if (lst) {
+      if (lst.isSymbolicLink()) {
+        const linkTarget = readlinkSync(cur);
+        const baseDir = isAbsolute(linkTarget) ? "/" : canonicalizePath(dirname(cur), _hops + 1);
+        const resolvedLink = isAbsolute(linkTarget) ? linkTarget : resolve(baseDir, linkTarget);
+        const canonLink = canonicalizePath(resolvedLink, _hops + 1);
+        return trailing.length ? canonicalizePath(join(canonLink, ...trailing), _hops + 1) : canonLink;
+      }
+      let base = cur;
+      try {
+        base = realpathSync(cur);
+      } catch {
+        base = cur;
+      }
+      return trailing.length ? join(base, ...trailing) : base;
+    }
     const parent = dirname(cur);
-    if (parent === cur) break;
+    if (parent === cur) return abs;
     trailing.unshift(cur.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)));
     cur = parent;
   }
-  let base = cur;
-  try {
-    base = realpathSync(cur);
-  } catch {
-    base = cur;
-  }
-  return trailing.length ? join(base, ...trailing) : base;
 }
 
 /**
@@ -190,7 +215,10 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
       meta = readRunMeta(resolvedDataDir) ?? indexed;
     } else if (!requireExisting) {
       const safeRun = String(run_id).replace(/[^A-Za-z0-9._-]+/g, "_");
-      const candidate = join(resolvedStateDir, "runs-data", safeRun);
+      const baseDir = Array.isArray(allowedRoots) && allowedRoots.length > 0
+        ? join(canonicalizePath(allowedRoots[0]), ".uaw-runs")
+        : join(resolvedStateDir, "runs-data");
+      const candidate = join(baseDir, safeRun);
       resolvedDataDir = assertAllowedPath(candidate, allowedRoots, "data_dir");
       meta = readRunMeta(resolvedDataDir);
     } else {
