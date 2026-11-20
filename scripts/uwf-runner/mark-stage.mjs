@@ -20,13 +20,14 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const EVENTS_FILE = "monolith-events.json";
@@ -127,6 +128,122 @@ function withMarkLock(absDataDir, fn) {
   }
 }
 
+function copyNodeModulesIsolated(srcNm, destNm) {
+  let rootLst;
+  try {
+    rootLst = lstatSync(srcNm);
+  } catch {
+    return;
+  }
+  if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) return;
+
+  const realSrcNm = realpathSync(srcNm);
+  const absDestNm = resolve(destNm);
+
+  function walkNm(curSrc, curDest) {
+    mkdirSync(curDest, { recursive: true });
+    for (const entry of readdirSync(curSrc, { withFileTypes: true })) {
+      const src = join(curSrc, entry.name);
+      const dest = join(curDest, entry.name);
+      let lst;
+      try {
+        lst = lstatSync(src);
+      } catch {
+        continue;
+      }
+      if (lst.isSymbolicLink()) {
+        try {
+          const linkTarget = readlinkSync(src);
+          if (isAbsolute(linkTarget)) continue;
+          const realTarget = realpathSync(src);
+          if (!isInsideOrEqual(realTarget, realSrcNm)) continue;
+          if (!isInsideOrEqual(resolve(dirname(dest), linkTarget), absDestNm)) continue;
+          symlinkSync(linkTarget, dest);
+        } catch {
+          /* skip dangling or escaping symlink */
+        }
+      } else if (lst.isDirectory()) {
+        walkNm(src, dest);
+      } else if (lst.isFile()) {
+        copyFileSync(src, dest);
+      }
+    }
+  }
+
+  walkNm(srcNm, absDestNm);
+}
+
+function copyDataDirState(absDataDir, dataSnapshotDir, { snapshotsRoot, resolvedOutput }) {
+  mkdirSync(dataSnapshotDir, { recursive: true });
+  if (!existsSync(absDataDir)) return;
+  const sameOutputAndData = resolve(resolvedOutput) === resolve(absDataDir);
+
+  function walkData(srcDir, destDir) {
+    mkdirSync(destDir, { recursive: true });
+    for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
+      const name = entry.name;
+      if (
+        name === SNAPSHOTS_DIR ||
+        name === EVENTS_FILE ||
+        name === "mark-stage.lock" ||
+        name === "run.lock" ||
+        name === "transcripts" ||
+        name.endsWith(".tmp")
+      ) {
+        continue;
+      }
+      const src = join(srcDir, name);
+      if (isInsideOrEqual(src, snapshotsRoot)) continue;
+      if (!sameOutputAndData && isInsideOrEqual(src, resolvedOutput)) continue;
+      let lst;
+      try {
+        lst = lstatSync(src);
+      } catch {
+        continue;
+      }
+      if (lst.isSymbolicLink()) continue;
+      const dest = join(destDir, name);
+      if (lst.isDirectory()) {
+        walkData(src, dest);
+      } else if (lst.isFile()) {
+        copyFileSync(src, dest);
+      }
+    }
+  }
+
+  walkData(absDataDir, dataSnapshotDir);
+}
+
+function copyArtifactsDir(resolvedOutput, artifactsDir, { snapshotsRoot, absDataDir }) {
+  mkdirSync(artifactsDir, { recursive: true });
+  if (!existsSync(resolvedOutput)) return;
+  const sameOutputAndData = resolve(resolvedOutput) === resolve(absDataDir);
+
+  function walkArtifacts(srcDir, destDir) {
+    mkdirSync(destDir, { recursive: true });
+    for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
+      const src = join(srcDir, entry.name);
+      if (isInsideOrEqual(src, snapshotsRoot)) continue;
+      if (!sameOutputAndData && isInsideOrEqual(src, absDataDir)) continue;
+      let lst;
+      try {
+        lst = lstatSync(src);
+      } catch {
+        continue;
+      }
+      if (lst.isSymbolicLink()) continue;
+      const dest = join(destDir, entry.name);
+      if (lst.isDirectory()) {
+        walkArtifacts(src, dest);
+      } else if (lst.isFile()) {
+        copyFileSync(src, dest);
+      }
+    }
+  }
+
+  walkArtifacts(resolvedOutput, artifactsDir);
+}
+
 function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
   const absRepo = resolve(repoRoot);
   const absDataDir = resolve(dataDir);
@@ -137,9 +254,13 @@ function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
     mkdirSync(destDir, { recursive: true });
     for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
       const name = entry.name;
-      if (name === ".git" || name === "node_modules") continue;
+      if (name === ".git") continue;
       const src = join(srcDir, name);
       if (isInsideOrEqual(src, absDataDir) || isInsideOrEqual(src, absOutput) || isInsideOrEqual(src, absTmp)) {
+        continue;
+      }
+      if (name === "node_modules") {
+        copyNodeModulesIsolated(src, join(destDir, name));
         continue;
       }
       let lst;
@@ -155,16 +276,6 @@ function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
   }
 
   walkCopy(absRepo, repoSnapshotDir);
-
-  const repoNodeModules = join(absRepo, "node_modules");
-  const snapNodeModules = join(repoSnapshotDir, "node_modules");
-  if (existsSync(repoNodeModules) && !existsSync(snapNodeModules)) {
-    try {
-      symlinkSync(repoNodeModules, snapNodeModules, "dir");
-    } catch {
-      /* optional symlink for npm test execution */
-    }
-  }
 }
 
 /**
@@ -217,20 +328,13 @@ export function markStage(
 
     const artifactsDir = join(snapshotDir, "artifacts");
     const repoSnapshotDir = join(snapshotDir, "repo");
+    const dataSnapshotDir = join(snapshotDir, "data");
 
     try {
       mkdirSync(artifactsDir, { recursive: true });
       mkdirSync(repoSnapshotDir, { recursive: true });
-
-      if (existsSync(resolvedOutput)) {
-        cpSync(resolvedOutput, artifactsDir, {
-          recursive: true,
-          dereference: false,
-          filter: (src) => {
-            try { return !lstatSync(src).isSymbolicLink(); } catch { return false; }
-          },
-        });
-      }
+      copyDataDirState(absDataDir, dataSnapshotDir, { snapshotsRoot, resolvedOutput });
+      copyArtifactsDir(resolvedOutput, artifactsDir, { snapshotsRoot, absDataDir });
 
       if (snapshotWorkspace && existsSync(absRepoRoot)) {
         copyWorkspaceTree(absRepoRoot, repoSnapshotDir, { dataDir: absDataDir, outputPath: resolvedOutput });
@@ -269,6 +373,7 @@ export function markStage(
         snapshotDir,
         artifactsDir,
         repoSnapshotDir,
+        dataSnapshotDir,
         cwdPaths: safeCwdPaths,
         snapshotWorkspace: Boolean(snapshotWorkspace),
       };

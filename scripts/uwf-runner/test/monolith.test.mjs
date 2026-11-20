@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -585,10 +585,96 @@ await test("markStage handles nested dataDir inside repoRoot and invokeStage hon
       { backendAdapter: fakeBackend },
     );
     assert.ok(!capturedSystem.includes("Mark-stage command:"), "none disables mark-stage instruction");
+
+    // Verify dataDir nested inside outputPath (--output-path ./tmp --data-dir ./tmp/uwf) does not recurse
+    const outerOut = join(root, "tmp-out");
+    const innerData = join(outerOut, "uwf");
+    mkdirSync(innerData, { recursive: true });
+    mkdirSync(join(root, "docs", "adr"), { recursive: true });
+    writeFileSync(join(root, "docs", "adr", "0001-test.md"), "# ADR-0001\n");
+    writeFileSync(join(outerOut, "issues-intake.md"), "# Outer Output\n");
+    const evInner = markStage("intake", {
+      dataDir: innerData,
+      outputPath: outerOut,
+      repoRoot: root,
+      cwdPaths: ["docs/adr"],
+    });
+    assert.ok(existsSync(join(evInner.artifactsDir, "issues-intake.md")));
+    assert.ok(existsSync(join(evInner.repoSnapshotDir, "docs", "adr", "0001-test.md")));
+    assert.ok(!existsSync(join(evInner.artifactsDir, "uwf")));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+await test("markStage isolates dataDir gate state and node_modules per snapshot", async () => {
+  const root = mkdtempSync(join(tmpdir(), "uwf-mark-isolation-"));
+  const repoRoot = join(root, "repo");
+  const dataDir = join(root, "data");
+  const outputPath = join(dataDir, "workflow-artifacts");
+  mkdirSync(join(repoRoot, "node_modules", "pkg"), { recursive: true });
+  mkdirSync(join(repoRoot, "node_modules", ".bin"), { recursive: true });
+  mkdirSync(outputPath, { recursive: true });
+  writeFileSync(join(repoRoot, "node_modules", "pkg", "index.js"), "export const v = 1;\n");
+  symlinkSync("../pkg/index.js", join(repoRoot, "node_modules", ".bin", "pkg-cli"));
+
+  try {
+    // 1. Mark intake BEFORE uwf-issues.json exists in dataDir (attempt 1 must fail data-backed gate)
+    writeFileSync(join(outputPath, "issues-intake.md"), "# Intake\nReady\n");
+    const ev1 = markStage("intake", { dataDir, outputPath, repoRoot, snapshotWorkspace: true });
+    assert.ok(ev1.dataSnapshotDir && existsSync(ev1.dataSnapshotDir), "dataSnapshotDir captured");
+    assert.equal(lstatSync(join(ev1.repoSnapshotDir, "node_modules")).isSymbolicLink(), false, "node_modules must not symlink live repo");
+    assert.equal(lstatSync(join(ev1.repoSnapshotDir, "node_modules", ".bin", "pkg-cli")).isSymbolicLink(), true, "internal relative .bin symlink preserved");
+
+    // Mutate live dataDir & live node_modules after attempt 1
+    writeFileSync(join(dataDir, "uwf-issues.json"), JSON.stringify({ issues: [{ id: 1, status: "open" }] }));
+    writeFileSync(join(repoRoot, "node_modules", "pkg", "index.js"), "export const v = 999;\n");
+
+    // Snapshot 1 must remain isolated from later live mutations
+    assert.equal(existsSync(join(ev1.dataSnapshotDir, "uwf-issues.json")), false);
+    assert.equal(readFileSync(join(ev1.repoSnapshotDir, "node_modules", "pkg", "index.js"), "utf8"), "export const v = 1;\n");
+
+    // 2. Mark intake AFTER uwf-issues.json is populated (attempt 2 passes)
+    const ev2 = markStage("intake", { dataDir, outputPath, repoRoot, snapshotWorkspace: true });
+    assert.equal(existsSync(join(ev2.dataSnapshotDir, "uwf-issues.json")), true);
+
+    const cliFn = (script, args) => {
+      if (script === "RUN_SCRIPT" && args[0] === "--check-gate") {
+        return existsSync(join(dataDir, "uwf-issues.json"))
+          ? { ok: true, data: { stage: "intake", passed: true, failures: [], prescriptions: [] } }
+          : { ok: false, data: { stage: "intake", passed: false, failures: ["Missing uwf-issues.json"], prescriptions: ["Populate issues"] } };
+      }
+      return { ok: true, data: {} };
+    };
+    const runGateAtFn = (_script, _args, opts = {}) => {
+      const checkData = opts.dataDir ?? dataDir;
+      return existsSync(join(checkData, "uwf-issues.json"))
+        ? { ok: true, data: { stage: "intake", passed: true, failures: [], prescriptions: [] } }
+        : { ok: false, data: { stage: "intake", passed: false, failures: ["Missing uwf-issues.json"], prescriptions: ["Populate issues"] } };
+    };
+
+    const evaluated = await evaluateMonolithGates({
+      workflow: "sw_dev",
+      stages: [{ name: "intake", gated: true, conditional: false }],
+      runScript: "RUN_SCRIPT",
+      outputPath,
+      dataDir,
+      sessionOk: true,
+      cli: cliFn,
+      runGateAt: runGateAtFn,
+      repoRoot,
+      markEvents: readMarkEvents(dataDir),
+      requireStageMarks: true,
+    });
+    assert.equal(evaluated.allPassed, true);
+    assert.equal(evaluated.stages[0].firstTryPass, false, "attempt 1 failed data gate before retry populated dataDir");
+    assert.equal(evaluated.stages[0].retriesToPass, 1);
+    assert.equal(evaluated.stages[0].attemptResults[0].passed, false);
+    assert.equal(evaluated.stages[0].attemptResults[1].passed, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+
 
 if (failures) {
   console.log(`\n${failures} monolith test(s) FAILED`);

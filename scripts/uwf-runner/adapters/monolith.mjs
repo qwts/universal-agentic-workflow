@@ -453,16 +453,18 @@ export async function evaluateMonolithGates({
     if (!snapshot) {
       return cli(runScript, ["--check-gate", stageName], withOut);
     }
+    const snapDataDir = snapshot.dataSnapshotDir ?? dataDir;
     const extra = [
       "--output-path",
       snapshot.artifactsDir ?? outputPath,
       "--data-dir",
-      dataDir,
+      snapDataDir,
       ...(skillsRoot ? ["--skills-root", skillsRoot] : []),
     ];
     if (typeof runGateAt === "function") {
       return runGateAt(runScript, ["--check-gate", stageName, ...extra], {
         cwd: snapshot.repoSnapshotDir ?? repoRoot,
+        dataDir: snapDataDir,
       });
     }
     return cli(runScript, ["--check-gate", stageName], extra);

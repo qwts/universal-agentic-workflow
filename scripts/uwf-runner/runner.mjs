@@ -405,7 +405,8 @@ async function main(argv) {
 
     const adapter = await loadAdapter(adapterName);
     if (adapterName === "monolith") {
-      const runGateAt = (script, args, opts = {}) => runCli(script, args, { cwd: opts.cwd ?? repoRoot, env: cliEnv });
+      const runGateAt = (script, args, opts = {}) =>
+        runCli(script, args, { cwd: opts.cwd ?? repoRoot, env: opts.dataDir ? { ...cliEnv, UWF_DATA_DIR: opts.dataDir } : cliEnv });
       const res = await adapter.runMonolith({
         workflow, stages: stages.slice(start), runScript, trackerScript: TRACKER, stateScript: STATE,
         repoRoot, skillsRoot, outputPath, dataDir, goal, flags, fixtureDir, timeoutMs, maxCostUsd,
