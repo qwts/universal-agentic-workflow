@@ -102,6 +102,7 @@ async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, ou
     return finish(EXIT.GATE, rows, `provenance manifest generation failed (${err.message})`, note);
   }
   rmSync(join(dataDir, FINALIZE_PENDING_FILE), { force: true });
+  rmSync(join(dataDir, ROUTING_FILE), { force: true });
   return finish(EXIT.OK, rows, "workflow complete", note);
 }
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (canonical order; each workflow visits a subsequence of it).
@@ -452,7 +453,17 @@ async function main(argv) {
         }
       }
       if (!flags["from-stage"]) {
-        const hadPriorRun = priorTracked.length > 0 || existsSync(join(dataDir, "uaw-manifest.json"));
+        let existingMetaWorkflow = null;
+        const existingMetaPath = join(dataDir, "run-meta.json");
+        if (existsSync(existingMetaPath)) {
+          try { existingMetaWorkflow = JSON.parse(readFileSync(existingMetaPath, "utf8"))?.workflow ?? null; } catch { /* ignore */ }
+        }
+        const hadPriorRun =
+          priorTracked.length > 0 ||
+          existsSync(join(dataDir, "uaw-manifest.json")) ||
+          existsSync(join(dataDir, "uwf-stages.db")) ||
+          existsSync(join(dataDir, "uwf-state.db")) ||
+          Boolean(existingMetaWorkflow && existingMetaWorkflow !== workflow);
         const meta = ensureRunMeta(dataDir, {
           workflow,
           outputPath,
@@ -787,7 +798,6 @@ async function stageLoop(ctx) {
     const doneTrips = [...trips].filter(([k]) => k.startsWith(`${st.name}|`)).reduce((n, [, v]) => n + v, 0);
     if (doneTrips && row.result.startsWith("passed")) row.result += ` after ${doneTrips} round trip(s)`;
   }
-  rmSync(routingPath, { force: true });
   return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log });
 
   function advancePhase(target, stageName, phaseFlags) {

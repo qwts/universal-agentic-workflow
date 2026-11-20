@@ -597,6 +597,102 @@ try {
     assert.equal(cliSealedManifest.architecture.br?.sha256, sha256Hex(readFileSync(brAbs)));
     assert.equal(cliSealedManifest.architecture.changelog_snapshot?.path, "tmp/workflow-artifacts/uwf-changelog.md");
     assert.equal(cliSealedManifest.architecture.changelog_snapshot?.sha256, sha256Hex(readFileSync(changelogAbs)));
+
+    // Step M1: local non-deferred runner run must fail closed if retro tampers with earlier stage output
+    const fxTamper = join(runRoot, "fx-tamper");
+    const rootTamper = join(runRoot, "root-tamper");
+    const dataTamper = join(runRoot, "data-tamper");
+    cpSync(fxDir, fxTamper, { recursive: true });
+    mkdirSync(rootTamper, { recursive: true });
+    writeFileSync(join(rootTamper, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const retroFx = JSON.parse(readFileSync(join(fxTamper, "retro.json"), "utf8"));
+    retroFx.files["tmp/workflow-artifacts/issues-intake.md"] = "# Intake\nTAMPERED_DURING_RETRO\n";
+    writeFileSync(join(fxTamper, "retro.json"), JSON.stringify(retroFx, null, 2));
+    let tamperExit = 0;
+    let tamperErr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Tamper test", "--adapter", "fake", "--repo-root", rootTamper, "--data-dir", dataTamper],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxTamper, UWF_DATA_DIR: "" }, stdio: "pipe" },
+      );
+    } catch (err) {
+      tamperExit = err.status;
+      tamperErr = String(err.stderr ?? "");
+    }
+    assert.equal(tamperExit, 1, "local run must exit 1 (EXIT.GATE) when retro mutates an earlier stage output");
+    assert.match(tamperErr, /Stage output integrity verification failed|Unexpected post-stage mutation/);
+    const tamperOnDisk = JSON.parse(readFileSync(join(dataTamper, "uaw-manifest.json"), "utf8"));
+    assert.equal(tamperOnDisk.phase, "snapshot", "tampered run must leave checkpoint at phase=snapshot and never emit closed/sealed manifest");
+
+    // Step M2: on_verdict review round-trip preserves round_trips count in materialized manifest
+    const fxRoute = join(runRoot, "fx-route");
+    const rootRoute = join(runRoot, "root-route");
+    const dataRoute = join(runRoot, "data-route");
+    cpSync(fxDir, fxRoute, { recursive: true });
+    mkdirSync(rootRoute, { recursive: true });
+    writeFileSync(join(rootRoute, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const goodReview = JSON.parse(readFileSync(join(fxRoute, "review.json"), "utf8"));
+    writeFileSync(
+      join(fxRoute, "review.json"),
+      JSON.stringify({
+        attempts: [
+          {
+            files: {
+              "tmp/workflow-artifacts/issues-review.md": "# Review\n\nverdict: changes_requested\n\n- high: fix item\n",
+              "tmp/workflow-artifacts/issues-review.result.json":
+                JSON.stringify({ verdict: "changes_requested", findings: [{ severity: "high", summary: "fix item" }] }) + "\n",
+            },
+            transcript: "review: changes requested",
+            delayMs: 0,
+          },
+          goodReview,
+        ],
+      }),
+    );
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Round trip test", "--adapter", "fake", "--repo-root", rootRoute, "--data-dir", dataRoute, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxRoute, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    const routedManifest = JSON.parse(readFileSync(join(dataRoute, "uaw-manifest.json"), "utf8"));
+    const reviewAudit = routedManifest.execution_audit.stages.find((s) => s.stage === "review");
+    assert.ok(reviewAudit && reviewAudit.round_trips >= 1, `expected review round_trips >= 1, got ${JSON.stringify(reviewAudit)}`);
+    assert.equal(existsSync(join(dataRoute, "runner-routing.json")), false, "runner-routing.json should be cleaned up after finalization");
+
+    // Step M3: switching workflows in an incomplete dataDir without --force rotates run_id cleanly
+    const rootSwitch = join(runRoot, "root-switch");
+    const dataSwitch = join(runRoot, "data-switch");
+    const fxEmpty = join(runRoot, "fx-empty");
+    mkdirSync(rootSwitch, { recursive: true });
+    mkdirSync(fxEmpty, { recursive: true });
+    writeFileSync(join(rootSwitch, ".uwf.json"), JSON.stringify({ verify: [] }));
+    writeFileSync(join(fxEmpty, "intake.json"), JSON.stringify({ files: {}, transcript: "empty intake", delayMs: 0 }));
+    let pmExit = 0;
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "project_manager", "--goal", "Incomplete PM run", "--adapter", "fake", "--repo-root", rootSwitch, "--data-dir", dataSwitch],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxEmpty, UWF_DATA_DIR: "" }, stdio: "pipe" },
+      );
+    } catch (err) {
+      pmExit = err.status;
+    }
+    assert.equal(pmExit, 1, "incomplete project_manager fixture run should exit 1");
+    assert.equal(existsSync(join(dataSwitch, "uaw-manifest.json")), false);
+    const pmMeta = JSON.parse(readFileSync(join(dataSwitch, "run-meta.json"), "utf8"));
+    assert.equal(pmMeta.workflow, "project_manager");
+
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Switch workflow without force", "--adapter", "fake", "--repo-root", rootSwitch, "--data-dir", dataSwitch, "--defer-seal"],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const swMeta = JSON.parse(readFileSync(join(dataSwitch, "run-meta.json"), "utf8"));
+    const swManifest = JSON.parse(readFileSync(join(dataSwitch, "uaw-manifest.json"), "utf8"));
+    assert.notEqual(swMeta.run_id, pmMeta.run_id, "switching workflows must rotate run_id");
+    assert.equal(swMeta.workflow, "sw_dev");
+    assert.equal(swManifest.workflow, "sw_dev");
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

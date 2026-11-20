@@ -292,7 +292,8 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE/target"
             --skills-root "$GITHUB_WORKSPACE/uwf"
             --data-dir "$UWF_DATA_DIR"
-            --max-cost-usd "$INPUT_MAX_COST_USD")
+            --max-cost-usd "$INPUT_MAX_COST_USD"
+            --defer-seal)
           # skip keeps the old behaviour (questions are marked skipped); pause lets required ones end the run with exit 3.
           if [ "$INPUT_ON_QUESTIONS" = skip ]; then
             args+=(--non-interactive)
@@ -360,6 +361,57 @@ jobs:
           set -uo pipefail
           node uwf/scripts/uwf-on-pr/push-as-bot.mjs
 
+      - name: Seal provenance manifest
+        id: seal
+        if: ${{ always() && steps.run.outputs.exit_code == '0' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PUSH_RESULT: ${{ runner.temp }}/push-result.json
+          TARGET_DIR: ${{ github.workspace }}/target
+          INPUT_WORKFLOW: ${{ inputs.workflow }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PUSH_RESULT" ]; then
+            echo "::notice::skipping provenance seal (missing push-result.json); manifest remains closed"
+            exit 0
+          fi
+          push_status=$(node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.env.PUSH_RESULT,"utf8"));process.stdout.write(String(r.status||""));')
+          pushed_sha=$(node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.env.PUSH_RESULT,"utf8"));process.stdout.write(String(r.sha||""));')
+          if [ "$push_status" = pushed ]; then
+            case "$pushed_sha" in
+              (*[!0-9a-f]*|'')
+                echo "::error::unexpected pushed sha in push-result.json"
+                exit 1
+                ;;
+            esac
+            if [ "${#pushed_sha}" -ne 40 ]; then
+              echo "::error::unexpected pushed sha length in push-result.json"
+              exit 1
+            fi
+            basic_auth=$(node -e 'process.stdout.write("AUTHORIZATION: basic " + Buffer.from("x-access-token:" + process.env.GH_TOKEN).toString("base64"));')
+            GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL%/}/.extraheader" \
+              GIT_CONFIG_VALUE_0="$basic_auth" \
+              git -C "$TARGET_DIR" fetch --depth=1 origin "$pushed_sha"
+            head_commit="$pushed_sha"
+          elif [ "$push_status" = no-changes ]; then
+            head_commit="$EXPECTED_SHA"
+          else
+            echo "::notice::skipping provenance seal (push status: ${push_status:-unknown}); manifest remains closed"
+            exit 0
+          fi
+          node uwf/scripts/uwf-runner/provenance.mjs seal \
+            --data-dir "$UWF_DATA_DIR" \
+            --workflow "$INPUT_WORKFLOW" \
+            --repo-root "$TARGET_DIR" \
+            --skills-root "$GITHUB_WORKSPACE/uwf" \
+            --head-commit "$head_commit" \
+            --pr-url "$PR_URL"
+
       - name: Pause for questions
         id: pause
         if: ${{ always() && steps.run.outputs.exit_code == '3' && inputs.on_questions != 'skip' }}
@@ -424,6 +476,7 @@ jobs:
             target/tmp/workflow-artifacts
             ${{ runner.temp }}/uwf-${{ github.run_id }}/transcripts
             ${{ runner.temp }}/uwf-${{ github.run_id }}/workflow-artifacts
+            ${{ runner.temp }}/uwf-${{ github.run_id }}/uaw-manifest.json
             ${{ runner.temp }}/runner.log
           if-no-files-found: warn
           retention-days: 14

@@ -1441,6 +1441,17 @@ export async function materializeManifest({
     throw new Error(`Generated manifest failed schema validation: ${validationErrors.join("; ")}`);
   }
 
+  if (phase !== "snapshot") {
+    const outCheck = verifyManifestStageOutputs(built.manifest, {
+      dataDir: absDataDir,
+      repoRoot: resolve(repoRoot),
+      outputPath,
+    });
+    if (!outCheck.ok) {
+      throw new Error(`Stage output integrity verification failed: ${outCheck.errors.join("; ")}`);
+    }
+  }
+
   mkdirSync(absDataDir, { recursive: true });
   const manifestPath = join(absDataDir, MANIFEST_FILE);
   writeFileSync(manifestPath, built.canonicalJson, "utf8");
@@ -1490,36 +1501,16 @@ export async function materializeManifest({
 }
 
 /**
- * Verify `<data-dir>/uaw-manifest.json` integrity and un-superseded stage output digests on disk.
+ * Verify un-superseded stage output files recorded in `manifest.stages` still exist as
+ * regular files inside allowed roots and match their recorded `sha256` and `bytes`.
  */
-export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
+export function verifyManifestStageOutputs(manifest, { dataDir, repoRoot = OWN_ROOT, outputPath = null } = {}) {
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
-  const manifestPath = join(absDataDir, MANIFEST_FILE);
-  if (!existsSync(manifestPath)) {
-    return { ok: false, errors: [`Manifest not found at ${manifestPath}`] };
-  }
-  const rawText = readFileSync(manifestPath, "utf8");
-  let manifest;
-  try {
-    manifest = JSON.parse(rawText);
-  } catch (err) {
-    return { ok: false, errors: [`Invalid JSON in ${manifestPath}: ${err.message}`] };
-  }
-
-  const errors = validateManifest(manifest);
-
-  const { manifest_sha256: recordedSha, execution_audit: _audit, ...contentOnly } = manifest;
-  const computedSha = sha256Hex(canonicalizeJcs(contentOnly));
-  if (recordedSha !== computedSha) {
-    errors.push(`manifest_sha256 mismatch: recorded ${recordedSha}, computed ${computedSha}`);
-  }
-  if (rawText !== canonicalizeJcs(manifest)) {
-    errors.push("Manifest on disk is not canonical RFC 8785 JCS");
-  }
+  const errors = [];
 
   const latestByPath = new Map();
-  for (const st of manifest.stages ?? []) {
+  for (const st of manifest?.stages ?? []) {
     if (st.status === "skipped") {
       if (Array.isArray(st.outputs) && st.outputs.length > 0) {
         errors.push(`Skipped stage "${st.stage}" must have empty outputs[]`);
@@ -1531,13 +1522,12 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
     }
   }
 
-  const meta = (() => {
-    try { return JSON.parse(readFileSync(join(absDataDir, RUN_META_FILE), "utf8")); } catch { return null; }
-  })();
+  const meta = readExistingRunMeta(absDataDir);
   const realRepo = existsSync(absRepoRoot) ? realpathSync(absRepoRoot) : absRepoRoot;
   const realData = existsSync(absDataDir) ? realpathSync(absDataDir) : absDataDir;
-  const metaOut = meta?.output_path
-    ? (isAbsolute(meta.output_path) ? resolve(meta.output_path) : resolve(absRepoRoot, meta.output_path))
+  const rawOut = outputPath ?? meta?.output_path ?? null;
+  const metaOut = rawOut
+    ? (isAbsolute(rawOut) ? resolve(rawOut) : resolve(absRepoRoot, rawOut))
     : null;
   const realMetaOut = metaOut && existsSync(metaOut) ? realpathSync(metaOut) : metaOut;
 
@@ -1575,9 +1565,48 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
   return {
     ok: errors.length === 0,
     errors,
+    checkedOutputs: latestByPath.size,
+  };
+}
+
+/**
+ * Verify `<data-dir>/uaw-manifest.json` integrity and un-superseded stage output digests on disk.
+ */
+export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
+  const absDataDir = resolve(dataDir);
+  const absRepoRoot = resolve(repoRoot);
+  const manifestPath = join(absDataDir, MANIFEST_FILE);
+  if (!existsSync(manifestPath)) {
+    return { ok: false, errors: [`Manifest not found at ${manifestPath}`] };
+  }
+  const rawText = readFileSync(manifestPath, "utf8");
+  let manifest;
+  try {
+    manifest = JSON.parse(rawText);
+  } catch (err) {
+    return { ok: false, errors: [`Invalid JSON in ${manifestPath}: ${err.message}`] };
+  }
+
+  const errors = validateManifest(manifest);
+
+  const { manifest_sha256: recordedSha, execution_audit: _audit, ...contentOnly } = manifest;
+  const computedSha = sha256Hex(canonicalizeJcs(contentOnly));
+  if (recordedSha !== computedSha) {
+    errors.push(`manifest_sha256 mismatch: recorded ${recordedSha}, computed ${computedSha}`);
+  }
+  if (rawText !== canonicalizeJcs(manifest)) {
+    errors.push("Manifest on disk is not canonical RFC 8785 JCS");
+  }
+
+  const outCheck = verifyManifestStageOutputs(manifest, { dataDir: absDataDir, repoRoot: absRepoRoot });
+  errors.push(...outCheck.errors);
+
+  return {
+    ok: errors.length === 0,
+    errors,
     manifestPath,
     manifestSha256: recordedSha,
-    checkedOutputs: latestByPath.size,
+    checkedOutputs: outCheck.checkedOutputs,
   };
 }
 
