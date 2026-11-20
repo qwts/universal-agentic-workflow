@@ -12,6 +12,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -704,8 +705,9 @@ await test("evaluateMonolithGates skips untriggered conditional stages even when
     sessionOk: true,
     requireStageMarks: true,
     markEvents: [
-      { stage: "intake", seq: 1, timestamp: "2026-01-01T00:00:00Z" },
-      { stage: "adr", seq: 2, timestamp: "2026-01-01T00:01:00Z" },
+      { stage: "intake", seq: 1, timestamp: "2026-01-01T00:00:00Z", dataSnapshotDir: "/snap-intake-fail" },
+      { stage: "intake", seq: 2, timestamp: "2026-01-01T00:00:30Z", dataSnapshotDir: "/snap-intake-pass" },
+      { stage: "adr", seq: 3, timestamp: "2026-01-01T00:01:00Z", dataSnapshotDir: "/snap-adr" },
     ],
     cli: (script, args) => {
       if (script === "TRACKER") trackerCalls.push(args);
@@ -719,9 +721,11 @@ await test("evaluateMonolithGates skips untriggered conditional stages even when
       }
       return { ok: true, data: { ok: true } };
     },
-    runGateAt: (_script, args) => {
+    runGateAt: (_script, args, opts) => {
       if (args[1] === "intake") {
-        return { ok: false, data: { stage: "intake", passed: false, failures: ["missing on attempt 1"], prescriptions: [] } };
+        return opts?.dataDir === "/snap-intake-pass"
+          ? { ok: true, data: { stage: "intake", passed: true, failures: [], prescriptions: [] } }
+          : { ok: false, data: { stage: "intake", passed: false, failures: ["missing on attempt 1"], prescriptions: [] } };
       }
       return { ok: true, data: { stage: args[1], passed: true, failures: [], prescriptions: [], note: "conditional — not required" } };
     },
@@ -772,6 +776,108 @@ await test("evaluateMonolithGates skips untriggered conditional stages even when
   assert.equal(evTriggered.stages[0].retriesToPass, 1);
   assert.equal(evTriggered.stages[0].attemptResults[0].passed, false);
   assert.equal(evTriggered.stages[0].attemptResults[1].passed, true);
+});
+
+await test("evaluateMonolithGates derives terminal passed/allPassed from last marked snapshot, not live tree drift", async () => {
+  const trackerCalls = [];
+  // Case A: intake passed at mark snapshot, then a later stage mutated/broke intake on disk -> stays PASSED.
+  // Case B: discovery failed all mark snapshots, then an unmarked later edit repaired discovery on disk -> stays FAILED & neverPassed: true.
+  const ev = await evaluateMonolithGates({
+    workflow: "sw_dev",
+    stages: [
+      { name: "intake", gated: true, conditional: false },
+      { name: "discovery", gated: true, conditional: false },
+    ],
+    runScript: "RUN_SCRIPT",
+    trackerScript: "TRACKER",
+    outputPath: "/out",
+    dataDir: "/data",
+    sessionOk: true,
+    requireStageMarks: true,
+    markEvents: [
+      { stage: "intake", seq: 1, timestamp: "2026-01-01T00:00:00Z", dataSnapshotDir: "/snap-intake" },
+      { stage: "discovery", seq: 2, timestamp: "2026-01-01T00:01:00Z", dataSnapshotDir: "/snap-discovery-1" },
+      { stage: "discovery", seq: 3, timestamp: "2026-01-01T00:02:00Z", dataSnapshotDir: "/snap-discovery-2" },
+    ],
+    cli: (script, args) => {
+      if (script === "TRACKER") trackerCalls.push(args);
+      if (script === "RUN_SCRIPT" && args[0] === "--check-gate") {
+        if (args[1] === "intake") {
+          return { ok: false, data: { stage: "intake", passed: false, failures: ["later stage overwrote intake"], prescriptions: [] } };
+        }
+        if (args[1] === "discovery") {
+          return { ok: true, data: { stage: "discovery", passed: true, failures: [], prescriptions: [] } };
+        }
+      }
+      return { ok: true, data: { ok: true } };
+    },
+    runGateAt: (_s, args) => {
+      if (args[1] === "intake") {
+        return { ok: true, data: { stage: "intake", passed: true, failures: [], prescriptions: [] } };
+      }
+      return { ok: false, data: { stage: "discovery", passed: false, failures: ["missing at mark time"], prescriptions: ["Write discovery"] } };
+    },
+  });
+
+  const intake = ev.stages.find((s) => s.stage === "intake");
+  const discovery = ev.stages.find((s) => s.stage === "discovery");
+  assert.equal(intake.passed, true, "marked stage passing at snapshot stays passed despite live tree mutation");
+  assert.equal(intake.firstTryPass, true);
+  assert.equal(discovery.passed, false, "all-failed marked stage stays failed despite unmarked live tree repair");
+  assert.equal(discovery.neverPassed, true);
+  assert.deepEqual(discovery.failures, ["missing at mark time"]);
+  assert.equal(ev.allPassed, false);
+  assert.ok(trackerCalls.some((a) => a[0] === "stage-complete" && a.includes("intake")));
+  assert.ok(trackerCalls.some((a) => a[0] === "stage-fail" && a.includes("discovery")));
+});
+
+await test("markStage preserves isolated .git metadata in repoSnapshotDir (standard repo and linked git worktree)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "uwf-mark-git-"));
+  const repo = join(root, "repo");
+  const wt = join(root, "worktree");
+  mkdirSync(repo, { recursive: true });
+  const runGit = (cwd, args) =>
+    execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "test@example.com" },
+    });
+
+  try {
+    runGit(repo, ["init", "-q"]);
+    writeFileSync(join(repo, "app.js"), "export const x = 1;\n");
+    runGit(repo, ["add", "app.js"]);
+    runGit(repo, ["commit", "-q", "--no-gpg-sign", "-m", "init"]);
+
+    // Standard repo snapshot with branch named logs/test and clean working tree -> refs preserved & diff clean
+    runGit(repo, ["checkout", "-q", "-b", "logs/test"]);
+    const dataStd = join(root, "data-std");
+    const evStd = markStage("implementation", {
+      dataDir: dataStd,
+      repoRoot: repo,
+      snapshotWorkspace: true,
+    });
+    writeFileSync(join(repo, "app.js"), "export const x = 999; // dirty later\n");
+    execFileSync("git", ["-C", evStd.repoSnapshotDir, "diff", "--exit-code"], { encoding: "utf8" });
+    assert.equal(
+      execFileSync("git", ["-C", evStd.repoSnapshotDir, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim(),
+      "logs/test",
+    );
+
+    // Restore clean file, create linked git worktree, mark inside worktree while clean, then dirty worktree later
+    runGit(repo, ["checkout", "--", "app.js"]);
+    runGit(repo, ["worktree", "add", "-q", "-b", "wt-branch", wt]);
+    const dataWt = join(root, "data-wt");
+    const evWt = markStage("implementation", {
+      dataDir: dataWt,
+      repoRoot: wt,
+      snapshotWorkspace: true,
+    });
+    writeFileSync(join(wt, "app.js"), "export const x = 42; // dirty wt later\n");
+    execFileSync("git", ["-C", evWt.repoSnapshotDir, "diff", "--exit-code"], { encoding: "utf8" });
+    assert.ok(lstatSync(join(evWt.repoSnapshotDir, ".git")).isDirectory(), "worktree snapshot must contain standalone .git directory");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 if (failures) {

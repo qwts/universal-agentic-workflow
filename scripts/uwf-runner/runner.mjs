@@ -37,6 +37,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
+import { GIT_ENV_OVERRIDES } from "./mark-stage.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
 
@@ -128,9 +129,11 @@ class UsageError extends Error {}
 // ---------------------------------------------------------------------------
 
 /** Run one of the existing CLIs (no shell). Returns { ok, data, error, code }. */
-export function runCli(scriptPath, args, { cwd, env } = {}) {
+export function runCli(scriptPath, args, { cwd, env, unsetEnv = [] } = {}) {
+  const mergedEnv = { ...process.env, ...env };
+  for (const k of unsetEnv) delete mergedEnv[k];
   const r = spawnSync(process.execPath, [scriptPath, ...args], {
-    cwd, env: { ...process.env, ...env }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    cwd, env: mergedEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
   });
   let data = null;
   try { data = JSON.parse(r.stdout); } catch { /* non-JSON output */ }
@@ -406,7 +409,11 @@ async function main(argv) {
     const adapter = await loadAdapter(adapterName);
     if (adapterName === "monolith") {
       const runGateAt = (script, args, opts = {}) =>
-        runCli(script, args, { cwd: opts.cwd ?? repoRoot, env: opts.dataDir ? { ...cliEnv, UWF_DATA_DIR: opts.dataDir } : cliEnv });
+        runCli(script, args, {
+          cwd: opts.cwd ?? repoRoot,
+          env: opts.dataDir ? { ...cliEnv, UWF_DATA_DIR: opts.dataDir } : cliEnv,
+          unsetEnv: opts.cwd && resolve(opts.cwd) !== resolve(repoRoot) ? GIT_ENV_OVERRIDES : [],
+        });
       const res = await adapter.runMonolith({
         workflow, stages: stages.slice(start), runScript, trackerScript: TRACKER, stateScript: STATE,
         repoRoot, skillsRoot, outputPath, dataDir, goal, flags, fixtureDir, timeoutMs, maxCostUsd,

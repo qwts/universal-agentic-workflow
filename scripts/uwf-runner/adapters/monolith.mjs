@@ -491,12 +491,14 @@ export async function evaluateMonolithGates({
     const isConditional = st.conditional === true;
     const evList = (markEvents ?? []).filter((e) => e.stage === st.name);
 
-    // Evaluate snapshots first so the final end-of-session check below leaves uwf-stages.db with final state.
+    // Evaluate snapshots first so each immutable mark attempt reflects its capture-time state.
+    let lastSg = null;
     const attemptResults = [];
     if (isGated) {
       for (let idx = 0; idx < evList.length; idx++) {
         const ev = evList[idx];
         const sg = checkGateAt(st.name, ev);
+        lastSg = sg;
         const parsed = parseGateFailures(sg);
         const snapNotRequired = isConditional && sg.ok && /not required/i.test(sg.data?.note ?? "");
         attemptResults.push({
@@ -510,7 +512,7 @@ export async function evaluateMonolithGates({
       }
     }
 
-    const g = checkGateAt(st.name, null);
+    const g = evList.length === 0 || !isGated || isConditional ? checkGateAt(st.name, null) : lastSg;
 
     if (isConditional && g.ok && /not required/i.test(g.data?.note ?? "")) {
       if (trackerScript) {
@@ -591,22 +593,27 @@ export async function evaluateMonolithGates({
       continue;
     }
 
+    const terminalGate = evList.length > 0 ? lastSg : g;
+    const lastAttempt = evList.length > 0 ? attemptResults[attemptResults.length - 1] : null;
+    const terminalPassed = lastAttempt ? Boolean(lastAttempt.passed) : Boolean(g.ok);
     const neverMarked = evList.length === 0 && Boolean(requireStageMarks);
     const firstTryPass = evList.length > 0
       ? Boolean(attemptResults[0].passed)
       : requireStageMarks
         ? false
-        : Boolean(g.ok);
+        : terminalPassed;
     const firstPassIdx = attemptResults.findIndex((a) => a.passed);
     const attempts = evList.length > 0 ? evList.length : 1;
     const retriesToPass = evList.length > 0
-      ? (firstPassIdx >= 0 ? firstPassIdx : (g.ok ? evList.length : (st.maxRetries ?? 2) + 1))
+      ? (terminalPassed
+          ? (firstPassIdx >= 0 ? firstPassIdx : evList.length - 1)
+          : (st.maxRetries ?? 2) + 1)
       : requireStageMarks
-        ? (g.ok ? 1 : (st.maxRetries ?? 2) + 1)
-        : (g.ok ? 0 : (st.maxRetries ?? 2) + 1);
-    const neverPassed = !g.ok && firstPassIdx < 0;
+        ? (terminalPassed ? 1 : (st.maxRetries ?? 2) + 1)
+        : (terminalPassed ? 0 : (st.maxRetries ?? 2) + 1);
+    const neverPassed = !terminalPassed;
 
-    if (g.ok) {
+    if (terminalPassed) {
       if (trackerScript) {
         cli(trackerScript, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs], withOut);
       }
@@ -639,10 +646,17 @@ export async function evaluateMonolithGates({
         failures: [],
         prescriptions: [],
         verdict: null,
-        note: g.data?.note ?? null,
+        note: terminalGate?.data?.note ?? null,
       });
     } else {
-      const { failures, prescriptions, verdict } = parseGateFailures(g);
+      const parsedTerminal = lastAttempt && !lastAttempt.passed
+        ? {
+            failures: lastAttempt.failures?.length ? lastAttempt.failures : parseGateFailures(terminalGate).failures,
+            prescriptions: parseGateFailures(terminalGate).prescriptions,
+            verdict: lastAttempt.verdict ?? parseGateFailures(terminalGate).verdict,
+          }
+        : parseGateFailures(terminalGate);
+      const { failures, prescriptions, verdict } = parsedTerminal;
       if (trackerScript) {
         cli(trackerScript, ["stage-fail", "--workflow", workflow, "--stage", st.name, "--note", failures.join("; "), ...sessionArgs], withOut);
       }

@@ -12,10 +12,12 @@
  * `<dataDir>/monolith-events.json`.
  */
 
+import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   cpSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -24,7 +26,9 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -96,35 +100,99 @@ const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),
 function withMarkLock(absDataDir, fn) {
   mkdirSync(absDataDir, { recursive: true });
   const lockPath = join(absDataDir, "mark-stage.lock");
+  const reclaimPath = `${lockPath}.reclaim`;
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const tmpPath = `${lockPath}.${token}.tmp`;
   const deadline = Date.now() + 5_000;
-  while (true) {
-    try {
-      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, ts: Date.now() }), { flag: "wx" });
-      break;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      if (Date.now() >= deadline) {
-        // Reclaim stale lock only if holder PID is dead or unreadable/old.
-        let reclaim = false;
+  let acquired = false;
+  let linkedIno = null;
+
+  try {
+    writeFileSync(tmpPath, JSON.stringify({ pid: process.pid, token, ts: Date.now() }) + "\n", "utf8");
+    while (!acquired) {
+      try {
+        linkSync(tmpPath, lockPath);
+        linkedIno = statSync(lockPath).ino;
+        acquired = true;
+        break;
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+      }
+
+      let st;
+      try {
+        st = statSync(lockPath);
+      } catch {
+        continue;
+      }
+      let holder = null;
+      try {
+        holder = JSON.parse(readFileSync(lockPath, "utf8"));
+      } catch {
+        holder = null;
+      }
+      let deadPid = false;
+      if (holder && Number.isInteger(holder.pid) && holder.pid > 0) {
         try {
-          const holder = JSON.parse(readFileSync(lockPath, "utf8"));
-          try { process.kill(holder.pid, 0); } catch (ke) { if (ke.code === "ESRCH") reclaim = true; }
-        } catch {
-          reclaim = true;
+          process.kill(holder.pid, 0);
+        } catch (ke) {
+          if (ke.code === "ESRCH") deadPid = true;
         }
-        if (reclaim) {
-          rmSync(lockPath, { force: true });
-          continue;
+      }
+      const corruptStale = (!holder || !Number.isInteger(holder.pid)) && Date.now() - st.mtimeMs > 1_000;
+      if (deadPid || corruptStale) {
+        let holdingReclaim = false;
+        try {
+          writeFileSync(reclaimPath, JSON.stringify({ pid: process.pid, token, ts: Date.now() }) + "\n", { flag: "wx" });
+          holdingReclaim = true;
+        } catch (reclaimErr) {
+          if (reclaimErr.code === "EEXIST") {
+            try {
+              const rst = statSync(reclaimPath);
+              if (Date.now() - rst.mtimeMs > 1_000) {
+                rmSync(reclaimPath, { force: true });
+              }
+            } catch {
+              /* reclaim released */
+            }
+          }
         }
+        if (holdingReclaim) {
+          let reclaimed = false;
+          try {
+            const stNow = statSync(lockPath);
+            let cur = null;
+            try { cur = JSON.parse(readFileSync(lockPath, "utf8")); } catch { /* corrupt */ }
+            if (stNow.ino === st.ino && (!holder?.token || cur?.token === holder.token)) {
+              unlinkSync(lockPath);
+              reclaimed = true;
+            }
+          } catch (unlinkErr) {
+            if (unlinkErr.code === "ENOENT") reclaimed = true;
+          } finally {
+            rmSync(reclaimPath, { force: true });
+          }
+          if (reclaimed) continue;
+        }
+      }
+      if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for mark-stage lock at ${lockPath}`);
       }
       sleepSync(15);
     }
-  }
-  try {
     return fn();
   } finally {
-    rmSync(lockPath, { force: true });
+    rmSync(tmpPath, { force: true });
+    if (acquired && linkedIno !== null) {
+      try {
+        const cur = JSON.parse(readFileSync(lockPath, "utf8"));
+        if (statSync(lockPath).ino === linkedIno && cur?.token === token) {
+          unlinkSync(lockPath);
+        }
+      } catch {
+        /* lock already removed */
+      }
+    }
   }
 }
 
@@ -259,6 +327,169 @@ function safeRealPath(p) {
   }
 }
 
+export const GIT_ENV_OVERRIDES = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_VERSION",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+];
+const MAX_DIRECT_OBJECTS_BYTES = 16 * 1024 * 1024;
+
+function cleanGitEnv() {
+  const env = { ...process.env };
+  for (const k of GIT_ENV_OVERRIDES) delete env[k];
+  return env;
+}
+
+function copySafeGitEntry(src, dest) {
+  let lst;
+  try {
+    lst = lstatSync(src);
+  } catch {
+    return;
+  }
+  if (lst.isSymbolicLink()) return;
+  const name = src.split(/[\\/]/).pop();
+  if (name && name.endsWith(".lock")) return;
+  if (lst.isFile()) {
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(src, dest);
+    return;
+  }
+  if (lst.isDirectory()) {
+    mkdirSync(dest, { recursive: true });
+    for (const entry of readdirSync(src, { withFileTypes: true })) {
+      if (entry.name.endsWith(".lock")) continue;
+      copySafeGitEntry(join(src, entry.name), join(dest, entry.name));
+    }
+  }
+}
+
+function measureObjectsSize(dir, limit) {
+  let total = 0;
+  function walk(cur) {
+    if (total > limit) return;
+    let entries;
+    try {
+      entries = readdirSync(cur, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (total > limit) return;
+      const p = join(cur, entry.name);
+      let lst;
+      try {
+        lst = lstatSync(p);
+      } catch {
+        continue;
+      }
+      if (lst.isSymbolicLink()) continue;
+      if (lst.isDirectory()) walk(p);
+      else if (lst.isFile()) total += lst.size;
+    }
+  }
+  walk(dir);
+  return total;
+}
+
+function snapshotGitMetadata(absRepo, repoSnapshotDir) {
+  const dotGit = join(absRepo, ".git");
+  let dotGitLst;
+  try {
+    dotGitLst = lstatSync(dotGit);
+  } catch {
+    return;
+  }
+  if (dotGitLst.isSymbolicLink() || (!dotGitLst.isDirectory() && !dotGitLst.isFile())) {
+    return;
+  }
+
+  const gitEnv = cleanGitEnv();
+  let rawPaths;
+  try {
+    rawPaths = execFileSync(
+      "git",
+      ["-C", absRepo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+      { env: gitEnv, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+  } catch {
+    return;
+  }
+  const lines = rawPaths.trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) return;
+  let realGitDir;
+  let realCommonDir;
+  try {
+    realGitDir = realpathSync(lines[0]);
+    realCommonDir = realpathSync(lines[1]);
+    if (!lstatSync(realGitDir).isDirectory() || !lstatSync(realCommonDir).isDirectory()) return;
+  } catch {
+    return;
+  }
+
+  const destGit = join(repoSnapshotDir, ".git");
+  mkdirSync(destGit, { recursive: true });
+
+  for (const entryName of ["HEAD", "config", "packed-refs", "shallow", "refs", "info"]) {
+    copySafeGitEntry(join(realCommonDir, entryName), join(destGit, entryName));
+  }
+  for (const entryName of ["HEAD", "index", "ORIG_HEAD"]) {
+    copySafeGitEntry(join(realGitDir, entryName), join(destGit, entryName));
+  }
+
+  const destConfig = join(destGit, "config");
+  if (existsSync(destConfig)) {
+    for (const key of ["core.worktree", "core.hookspath"]) {
+      try {
+        execFileSync("git", ["config", "--file", destConfig, "--unset-all", key], {
+          env: gitEnv,
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+      } catch {
+        /* exit 5 when key is absent */
+      }
+    }
+  }
+
+  const srcObjects = join(realCommonDir, "objects");
+  try {
+    const objLst = lstatSync(srcObjects);
+    if (!objLst.isSymbolicLink() && objLst.isDirectory()) {
+      const realObjects = realpathSync(srcObjects);
+      const upstreamAlternates = join(realObjects, "info", "alternates");
+      const hasUpstreamAlternates = existsSync(upstreamAlternates);
+      if (!hasUpstreamAlternates && measureObjectsSize(realObjects, MAX_DIRECT_OBJECTS_BYTES) <= MAX_DIRECT_OBJECTS_BYTES) {
+        copySafeGitEntry(realObjects, join(destGit, "objects"));
+      } else {
+        const altLines = [];
+        if (hasUpstreamAlternates) {
+          try {
+            for (const line of readFileSync(upstreamAlternates, "utf8").split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith("#")) continue;
+              altLines.push(resolve(realObjects, trimmed));
+            }
+          } catch {
+            /* ignore unreadable upstream alternates */
+          }
+        }
+        altLines.push(realObjects);
+        const infoDir = join(destGit, "objects", "info");
+        mkdirSync(infoDir, { recursive: true });
+        writeFileSync(join(infoDir, "alternates"), [...new Set(altLines)].join("\n") + "\n", "utf8");
+      }
+    }
+  } catch {
+    /* ignore unreadable objects directory */
+  }
+}
+
 function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
   const absRepo = resolve(repoRoot);
   const realRepo = safeRealPath(absRepo);
@@ -303,6 +534,7 @@ function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
   }
 
   walkCopy(absRepo, repoSnapshotDir);
+  snapshotGitMetadata(absRepo, repoSnapshotDir);
 }
 
 /**
