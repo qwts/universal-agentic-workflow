@@ -518,6 +518,66 @@ try {
       failExit = err.status;
     }
     assert.equal(failExit, 1, "runner.mjs must exit 1 (EXIT.GATE), not 0, when materializeManifest fails");
+
+    // Step J: finalization failure remains retryable via resume & run until manifest succeeds
+    let retryStillBlocked = 0;
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData, "--defer-seal"],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      retryStillBlocked = err.status;
+    }
+    assert.equal(retryStillBlocked, 1, "resume must still fail when uaw-manifest.json write remains blocked");
+
+    // Unblock uaw-manifest.json and retry via resume -> must exit 0 and finalize manifest
+    rmSync(join(runData, "uaw-manifest.json"), { recursive: true, force: true });
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const healedManifest = JSON.parse(readFileSync(join(runData, "uaw-manifest.json"), "utf8"));
+    assert.equal(healedManifest.phase, "closed", "resume after deferred finalization failure preserves deferSeal phase=closed");
+
+    // Step K: snapshot strict sink failure leaves snapshot stage pending so resume replays it
+    let snapFailExit = 0;
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--from-stage", "snapshot", "--goal", "Fail snapshot sink", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData],
+        {
+          encoding: "utf8",
+          env: {
+            ...env,
+            UAW_CONTEXT_HUB_SINK: "webhook",
+            UAW_CONTEXT_HUB_URL: "http://127.0.0.1:1/unreachable",
+            UAW_CONTEXT_HUB_TOKEN: "tok",
+            UAW_CONTEXT_HUB_MODE: "strict",
+          },
+          stdio: "pipe",
+        },
+      );
+    } catch (err) {
+      snapFailExit = err.status;
+    }
+    assert.equal(snapFailExit, 1, "snapshot strict sink failure must exit 1");
+
+    const stagesDbAfterSnapFail = new Database(join(runData, "uwf-stages.db"), { readonly: true });
+    const snapRow = stagesDbAfterSnapFail.prepare("SELECT status FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'snapshot'").get();
+    stagesDbAfterSnapFail.close();
+    assert.equal(snapRow?.status, "pending", "snapshot stage must reset to pending when checkpoint dispatch fails");
+
+    // Clear strict sink and resume -> replays snapshot + retro and seals manifest
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const sealedManifest = JSON.parse(readFileSync(join(runData, "uaw-manifest.json"), "utf8"));
+    assert.equal(sealedManifest.phase, "sealed");
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

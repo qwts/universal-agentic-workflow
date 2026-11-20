@@ -50,6 +50,60 @@ const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
 const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings, so `resume` keeps them
+const FINALIZE_PENDING_FILE = "runner-finalize-pending.json";
+
+function readFinalizePending(dataDir) {
+  const p = join(dataDir, FINALIZE_PENDING_FILE);
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function needsFinalization(dataDir) {
+  if (existsSync(join(dataDir, FINALIZE_PENDING_FILE))) return true;
+  const manifestPath = join(dataDir, "uaw-manifest.json");
+  if (!existsSync(manifestPath)) return true;
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+    return parsed?.phase !== "closed" && parsed?.phase !== "sealed";
+  } catch {
+    return true;
+  }
+}
+
+async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log }) {
+  mkdirSync(dataDir, { recursive: true });
+  const pending = readFinalizePending(dataDir);
+  const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal);
+  const finalPhase = effectiveDeferSeal ? "closed" : "sealed";
+  writeFileSync(
+    join(dataDir, FINALIZE_PENDING_FILE),
+    JSON.stringify({ phase: finalPhase, defer_seal: effectiveDeferSeal, ts: new Date().toISOString() }) + "\n",
+  );
+  try {
+    const m = await materializeManifest({
+      dataDir,
+      workflow,
+      repoRoot,
+      skillsRoot,
+      outputPath,
+      phase: finalPhase,
+      deferSeal: effectiveDeferSeal,
+      dispatchSink: !effectiveDeferSeal,
+    });
+    if (!m.ok) {
+      return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+    }
+  } catch (err) {
+    log(`[runner] provenance manifest failed: ${err.message}`);
+    return finish(EXIT.GATE, rows, `provenance manifest generation failed (${err.message})`, note);
+  }
+  rmSync(join(dataDir, FINALIZE_PENDING_FILE), { force: true });
+  return finish(EXIT.OK, rows, "workflow complete", note);
+}
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (canonical order; each workflow visits a subsequence of it).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
@@ -358,6 +412,12 @@ async function main(argv) {
       reconcilePhase(tracked);
       start = stages.findIndex((st) => !isDone(tracked.find((x) => x.stage === st.name)?.status));
       if (start < 0) {
+        if (needsFinalization(dataDir)) {
+          ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
+          const n = note("runner resume: retrying pending provenance finalization");
+          if (!n.ok) log(`[runner] note not recorded: ${n.error}`);
+          return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows: tableRows(tracked), note, log });
+        }
         process.stdout.write(formatTable(tableRows(tracked)));
         return EXIT.OK;
       }
@@ -381,6 +441,11 @@ async function main(argv) {
       const priorTracked = readTracker();
       if (!flags["from-stage"] && flags.force !== true) {
         if (priorTracked.length && stages.every((st) => isDone(priorTracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
+          if (needsFinalization(dataDir)) {
+            ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
+            log("[runner] all stages complete; retrying pending provenance finalization");
+            return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows: tableRows(priorTracked), note, log });
+          }
           log("[runner] workflow already complete; nothing to do (use --force to start over)");
           process.stdout.write(formatTable(tableRows(priorTracked)));
           return EXIT.OK;
@@ -395,6 +460,7 @@ async function main(argv) {
           forceNew: flags.force === true || hadPriorRun,
         });
         rmSync(join(dataDir, ROUTING_FILE), { force: true });
+        rmSync(join(dataDir, FINALIZE_PENDING_FILE), { force: true });
         rmSync(join(dataDir, "uaw-manifest.json"), { force: true });
         for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init", "--run-id", meta.run_id]]]) {
           const r = cli(script, args, withOut);
@@ -624,12 +690,22 @@ async function stageLoop(ctx) {
           const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
           if (adv) row.result += ` (${adv})`;
           if (st.name === "snapshot") {
+            let snapErr = null;
             try {
               const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal });
-              if (!m.ok) return finish(EXIT.GATE, rows, `${tag}: context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+              if (!m.ok) snapErr = `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`;
             } catch (err) {
               log(`[runner] provenance manifest at snapshot failed: ${err.message}`);
-              return finish(EXIT.GATE, rows, `${tag}: provenance manifest generation failed (${err.message})`, note);
+              snapErr = `provenance manifest generation failed (${err.message})`;
+            }
+            if (snapErr) {
+              resetFrom(i);
+              rollbackPhase(i);
+              if (sessionId && st.retryMode !== "fresh") {
+                cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
+              }
+              row.result = "failed (provenance)";
+              return finish(EXIT.GATE, rows, `${tag}: ${snapErr}`, note);
             }
           }
           if (over) return capStop(`${st.name} passed`);
@@ -712,24 +788,7 @@ async function stageLoop(ctx) {
     if (doneTrips && row.result.startsWith("passed")) row.result += ` after ${doneTrips} round trip(s)`;
   }
   rmSync(routingPath, { force: true });
-  try {
-    const finalPhase = deferSeal ? "closed" : "sealed";
-    const m = await materializeManifest({
-      dataDir,
-      workflow,
-      repoRoot,
-      skillsRoot,
-      outputPath,
-      phase: finalPhase,
-      deferSeal,
-      dispatchSink: !deferSeal,
-    });
-    if (!m.ok) return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
-  } catch (err) {
-    log(`[runner] provenance manifest failed: ${err.message}`);
-    return finish(EXIT.GATE, rows, `provenance manifest generation failed (${err.message})`, note);
-  }
-  return finish(EXIT.OK, rows, "workflow complete", note);
+  return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log });
 
   function advancePhase(target, stageName, phaseFlags) {
     const cur = cli(STATE, ["read"], withOut);
