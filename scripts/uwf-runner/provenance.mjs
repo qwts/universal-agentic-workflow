@@ -111,46 +111,163 @@ function resolveHeadSha(repoRoot) {
   }
 }
 
+function recoverPersistedRunIdentity(absDataDir) {
+  const out = {
+    runId: null,
+    workflow: null,
+    modeHint: null,
+    outputPath: null,
+    baseCommitSha: null,
+    hasRunnerHistory: false,
+  };
+  let realDataDir = absDataDir;
+  try {
+    const dirLst = lstatSync(absDataDir);
+    if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) return out;
+    realDataDir = realpathSync(absDataDir);
+  } catch {
+    return out;
+  }
+
+  let Database = null;
+  try {
+    Database = loadDatabaseCtor();
+  } catch {
+    Database = null;
+  }
+
+  if (Database) {
+    const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
+    const stateDb = stateChecked.exists ? openReadOnly(Database, stateChecked.path) : null;
+    if (stateDb) {
+      try {
+        if (tableExists(stateDb, "workflow_state")) {
+          const ws = stateDb.prepare("SELECT * FROM workflow_state WHERE id = 1").get();
+          if (ws) {
+            if (typeof ws.run_id === "string" && ws.run_id.trim()) out.runId = ws.run_id.trim();
+            if (typeof ws.mode === "string" && ws.mode.trim()) out.modeHint = ws.mode.trim();
+            if (typeof ws.artifact_path === "string" && ws.artifact_path.trim()) out.outputPath = ws.artifact_path.trim();
+          }
+        }
+        if (tableExists(stateDb, "run_manifests")) {
+          const rm = stateDb
+            .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
+            .get();
+          if (rm) {
+            if (!out.runId && typeof rm.run_id === "string" && rm.run_id.trim()) out.runId = rm.run_id.trim();
+            if (!out.workflow && typeof rm.workflow === "string" && rm.workflow.trim()) out.workflow = rm.workflow.trim();
+            if (!out.baseCommitSha && typeof rm.manifest_json === "string") {
+              try {
+                const parsedRm = JSON.parse(rm.manifest_json);
+                const base = parsedRm?.deliverable?.base_commit_sha;
+                if (typeof base === "string" && base.trim()) out.baseCommitSha = base.trim();
+              } catch { /* ignore */ }
+            }
+          }
+        }
+        if (tableExists(stateDb, "workflow_history")) {
+          out.hasRunnerHistory = Boolean(
+            stateDb
+              .prepare("SELECT 1 FROM workflow_history WHERE note LIKE 'runner start:%' OR note LIKE 'runner resume:%' LIMIT 1")
+              .get()
+          );
+        }
+      } finally {
+        stateDb.close();
+      }
+    }
+
+    if (!out.workflow) {
+      const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
+      const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
+      if (stagesDb) {
+        try {
+          if (tableExists(stagesDb, "stage_runs")) {
+            const sr = stagesDb.prepare("SELECT workflow FROM stage_runs ORDER BY id DESC LIMIT 1").get();
+            if (sr && typeof sr.workflow === "string" && sr.workflow.trim()) {
+              out.workflow = sr.workflow.trim();
+            }
+          }
+        } finally {
+          stagesDb.close();
+        }
+      }
+    }
+  }
+
+  const manifestPath = join(absDataDir, MANIFEST_FILE);
+  try {
+    const manLst = lstatSync(manifestPath);
+    if (!manLst.isSymbolicLink() && manLst.isFile() && isInsideOrEqual(realpathSync(manifestPath), realDataDir)) {
+      const parsedMan = JSON.parse(readFileSync(manifestPath, "utf8"));
+      if (parsedMan && typeof parsedMan === "object" && !Array.isArray(parsedMan)) {
+        if (!out.runId && typeof parsedMan.run_id === "string" && parsedMan.run_id.trim()) {
+          out.runId = parsedMan.run_id.trim();
+        }
+        if (!out.workflow && typeof parsedMan.workflow === "string" && parsedMan.workflow.trim()) {
+          out.workflow = parsedMan.workflow.trim();
+        }
+        const base = parsedMan.deliverable?.base_commit_sha;
+        if (!out.baseCommitSha && typeof base === "string" && base.trim()) {
+          out.baseCommitSha = base.trim();
+        }
+      }
+    }
+  } catch { /* ignore unreadable manifest fallback */ }
+
+  return out;
+}
+
 /**
  * Read or initialize `<data-dir>/run-meta.json` so `run_id` stays durable across
  * resume, replay, and post-commit seal invocations, and rotates cleanly on forced fresh runs.
  */
 export function ensureRunMeta(
   dataDir,
-  { workflow = "sw_dev", outputPath = null, runId = null, baseCommitSha = null, repoRoot = null, forceNew = false } = {}
+  { workflow = null, outputPath = null, runId = null, baseCommitSha = null, repoRoot = null, forceNew = false, persist = true } = {}
 ) {
+  const absDataDir = resolve(dataDir);
   try {
-    const dirLst = lstatSync(dataDir);
+    const dirLst = lstatSync(absDataDir);
     if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
-      throw new Error(`Refusing unsafe or symlinked directory at ${dataDir}`);
+      throw new Error(`Refusing unsafe or symlinked directory at ${absDataDir}`);
     }
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
   }
-  mkdirSync(dataDir, { recursive: true });
-  const metaPath = join(dataDir, RUN_META_FILE);
+  if (persist) {
+    mkdirSync(absDataDir, { recursive: true });
+  }
+  const metaPath = join(absDataDir, RUN_META_FILE);
+  let metaFileExisted = false;
   try {
     const metaLst = lstatSync(metaPath);
     if (metaLst.isSymbolicLink() || !metaLst.isFile()) {
       throw new Error(`Refusing unsafe or symlinked run metadata at ${metaPath}`);
     }
+    metaFileExisted = true;
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
   }
   let existing = null;
-  if (existsSync(metaPath)) {
+  let metaFileCorrupt = false;
+  if (metaFileExisted) {
     try {
       const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
-      if (parsed && typeof parsed === "object") existing = parsed;
-    } catch { /* fall through and recreate */ }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.run_id === "string" && parsed.run_id.trim().length > 0) {
+        existing = parsed;
+      } else {
+        metaFileCorrupt = true;
+      }
+    } catch {
+      metaFileCorrupt = true;
+    }
   }
 
   const explicitRunId = runId || process.env.UAW_RUN_ID || null;
   if (
     !forceNew &&
     existing &&
-    typeof existing.run_id === "string" &&
-    existing.run_id.length > 0 &&
     (!explicitRunId || existing.run_id === explicitRunId)
   ) {
     let dirty = false;
@@ -160,14 +277,48 @@ export function ensureRunMeta(
       const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
       if (resolvedBase) { existing.base_commit_sha = resolvedBase; dirty = true; }
     }
-    if (dirty) writeFileSync(metaPath, JSON.stringify(existing, null, 2) + "\n");
+    if (dirty && persist) writeFileSync(metaPath, JSON.stringify(existing, null, 2) + "\n");
     return existing;
   }
 
+  if (!forceNew && (!existing || metaFileCorrupt)) {
+    const recovered = recoverPersistedRunIdentity(absDataDir);
+    if (recovered.runId) {
+      if (explicitRunId && explicitRunId !== recovered.runId) {
+        throw new Error(`Run ID mismatch for ${absDataDir}: persisted state records "${recovered.runId}", requested "${explicitRunId}"`);
+      }
+      if (workflow && recovered.workflow && workflow !== recovered.workflow) {
+        throw new Error(`Workflow mismatch for ${absDataDir}: persisted state records "${recovered.workflow}", requested "${workflow}"`);
+      }
+      const recoveredWorkflow = recovered.workflow ?? workflow ?? recovered.modeHint ?? "sw_dev";
+      const recoveredBase = baseCommitSha ?? recovered.baseCommitSha ?? resolveHeadSha(repoRoot);
+      const recoveredMeta = {
+        run_id: recovered.runId,
+        workflow: recoveredWorkflow,
+        output_path: outputPath ?? recovered.outputPath ?? join(absDataDir, "workflow-artifacts"),
+        created_at: new Date().toISOString(),
+        ...(recoveredBase ? { base_commit_sha: recoveredBase } : {}),
+      };
+      if (persist) {
+        writeFileSync(metaPath, JSON.stringify(recoveredMeta, null, 2) + "\n");
+      }
+      return recoveredMeta;
+    }
+    if (!explicitRunId) {
+      if (metaFileCorrupt) {
+        throw new Error(`Corrupt run metadata at ${metaPath} and no persisted run_id found in uwf-state.db`);
+      }
+      if (recovered.hasRunnerHistory) {
+        throw new Error(`Missing run metadata at ${metaPath} for existing runner run in ${absDataDir} with no persisted run_id in uwf-state.db`);
+      }
+    }
+  }
+
+  const defaultWorkflow = workflow ?? "sw_dev";
   const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
   const explicitChanged = Boolean(explicitRunId && existing?.run_id && existing.run_id !== explicitRunId);
   const priorTranscripts = (forceNew || explicitChanged)
-    ? listTranscripts(dataDir).map((f) => basename(f))
+    ? listTranscripts(absDataDir).map((f) => basename(f))
     : Array.isArray(existing?.prior_transcripts)
       ? existing.prior_transcripts
       : [];
@@ -180,14 +331,16 @@ export function ensureRunMeta(
     : {};
   const meta = {
     ...preservedPointers,
-    run_id: explicitRunId || `${workflow}-${randomUUID()}`,
-    workflow,
-    output_path: outputPath ?? join(dataDir, "workflow-artifacts"),
+    run_id: explicitRunId || `${defaultWorkflow}-${randomUUID()}`,
+    workflow: defaultWorkflow,
+    output_path: outputPath ?? join(absDataDir, "workflow-artifacts"),
     created_at: new Date().toISOString(),
     ...(resolvedBase ? { base_commit_sha: resolvedBase } : {}),
     ...(priorTranscripts.length ? { prior_transcripts: priorTranscripts } : {}),
   };
-  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+  if (persist) {
+    writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
+  }
   return meta;
 }
 
@@ -1187,99 +1340,166 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
 }
 
 // ---------------------------------------------------------------------------
-// Manifest Schema Validation (Zero-Dependency Structural Validator)
+// Manifest Schema Validation (Draft-07 Schema Enforcer against uaw-manifest.schema.json)
 // ---------------------------------------------------------------------------
 
-const HEX64_RE = /^[0-9a-f]{64}$/;
-const VALID_MANIFEST_PHASES = new Set(["snapshot", "closed", "sealed"]);
-const VALID_STAGE_STATUSES = new Set(["pending", "active", "passed", "failed", "skipped"]);
+const MANIFEST_SCHEMA_PATH = join(OWN_ROOT, "schemas", "uaw-manifest.schema.json");
+let cachedManifestSchema = null;
+const compiledPatternCache = new Map();
+
+function getManifestSchema() {
+  if (!cachedManifestSchema) {
+    cachedManifestSchema = JSON.parse(readFileSync(MANIFEST_SCHEMA_PATH, "utf8"));
+  }
+  return cachedManifestSchema;
+}
+
+function getCompiledRegex(pattern) {
+  let re = compiledPatternCache.get(pattern);
+  if (!re) {
+    re = new RegExp(pattern);
+    compiledPatternCache.set(pattern, re);
+  }
+  return re;
+}
+
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function matchesSchemaType(val, typeName) {
+  switch (typeName) {
+    case "object": return isPlainObject(val);
+    case "array": return Array.isArray(val);
+    case "string": return typeof val === "string";
+    case "integer": return Number.isInteger(val);
+    case "number": return typeof val === "number" && Number.isFinite(val);
+    case "boolean": return typeof val === "boolean";
+    case "null": return val === null;
+    default: return true;
+  }
+}
+
+function resolveSchemaRef(schema, rootSchema) {
+  if (!schema || !schema.$ref) return schema;
+  const m = String(schema.$ref).match(/^#\/definitions\/([^/]+)$/);
+  if (!m) throw new Error(`Unsupported manifest schema $ref: ${schema.$ref}`);
+  const def = rootSchema.definitions?.[m[1]];
+  if (!def) throw new Error(`Missing manifest schema definition: ${m[1]}`);
+  return def;
+}
+
+const SUPPORTED_SCHEMA_KEYWORDS = new Set([
+  "$schema",
+  "$id",
+  "title",
+  "description",
+  "definitions",
+  "$ref",
+  "type",
+  "const",
+  "enum",
+  "minLength",
+  "pattern",
+  "minimum",
+  "required",
+  "properties",
+  "additionalProperties",
+  "items",
+]);
+
+function validateAgainstSchema(val, rawSchema, rootSchema, ptr, errs) {
+  const schema = resolveSchemaRef(rawSchema, rootSchema);
+  if (!schema) return;
+  const label = ptr || "/";
+  for (const k of Object.keys(schema)) {
+    if (!SUPPORTED_SCHEMA_KEYWORDS.has(k)) {
+      throw new Error(`Unsupported JSON Schema keyword "${k}" at ${label}`);
+    }
+  }
+
+  if (schema.type !== undefined) {
+    const allowed = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!allowed.some((t) => matchesSchemaType(val, t))) {
+      errs.push(`${label} must have type ${allowed.join("|")}`);
+      return;
+    }
+  }
+
+  if ("const" in schema && val !== schema.const) {
+    errs.push(`${label} must equal ${JSON.stringify(schema.const)}`);
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.includes(val)) {
+    errs.push(`${label} must be one of ${schema.enum.join("|")}`);
+  }
+
+  if (typeof val === "string") {
+    if (typeof schema.minLength === "number" && val.length < schema.minLength) {
+      errs.push(`${label} must have length >= ${schema.minLength}`);
+    }
+    if (typeof schema.pattern === "string" && !getCompiledRegex(schema.pattern).test(val)) {
+      errs.push(`${label} must match pattern ${schema.pattern}`);
+    }
+  }
+
+  if (typeof val === "number") {
+    if (typeof schema.minimum === "number" && val < schema.minimum) {
+      errs.push(`${label} must be >= ${schema.minimum}`);
+    }
+  }
+
+  if (isPlainObject(val)) {
+    if (Array.isArray(schema.required)) {
+      for (const reqKey of schema.required) {
+        if (!Object.hasOwn(val, reqKey)) {
+          errs.push(`${ptr}/${reqKey} is required`);
+        }
+      }
+    }
+    const props = isPlainObject(schema.properties) ? schema.properties : null;
+    if (props) {
+      for (const k of Object.keys(props)) {
+        if (Object.hasOwn(val, k)) {
+          validateAgainstSchema(val[k], props[k], rootSchema, `${ptr}/${k}`, errs);
+        }
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const k of Object.keys(val)) {
+        if (!props || !Object.hasOwn(props, k)) {
+          errs.push(`${ptr}/${k} is not an allowed property`);
+        }
+      }
+    } else if (isPlainObject(schema.additionalProperties)) {
+      for (const k of Object.keys(val)) {
+        if (!props || !Object.hasOwn(props, k)) {
+          validateAgainstSchema(val[k], schema.additionalProperties, rootSchema, `${ptr}/${k}`, errs);
+        }
+      }
+    }
+  }
+
+  if (Array.isArray(val) && schema.items) {
+    val.forEach((item, i) => {
+      validateAgainstSchema(item, schema.items, rootSchema, `${ptr}/${i}`, errs);
+    });
+  }
+}
 
 /**
  * Validate a manifest object against the ADR-0009 `uaw-manifest.schema.json` contract.
  * Returns an array of error strings (empty array = valid).
  */
 export function validateManifest(manifest) {
+  if (!isPlainObject(manifest)) return ["/ must be an object"];
   const errs = [];
-  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
-  if (!isObj(manifest)) return ["/ must be an object"];
-
-  const requiredTop = [
-    "schema_version", "run_id", "workflow", "goal_sha256", "phase",
-    "manifest_sha256", "deliverable_key", "deliverable", "stages",
-    "stores", "architecture", "execution_audit",
-  ];
-  for (const k of requiredTop) {
-    if (!(k in manifest)) errs.push(`/${k} is required`);
+  try {
+    const schema = getManifestSchema();
+    validateAgainstSchema(manifest, schema, schema, "", errs);
+  } catch (err) {
+    errs.push(`Manifest schema validation failed: ${err.message}`);
   }
-  if (manifest.schema_version !== SCHEMA_VERSION) errs.push(`/schema_version must equal "${SCHEMA_VERSION}"`);
-  if (typeof manifest.run_id !== "string" || !manifest.run_id) errs.push("/run_id must be a non-empty string");
-  if (typeof manifest.workflow !== "string" || !manifest.workflow) errs.push("/workflow must be a non-empty string");
-  if (manifest.goal_sha256 !== null && (typeof manifest.goal_sha256 !== "string" || !HEX64_RE.test(manifest.goal_sha256))) {
-    errs.push("/goal_sha256 must be null or 64-char lowercase hex");
-  }
-  if (!VALID_MANIFEST_PHASES.has(manifest.phase)) errs.push("/phase must be snapshot|closed|sealed");
-  if (typeof manifest.manifest_sha256 !== "string" || !HEX64_RE.test(manifest.manifest_sha256)) {
-    errs.push("/manifest_sha256 must be 64-char lowercase hex");
-  }
-  if (typeof manifest.deliverable_key !== "string" || !manifest.deliverable_key) {
-    errs.push("/deliverable_key must be a non-empty string");
-  }
-
-  if (!isObj(manifest.deliverable)) {
-    errs.push("/deliverable must be an object");
-  } else {
-    for (const k of ["repository", "base_commit_sha", "head_commit_sha", "git_tree_sha", "branch", "pr_url", "release_tag"]) {
-      if (!(k in manifest.deliverable)) errs.push(`/deliverable/${k} is required`);
-    }
-    if (!Array.isArray(manifest.deliverable.artifact_uris)) errs.push("/deliverable/artifact_uris must be an array");
-  }
-
-  if (!Array.isArray(manifest.stages)) {
-    errs.push("/stages must be an array");
-  } else {
-    manifest.stages.forEach((st, i) => {
-      if (!isObj(st)) { errs.push(`/stages/${i} must be an object`); return; }
-      if (typeof st.stage !== "string" || !st.stage) errs.push(`/stages/${i}/stage must be a non-empty string`);
-      if (!VALID_STAGE_STATUSES.has(st.status)) errs.push(`/stages/${i}/status invalid`);
-      if (!Array.isArray(st.outputs)) errs.push(`/stages/${i}/outputs must be an array`);
-      else {
-        st.outputs.forEach((o, j) => {
-          if (!isObj(o)) { errs.push(`/stages/${i}/outputs/${j} must be an object`); return; }
-          if (typeof o.path !== "string" || !o.path) errs.push(`/stages/${i}/outputs/${j}/path must be a non-empty string`);
-          if (typeof o.sha256 !== "string" || !HEX64_RE.test(o.sha256)) errs.push(`/stages/${i}/outputs/${j}/sha256 must be 64-char hex`);
-          if (!Number.isInteger(o.bytes) || o.bytes < 0) errs.push(`/stages/${i}/outputs/${j}/bytes must be non-negative integer`);
-        });
-      }
-    });
-  }
-
-  if (!isObj(manifest.stores)) {
-    errs.push("/stores must be an object");
-  } else {
-    for (const k of ["requirements", "adrs", "discoveries", "reviews", "issues", "questions", "cbs"]) {
-      if (!(k in manifest.stores)) errs.push(`/stores/${k} is required`);
-    }
-  }
-
-  if (!isObj(manifest.architecture)) {
-    errs.push("/architecture must be an object");
-  } else {
-    for (const k of ["drs", "br", "changelog_snapshot"]) {
-      if (!(k in manifest.architecture)) errs.push(`/architecture/${k} is required`);
-    }
-  }
-
-  if (!isObj(manifest.execution_audit)) {
-    errs.push("/execution_audit must be an object");
-  } else {
-    if (typeof manifest.execution_audit.finalized_at !== "string" || !manifest.execution_audit.finalized_at) {
-      errs.push("/execution_audit/finalized_at must be a non-empty string");
-    }
-    if (!Array.isArray(manifest.execution_audit.stages)) {
-      errs.push("/execution_audit/stages must be an array");
-    }
-  }
-
   return errs;
 }
 
@@ -1481,6 +1701,7 @@ export function buildManifest({
   outputPath = null,
   phase = "closed",
   deliverableOverrides = {},
+  persistMeta = true,
   now = new Date().toISOString(),
 }) {
   const Database = loadDatabaseCtor();
@@ -1490,6 +1711,8 @@ export function buildManifest({
 
   let modelProfile = null;
   let modelName = null;
+  let stateModeHint = null;
+  let persistedManifestWorkflow = null;
   let stateArtifactPath = null;
   let firstHistTs = null;
   const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
@@ -1501,7 +1724,16 @@ export function buildManifest({
         if (ws) {
           modelProfile = ws.model_profile ?? null;
           modelName = ws.model_name ?? null;
+          stateModeHint = typeof ws.mode === "string" && ws.mode.trim() ? ws.mode.trim() : null;
           stateArtifactPath = ws.artifact_path ?? null;
+        }
+      }
+      if (tableExists(stateDb, "run_manifests")) {
+        const rm = stateDb
+          .prepare("SELECT workflow FROM run_manifests ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
+          .get();
+        if (rm && typeof rm.workflow === "string" && rm.workflow.trim()) {
+          persistedManifestWorkflow = rm.workflow.trim();
         }
       }
       if (tableExists(stateDb, "workflow_history")) {
@@ -1513,18 +1745,20 @@ export function buildManifest({
     }
   }
 
-  if (workflow && existingMeta?.workflow && workflow !== existingMeta.workflow) {
+  const authoritativeWorkflow = existingMeta?.workflow ?? persistedManifestWorkflow;
+  if (workflow && authoritativeWorkflow && workflow !== authoritativeWorkflow) {
     throw new Error(
-      `Workflow mismatch for ${absDataDir}: run-meta.json records "${existingMeta.workflow}", requested "${workflow}"`,
+      `Workflow mismatch for ${absDataDir}: persisted state records "${authoritativeWorkflow}", requested "${workflow}"`,
     );
   }
-  const effectiveWorkflow = workflow ?? existingMeta?.workflow ?? "sw_dev";
+  const effectiveWorkflow = workflow ?? authoritativeWorkflow ?? stateModeHint ?? null;
   const meta = ensureRunMeta(absDataDir, {
     workflow: effectiveWorkflow,
     outputPath: outputPath ?? existingMeta?.output_path ?? stateArtifactPath ?? null,
     runId: phase === "sealed" && existingMeta?.run_id ? existingMeta.run_id : null,
     repoRoot: absRepoRoot,
     baseCommitSha: deliverableOverrides.base_commit_sha ?? null,
+    persist: persistMeta,
   });
   const runId = meta.run_id;
   const resolvedWorkflow = workflow ?? meta.workflow ?? "sw_dev";
@@ -1670,6 +1904,7 @@ export function buildManifest({
     manifest,
     canonicalJson: canonicalizeJcs(manifest),
     runId,
+    outputPath: resolvedOutputPath,
     manifestSha256,
     deliverableKey,
   };
@@ -1857,6 +2092,41 @@ export function verifyManifestStageOutputs(manifest, { dataDir, repoRoot = OWN_R
   };
 }
 
+function verifyManifestFileIntegrity(manifestPath) {
+  let lst;
+  try {
+    lst = lstatSync(manifestPath);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      return { manifest: null, errors: [`Manifest not found at ${manifestPath}`] };
+    }
+    return { manifest: null, errors: [`Cannot stat manifest at ${manifestPath}: ${err.message}`] };
+  }
+  if (lst.isSymbolicLink() || !lst.isFile()) {
+    return { manifest: null, errors: [`Refusing unsafe or symlinked manifest at ${manifestPath}`] };
+  }
+  const rawText = readFileSync(manifestPath, "utf8");
+  let manifest;
+  try {
+    manifest = JSON.parse(rawText);
+  } catch (err) {
+    return { manifest: null, errors: [`Invalid JSON in ${manifestPath}: ${err.message}`] };
+  }
+
+  const errors = validateManifest(manifest);
+  if (isPlainObject(manifest)) {
+    const { manifest_sha256: recordedSha, execution_audit: _audit, ...contentOnly } = manifest;
+    const computedSha = sha256Hex(canonicalizeJcs(contentOnly));
+    if (recordedSha !== computedSha) {
+      errors.push(`manifest_sha256 mismatch: recorded ${recordedSha}, computed ${computedSha}`);
+    }
+    if (rawText !== canonicalizeJcs(manifest)) {
+      errors.push("Manifest on disk is not canonical RFC 8785 JCS");
+    }
+  }
+  return { manifest, errors };
+}
+
 /**
  * Verify `<data-dir>/uaw-manifest.json` integrity and un-superseded stage output digests on disk.
  */
@@ -1864,26 +2134,9 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
   const manifestPath = join(absDataDir, MANIFEST_FILE);
-  if (!existsSync(manifestPath)) {
-    return { ok: false, errors: [`Manifest not found at ${manifestPath}`] };
-  }
-  const rawText = readFileSync(manifestPath, "utf8");
-  let manifest;
-  try {
-    manifest = JSON.parse(rawText);
-  } catch (err) {
-    return { ok: false, errors: [`Invalid JSON in ${manifestPath}: ${err.message}`] };
-  }
-
-  const errors = validateManifest(manifest);
-
-  const { manifest_sha256: recordedSha, execution_audit: _audit, ...contentOnly } = manifest;
-  const computedSha = sha256Hex(canonicalizeJcs(contentOnly));
-  if (recordedSha !== computedSha) {
-    errors.push(`manifest_sha256 mismatch: recorded ${recordedSha}, computed ${computedSha}`);
-  }
-  if (rawText !== canonicalizeJcs(manifest)) {
-    errors.push("Manifest on disk is not canonical RFC 8785 JCS");
+  const { manifest, errors } = verifyManifestFileIntegrity(manifestPath);
+  if (!manifest) {
+    return { ok: false, errors };
   }
 
   const outCheck = verifyManifestStageOutputs(manifest, { dataDir: absDataDir, repoRoot: absRepoRoot });
@@ -1893,7 +2146,7 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
     ok: errors.length === 0,
     errors,
     manifestPath,
-    manifestSha256: recordedSha,
+    manifestSha256: manifest.manifest_sha256,
     checkedOutputs: outCheck.checkedOutputs,
   };
 }
@@ -1924,17 +2177,71 @@ export async function sealManifest({
 }) {
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
+  const manifestPath = join(absDataDir, MANIFEST_FILE);
 
-  if (existsSync(join(absDataDir, MANIFEST_FILE))) {
-    const preCheck = verifyManifest({ dataDir: absDataDir, repoRoot: absRepoRoot });
-    if (!preCheck.ok) {
+  let hasManifestFile = true;
+  try {
+    lstatSync(manifestPath);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      hasManifestFile = false;
+    } else {
+      throw err;
+    }
+  }
+
+  if (hasManifestFile) {
+    const fileCheck = verifyManifestFileIntegrity(manifestPath);
+    if (fileCheck.errors.length > 0) {
       return {
         ok: false,
         exitCode: 1,
-        error: `Pre-seal verification failed: ${preCheck.errors.join("; ")}`,
-        errors: preCheck.errors,
+        error: `Pre-seal verification failed: ${fileCheck.errors.join("; ")}`,
+        errors: fileCheck.errors,
       };
     }
+  }
+
+  let preBuilt;
+  try {
+    preBuilt = buildManifest({
+      dataDir: absDataDir,
+      workflow,
+      repoRoot: absRepoRoot,
+      skillsRoot,
+      outputPath,
+      phase: "closed",
+      deliverableOverrides: {
+        ...(baseCommitSha ? { base_commit_sha: baseCommitSha } : {}),
+      },
+      persistMeta: false,
+      now,
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Refusing unsafe")) {
+      throw err;
+    }
+    return {
+      ok: false,
+      exitCode: 1,
+      error: `Pre-seal verification failed: ${err.message}`,
+      errors: [err.message],
+    };
+  }
+  const preErrors = validateManifest(preBuilt.manifest);
+  const outCheck = verifyManifestStageOutputs(preBuilt.manifest, {
+    dataDir: absDataDir,
+    repoRoot: absRepoRoot,
+    outputPath: outputPath ?? preBuilt.outputPath ?? null,
+  });
+  preErrors.push(...outCheck.errors);
+  if (preErrors.length > 0) {
+    return {
+      ok: false,
+      exitCode: 1,
+      error: `Pre-seal verification failed: ${preErrors.join("; ")}`,
+      errors: preErrors,
+    };
   }
 
   let commitRepo = absRepoRoot;

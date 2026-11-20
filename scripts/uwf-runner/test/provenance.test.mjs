@@ -1474,6 +1474,103 @@ try {
       () => buildManifest({ dataDir: ncData, workflow: "sw_dev", repoRoot: ncRepo, phase: "closed" }),
       /not a database/i,
     );
+
+    // Step R: Retro replay after seal, persisted run_id recovery, and deep JSON Schema validation
+    const replayRepo = join(runRoot, "replay-repo");
+    const replayData = join(runRoot, "replay-data");
+    const replayFx = join(runRoot, "replay-fx");
+    cpSync(fxDir, replayFx, { recursive: true });
+    mkdirSync(replayRepo, { recursive: true });
+    execFileSync("git", ["-C", replayRepo, "init", "-q"]);
+    execFileSync("git", ["-C", replayRepo, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", replayRepo, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", replayRepo, "config", "commit.gpgsign", "false"]);
+    writeFileSync(join(replayRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+    writeFileSync(join(replayRepo, ".gitignore"), "tmp/\n");
+    writeFileSync(join(replayRepo, "README.md"), "# Replay\n");
+    execFileSync("git", ["-C", replayRepo, "add", "."]);
+    execFileSync("git", ["-C", replayRepo, "commit", "-q", "-m", "init"]);
+
+    const replayEnv = { ...process.env, UWF_FAKE_FIXTURE_DIR: replayFx, UWF_DATA_DIR: "" };
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Replay seal test", "--adapter", "fake", "--repo-root", replayRepo, "--data-dir", replayData, "--defer-seal"],
+      { encoding: "utf8", env: replayEnv, stdio: "pipe" },
+    );
+    execFileSync("git", ["-C", replayRepo, "add", "-A"]);
+    execFileSync("git", ["-C", replayRepo, "commit", "-q", "--allow-empty", "-m", "v1"]);
+    const sealV1 = await sealManifest({ dataDir: replayData, workflow: "sw_dev", repoRoot: replayRepo, now: "2026-11-20T01:00:00.000Z" });
+    assert.equal(sealV1.ok, true, sealV1.error);
+    const sealedRunId = sealV1.manifest.run_id;
+
+    // Truncated run-meta.json before `run --from-stage retro` recovers run_id from uwf-state.db and re-seal succeeds even if stale sealed uaw-manifest.json remains on disk.
+    const replayRetroFxPath = join(replayFx, "retro.json");
+    const replayRetroFx = JSON.parse(readFileSync(replayRetroFxPath, "utf8"));
+    replayRetroFx.files["tmp/workflow-artifacts/issues-retro.md"] = "# Retro v2\nUpdated replay output\n";
+    writeFileSync(replayRetroFxPath, JSON.stringify(replayRetroFx, null, 2));
+    writeFileSync(join(replayData, "run-meta.json"), "{truncated");
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Replay seal test", "--from-stage", "retro", "--adapter", "fake", "--repo-root", replayRepo, "--data-dir", replayData, "--defer-seal"],
+      { encoding: "utf8", env: replayEnv, stdio: "pipe" },
+    );
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId, "truncated run-meta.json must recover persisted run_id");
+    // Simulate stale sealed uaw-manifest.json from v1 still on disk before sealManifest runs
+    writeFileSync(join(replayData, "uaw-manifest.json"), sealV1.canonicalJson);
+    execFileSync("git", ["-C", replayRepo, "add", "-A"]);
+    execFileSync("git", ["-C", replayRepo, "commit", "-q", "--allow-empty", "-m", "retro v2"]);
+    const sealV2 = await sealManifest({ dataDir: replayData, workflow: "sw_dev", repoRoot: replayRepo, now: "2026-11-20T01:05:00.000Z" });
+    assert.equal(sealV2.ok, true, `sealManifest after --from-stage retro must rebuild from updated stage ledger: ${sealV2.error}`);
+    assert.equal(sealV2.manifest.run_id, sealedRunId);
+    assert.equal(
+      sealV2.manifest.stages.find((s) => s.stage === "retro")?.outputs.find((o) => o.path === "tmp/workflow-artifacts/issues-retro.md")?.sha256,
+      sha256Hex(Buffer.from("# Retro v2\nUpdated replay output\n")),
+    );
+
+    // Deleted run-meta.json before buildManifest also recovers persisted run_id from uwf-state.db.
+    rmSync(join(replayData, "run-meta.json"), { force: true });
+    // Read-only pre-seal failure must not recreate run-meta.json on disk.
+    const retroArtifactPath = join(replayRepo, "tmp/workflow-artifacts/issues-retro.md");
+    const savedRetroArtifact = readFileSync(retroArtifactPath);
+    writeFileSync(retroArtifactPath, "# Tampered before seal\n");
+    const roSealFail = await sealManifest({ dataDir: replayData, workflow: "sw_dev", repoRoot: replayRepo, now: "2026-11-20T01:06:00.000Z" });
+    assert.equal(roSealFail.ok, false, "sealManifest must fail on tampered stage output even when run-meta.json is absent");
+    assert.equal(existsSync(join(replayData, "run-meta.json")), false, "failing sealManifest pre-check must not recreate run-meta.json on disk");
+    writeFileSync(retroArtifactPath, savedRetroArtifact);
+
+    const rebuiltRecovered = buildManifest({ dataDir: replayData, workflow: "sw_dev", repoRoot: replayRepo, phase: "closed" });
+    assert.equal(rebuiltRecovered.manifest.run_id, sealedRunId, "deleted run-meta.json must recover run_id from uwf-state.db");
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
+
+    // Corrupt run-meta.json in a fresh data dir with no persisted run_id fails closed instead of minting a replacement.
+    const corruptEmptyData = join(runRoot, "corrupt-empty-data");
+    mkdirSync(corruptEmptyData, { recursive: true });
+    writeFileSync(join(corruptEmptyData, "run-meta.json"), "{corrupt");
+    assert.throws(
+      () => buildManifest({ dataDir: corruptEmptyData, workflow: "sw_dev", repoRoot: replayRepo, phase: "closed" }),
+      /Corrupt run metadata/i,
+    );
+
+    // Full nested schema validation rejects structurally invalid stores/architecture/audit payloads even with recomputed manifest_sha256.
+    const schemaTestData = join(runRoot, "schema-test-data");
+    mkdirSync(schemaTestData, { recursive: true });
+    const schemaMutators = [
+      (m) => { m.stores.requirements = {}; },
+      (m) => { m.stores.adrs = { sha256: "a".repeat(64), total: 0, records: [{}] }; },
+      (m) => { m.architecture.drs = { path: "x" }; },
+      (m) => { m.execution_audit.cost_summary = {}; },
+      (m) => { m.stores.unexpected = null; },
+    ];
+    for (const mutate of schemaMutators) {
+      const candidate = JSON.parse(readFileSync(join(replayData, "uaw-manifest.json"), "utf8"));
+      mutate(candidate);
+      const { execution_audit: _ea, manifest_sha256: _ms, ...contentOnly } = candidate;
+      candidate.manifest_sha256 = sha256Hex(canonicalizeJcs(contentOnly));
+      assert.ok(validateManifest(candidate).length > 0, "validateManifest must reject invalid nested schema object");
+      writeFileSync(join(schemaTestData, "uaw-manifest.json"), canonicalizeJcs(candidate));
+      const vr = verifyManifest({ dataDir: schemaTestData, repoRoot: replayRepo });
+      assert.equal(vr.ok, false, "verifyManifest must fail on schema-invalid nested payload");
+    }
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }
