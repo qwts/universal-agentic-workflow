@@ -1294,6 +1294,8 @@ try {
 
     // Construct the exact tree+commit that push-as-bot.mjs createBlob+createTree produces in bare store
     execFileSync("git", ["-C", botRawStore, "init", "--bare", "-q"]);
+    execFileSync("git", ["--git-dir", botRawStore, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["--git-dir", botRawStore, "config", "user.name", "Test"]);
     execFileSync("git", ["-C", botRawStore, "fetch", "--depth=1", "--no-tags", botRawRepo, botBaseHead]);
     const botIdx = join(runRoot, "bot-raw.idx");
     const botEnv = { ...process.env, GIT_INDEX_FILE: botIdx };
