@@ -674,7 +674,92 @@ await test("markStage isolates dataDir gate state and node_modules per snapshot"
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
 
+await test("evaluateMonolithGates skips untriggered conditional stages even when marked", async () => {
+  const trackerCalls = [];
+  const ev = await evaluateMonolithGates({
+    workflow: "sw_dev",
+    stages: [
+      { name: "intake", gated: true, conditional: false },
+      { name: "adr", gated: true, conditional: true },
+    ],
+    runScript: "RUN_SCRIPT",
+    trackerScript: "TRACKER",
+    outputPath: "/out",
+    dataDir: "/data",
+    sessionOk: true,
+    requireStageMarks: true,
+    markEvents: [
+      { stage: "intake", seq: 1, timestamp: "2026-01-01T00:00:00Z" },
+      { stage: "adr", seq: 2, timestamp: "2026-01-01T00:01:00Z" },
+    ],
+    cli: (script, args) => {
+      if (script === "TRACKER") trackerCalls.push(args);
+      if (script === "RUN_SCRIPT" && args[0] === "--check-gate") {
+        if (args[1] === "intake") {
+          return { ok: true, data: { stage: "intake", passed: true, failures: [], prescriptions: [] } };
+        }
+        if (args[1] === "adr") {
+          return { ok: true, data: { stage: "adr", passed: true, failures: [], prescriptions: [], note: "conditional — not required" } };
+        }
+      }
+      return { ok: true, data: { ok: true } };
+    },
+    runGateAt: (_script, args) => {
+      if (args[1] === "intake") {
+        return { ok: false, data: { stage: "intake", passed: false, failures: ["missing on attempt 1"], prescriptions: [] } };
+      }
+      return { ok: true, data: { stage: args[1], passed: true, failures: [], prescriptions: [], note: "conditional — not required" } };
+    },
+  });
+
+  const intake = ev.stages.find((s) => s.stage === "intake");
+  const adr = ev.stages.find((s) => s.stage === "adr");
+  assert.ok(intake && adr);
+  assert.equal(intake.passed, true);
+  assert.equal(intake.firstTryPass, false);
+  assert.equal(adr.skipped, true);
+  assert.equal(adr.passed, false);
+  assert.equal(adr.firstTryPass, false);
+  assert.equal(adr.markEventsCount, 1);
+  assert.deepEqual(adr.attemptResults, []);
+  assert.equal(ev.summary.skippedStages, 1);
+  assert.equal(ev.summary.gatedEvaluated, 1);
+  assert.equal(ev.summary.firstTryPassed, 0);
+  assert.equal(ev.summary.firstTryPassRate, 0);
+  assert.equal(ev.allPassed, true);
+  assert.ok(trackerCalls.some((a) => a[0] === "stage-skip" && a.includes("adr")), "tracker stage-skip must be called for marked untriggered conditional stage");
+
+  // Premature mark snapshot before conditional trigger exists must not grant firstTryPass if stage later triggers
+  const evTriggered = await evaluateMonolithGates({
+    workflow: "sw_dev",
+    stages: [{ name: "adr", gated: true, conditional: true }],
+    runScript: "RUN_SCRIPT",
+    outputPath: "/out",
+    dataDir: "/data",
+    sessionOk: true,
+    requireStageMarks: true,
+    markEvents: [
+      { stage: "adr", seq: 1, timestamp: "2026-01-01T00:00:00Z", dataSnapshotDir: "/snap-1" },
+      { stage: "adr", seq: 2, timestamp: "2026-01-01T00:01:00Z", dataSnapshotDir: "/snap-2" },
+    ],
+    cli: () => ({ ok: true, data: { stage: "adr", passed: true, failures: [], prescriptions: [] } }),
+    runGateAt: (_s, _a, opts) => {
+      // Snapshot 1 happened before trigger existed ("not required"), snapshot 2 happened after trigger existed and passed
+      if (opts?.dataDir === "/snap-1") {
+        return { ok: true, data: { stage: "adr", passed: true, failures: [], prescriptions: [], note: "conditional — not required" } };
+      }
+      return { ok: true, data: { stage: "adr", passed: true, failures: [], prescriptions: [] } };
+    },
+  });
+  assert.equal(evTriggered.stages[0].skipped, false);
+  assert.equal(evTriggered.stages[0].passed, true);
+  assert.equal(evTriggered.stages[0].firstTryPass, false, "vacuous not-required snapshot must not count as firstTryPass");
+  assert.equal(evTriggered.stages[0].retriesToPass, 1);
+  assert.equal(evTriggered.stages[0].attemptResults[0].passed, false);
+  assert.equal(evTriggered.stages[0].attemptResults[1].passed, true);
+});
 
 if (failures) {
   console.log(`\n${failures} monolith test(s) FAILED`);

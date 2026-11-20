@@ -498,12 +498,13 @@ export async function evaluateMonolithGates({
         const ev = evList[idx];
         const sg = checkGateAt(st.name, ev);
         const parsed = parseGateFailures(sg);
+        const snapNotRequired = isConditional && sg.ok && /not required/i.test(sg.data?.note ?? "");
         attemptResults.push({
           attempt: idx + 1,
           seq: ev.seq ?? idx + 1,
           timestamp: ev.timestamp ?? null,
-          passed: Boolean(sg.ok),
-          failures: parsed.failures,
+          passed: snapNotRequired ? false : Boolean(sg.ok),
+          failures: snapNotRequired ? ["conditional — not required at mark snapshot"] : parsed.failures,
           verdict: parsed.verdict,
         });
       }
@@ -511,7 +512,7 @@ export async function evaluateMonolithGates({
 
     const g = checkGateAt(st.name, null);
 
-    if (isConditional && g.ok && /not required/i.test(g.data?.note ?? "") && evList.length === 0) {
+    if (isConditional && g.ok && /not required/i.test(g.data?.note ?? "")) {
       if (trackerScript) {
         cli(trackerScript, ["stage-skip", "--workflow", workflow, "--stage", st.name, "--note", "condition not met", ...sessionArgs], withOut);
       }
@@ -525,7 +526,7 @@ export async function evaluateMonolithGates({
         passed: false,
         firstTryPass: false,
         neverMarked: false,
-        markEventsCount: 0,
+        markEventsCount: evList.length,
         attemptResults: [],
         retriesToPass: 0,
         neverPassed: false,
