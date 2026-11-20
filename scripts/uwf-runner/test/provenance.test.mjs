@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -29,6 +29,8 @@ const REPO_ROOT = resolve(HERE, "..", "..", "..");
 const SCHEMA_PATH = join(REPO_ROOT, "schemas", "uaw-manifest.schema.json");
 const PROVENANCE_CLI = join(REPO_ROOT, "scripts", "uwf-runner", "provenance.mjs");
 const RUNNER_CLI = join(REPO_ROOT, "scripts", "uwf-runner", "runner.mjs");
+const TRACKER_CLI = join(REPO_ROOT, ".github", "skills", "uwf-orchestration-engine", "stage-tracker.mjs");
+const SW_DEV_RUN_CLI = join(REPO_ROOT, ".github", "skills", "uwf-sw_dev", "run.mjs");
 
 // Resolve better-sqlite3 the same way provenance.mjs does.
 function loadDatabase() {
@@ -1858,6 +1860,165 @@ try {
     const snapTamperRow = snapTamperStagesDb.prepare("SELECT status FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'snapshot'").get();
     snapTamperStagesDb.close();
     assert.equal(snapTamperRow?.status, "pending", "tampered snapshot must roll snapshot stage back to pending");
+
+    // Step S4: Declared stage outputs must fail closed on symlinks/non-regular files across provenance, stage-tracker, and runner
+    const validIntakeText = JSON.parse(readFileSync(join(fxDir, "intake.json"), "utf8")).files["tmp/workflow-artifacts/issues-intake.md"];
+    const symTargetFile = join(runRoot, "outside-valid-intake.md");
+    writeFileSync(symTargetFile, validIntakeText);
+
+    // 4a. captureStageOutputs rejects live symlink literal, dangling symlink literal, glob symlink, and symlinked ancestor dir
+    const capSymRepo = join(runRoot, "cap-sym-repo");
+    const capSymOut = join(capSymRepo, "out");
+    mkdirSync(capSymOut, { recursive: true });
+    symlinkSync(symTargetFile, join(capSymOut, "live.md"));
+    assert.throws(
+      () => captureStageOutputs(["{{output_path}}/live.md"], { outputPath: capSymOut, repoRoot: capSymRepo, skillsRoot: REPO_ROOT }),
+      /must not be a symlink/i,
+    );
+    symlinkSync(join(runRoot, "does-not-exist.md"), join(capSymOut, "dangling.md"));
+    assert.throws(
+      () => captureStageOutputs(["{{output_path}}/dangling.md"], { outputPath: capSymOut, repoRoot: capSymRepo, skillsRoot: REPO_ROOT }),
+      /must not be a symlink/i,
+    );
+    mkdirSync(join(capSymRepo, "docs", "adr"), { recursive: true });
+    symlinkSync(symTargetFile, join(capSymRepo, "docs", "adr", "ADR-0001.md"));
+    assert.throws(
+      () => captureStageOutputs(["{{cwd}}/docs/adr/ADR-[0-9]*.md"], { outputPath: capSymOut, repoRoot: capSymRepo, skillsRoot: REPO_ROOT }),
+      /must not be a symlink/i,
+    );
+    const outsideNestedDir = join(runRoot, "outside-nested-dir");
+    mkdirSync(outsideNestedDir, { recursive: true });
+    writeFileSync(join(outsideNestedDir, "nested.md"), "regular target inside symlinked dir\n");
+    symlinkSync(outsideNestedDir, join(capSymOut, "sym-subdir"));
+    assert.throws(
+      () => captureStageOutputs(["{{output_path}}/sym-subdir/nested.md"], { outputPath: capSymOut, repoRoot: capSymRepo, skillsRoot: REPO_ROOT }),
+      /must not be a symlink/i,
+    );
+    // ..-prefixed in-root directories and filenames must still be inspected/captured (not treated as .. escape)
+    symlinkSync(outsideNestedDir, join(capSymOut, "..evil-sym"));
+    assert.throws(
+      () => captureStageOutputs(["{{output_path}}/..evil-sym/nested.md"], { outputPath: capSymOut, repoRoot: capSymRepo, skillsRoot: REPO_ROOT }),
+      /must not be a symlink/i,
+    );
+    mkdirSync(join(capSymOut, "..dotdir"), { recursive: true });
+    writeFileSync(join(capSymOut, "..dotdir", "..dotfile.md"), "ok\n");
+    const dotCaptured = captureStageOutputs(["{{output_path}}/..dotdir/..dotfile.md"], {
+      outputPath: capSymOut,
+      repoRoot: capSymRepo,
+      skillsRoot: REPO_ROOT,
+    });
+    assert.equal(dotCaptured.length, 1);
+    assert.equal(dotCaptured[0].path, "out/..dotdir/..dotfile.md");
+
+    // 4b. stage-tracker.mjs stage-complete rejects live/dangling/glob symlinks and symlinked ancestor dirs
+    const trkRepo = join(runRoot, "trk-sym-repo");
+    const trkData = join(runRoot, "trk-sym-data");
+    const trkOut = join(trkRepo, "tmp", "workflow-artifacts");
+    mkdirSync(trkOut, { recursive: true });
+    mkdirSync(trkData, { recursive: true });
+    const runTracker = (args, extraOut = trkOut, cwd = trkRepo) =>
+      spawnSync(
+        process.execPath,
+        [TRACKER_CLI, ...args, "--workflow", "sw_dev", "--data-dir", trkData, "--repo-root", trkRepo, "--skills-root", REPO_ROOT, "--output-path", extraOut],
+        { cwd, encoding: "utf8" },
+      );
+    assert.equal(runTracker(["init"]).status, 0);
+    assert.equal(runTracker(["stage-start", "--stage", "intake"]).status, 0);
+
+    const trkStagesDb = new Database(join(trkData, "uwf-stages.db"), { readonly: true });
+    try {
+      // (a) Live symlink literal output (even when check-gate passes!)
+      const intakeOutPath = join(trkOut, "issues-intake.md");
+      symlinkSync(symTargetFile, intakeOutPath);
+      const gateSym = spawnSync(
+        process.execPath,
+        [SW_DEV_RUN_CLI, "--check-gate", "intake", "--data-dir", trkData, "--output-path", trkOut, "--skills-root", REPO_ROOT],
+        { cwd: trkRepo, encoding: "utf8" },
+      );
+      assert.equal(gateSym.status, 0, "fixture check that gate follows symlink");
+      const scLive = runTracker(["stage-complete", "--stage", "intake"]);
+      assert.notEqual(scLive.status, 0, "stage-complete must fail closed on live symlink literal output");
+      assert.match(scLive.stdout, /must not be a symlink/i);
+      assert.deepEqual(
+        trkStagesDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'intake'").get(),
+        { status: "active", outputs_json: null },
+      );
+
+      // (b) Dangling symlink literal output
+      rmSync(intakeOutPath);
+      symlinkSync(join(runRoot, "nonexistent-target.md"), intakeOutPath);
+      const scDangling = runTracker(["stage-complete", "--stage", "intake"]);
+      assert.notEqual(scDangling.status, 0, "stage-complete must fail closed on dangling symlink literal output");
+      assert.match(scDangling.stdout, /must not be a symlink/i);
+      assert.deepEqual(
+        trkStagesDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'intake'").get(),
+        { status: "active", outputs_json: null },
+      );
+
+      // (c) Symlinked glob-matched output (docs/adr/ADR-0001.md)
+      assert.equal(runTracker(["stage-start", "--stage", "adr"]).status, 0);
+      mkdirSync(join(trkRepo, "docs", "adr"), { recursive: true });
+      symlinkSync(symTargetFile, join(trkRepo, "docs", "adr", "ADR-0001.md"));
+      const scGlob = runTracker(["stage-complete", "--stage", "adr"]);
+      assert.notEqual(scGlob.status, 0, "stage-complete must fail closed on symlinked glob-matched output");
+      assert.match(scGlob.stdout, /must not be a symlink/i);
+      assert.deepEqual(
+        trkStagesDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'adr'").get(),
+        { status: "active", outputs_json: null },
+      );
+
+      // (d) Regular file under a symlinked subdirectory of outputPath / repoRoot
+      const symSubRoot = join(trkRepo, "sym-out-root");
+      const symOutNested = join(symSubRoot, "nested");
+      mkdirSync(join(outsideNestedDir, "nested"), { recursive: true });
+      writeFileSync(join(outsideNestedDir, "nested", "issues-intake.md"), validIntakeText);
+      symlinkSync(outsideNestedDir, symSubRoot);
+      const scAncestor = runTracker(["stage-complete", "--stage", "intake"], symOutNested);
+      assert.notEqual(scAncestor.status, 0, "stage-complete must fail closed when output ancestor dir is a symlink");
+      assert.match(scAncestor.stdout, /must not be a symlink/i);
+      assert.deepEqual(
+        trkStagesDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'intake'").get(),
+        { status: "active", outputs_json: null },
+      );
+    } finally {
+      trkStagesDb.close();
+    }
+
+    // 4c. runner.mjs fails closed (exit 1, stage marked failed with null outputs_json) when stage output is a symlink
+    const runnerSymFx = join(runRoot, "fx-runner-sym");
+    const runnerSymRoot = join(runRoot, "root-runner-sym");
+    const runnerSymData = join(runRoot, "data-runner-sym");
+    cpSync(fxDir, runnerSymFx, { recursive: true });
+    writeFileSync(
+      join(runnerSymFx, "intake.json"),
+      JSON.stringify({ files: {}, transcript: "intake: left symlink output", delayMs: 0 }, null, 2),
+    );
+    mkdirSync(join(runnerSymRoot, "tmp", "workflow-artifacts"), { recursive: true });
+    writeFileSync(join(runnerSymRoot, ".uwf.json"), JSON.stringify({ verify: [] }));
+    symlinkSync(symTargetFile, join(runnerSymRoot, "tmp", "workflow-artifacts", "issues-intake.md"));
+    const symRunnerRes = spawnSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Reject symlinked stage output", "--adapter", "fake", "--repo-root", runnerSymRoot, "--data-dir", runnerSymData, "--defer-seal"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, UWF_FAKE_FIXTURE_DIR: runnerSymFx, UWF_DATA_DIR: "" },
+      },
+    );
+    assert.equal(symRunnerRes.status, 1, "runner.mjs must exit 1 when stage-complete rejects a symlinked stage output");
+    assert.match(symRunnerRes.stderr ?? "", /must not be a symlink/i);
+    const runnerSymDb = new Database(join(runnerSymData, "uwf-stages.db"), { readonly: true });
+    try {
+      assert.deepEqual(
+        runnerSymDb.prepare("SELECT status, outputs_json FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'intake'").get(),
+        { status: "failed", outputs_json: null },
+      );
+      assert.deepEqual(
+        runnerSymDb.prepare("SELECT status FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'discovery'").get(),
+        { status: "pending" },
+      );
+    } finally {
+      runnerSymDb.close();
+    }
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

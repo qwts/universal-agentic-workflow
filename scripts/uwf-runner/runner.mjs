@@ -745,41 +745,48 @@ async function stageLoop(ctx) {
       } else {
         const g = cli(runScript, ["--check-gate", st.name], withOut);
         if (g.ok) {
-          log(`${tag} gate: PASS`);
-          cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
-          row.result = "passed";
-          // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
-          const had = [...findings].filter(([, v]) => v.from === st.name);
-          if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
-          const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
-          if (adv) row.result += ` (${adv})`;
-          if (st.name === "snapshot") {
-            let snapErr = null;
-            try {
-              const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal: false });
-              if (!m.ok) snapErr = `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`;
-            } catch (err) {
-              log(`[runner] provenance manifest at snapshot failed: ${err.message}`);
-              snapErr = `provenance manifest generation failed (${err.message})`;
-            }
-            if (snapErr) {
-              resetFrom(i);
-              rollbackPhase(i);
-              if (sessionId && st.retryMode !== "fresh") {
-                cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
+          const sc = cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
+          if (sc.ok) {
+            log(`${tag} gate: PASS`);
+            row.result = "passed";
+            // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
+            const had = [...findings].filter(([, v]) => v.from === st.name);
+            if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
+            const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
+            if (adv) row.result += ` (${adv})`;
+            if (st.name === "snapshot") {
+              let snapErr = null;
+              try {
+                const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal: false });
+                if (!m.ok) snapErr = `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`;
+              } catch (err) {
+                log(`[runner] provenance manifest at snapshot failed: ${err.message}`);
+                snapErr = `provenance manifest generation failed (${err.message})`;
               }
-              row.result = "failed (provenance)";
-              return finish(EXIT.GATE, rows, `${tag}: ${snapErr}`, note);
+              if (snapErr) {
+                resetFrom(i);
+                rollbackPhase(i);
+                if (sessionId && st.retryMode !== "fresh") {
+                  cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
+                }
+                row.result = "failed (provenance)";
+                return finish(EXIT.GATE, rows, `${tag}: ${snapErr}`, note);
+              }
             }
+            if (over) return capStop(`${st.name} passed`);
+            break;
           }
-          if (over) return capStop(`${st.name} passed`);
-          break;
+          const scErr = sc.data?.error ?? sc.error ?? "stage-complete failed";
+          failures = [scErr];
+          prescriptions = [`Replace any symlinked or non-regular stage output with a regular file so stage-complete succeeds (${scErr}).`];
+          log(`${tag} stage-complete: FAIL — ${scErr}`);
+        } else {
+          failures = g.data?.failures ?? [g.error];
+          verdict = typeof g.data?.verdict === "string" ? g.data.verdict : null;
+          gateRan = true;
+          prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
+          log(`${tag} gate: FAIL — ${failures.join("; ")}`);
         }
-        failures = g.data?.failures ?? [g.error];
-        verdict = typeof g.data?.verdict === "string" ? g.data.verdict : null;
-        gateRan = true;
-        prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
-        log(`${tag} gate: FAIL — ${failures.join("; ")}`);
       }
       log(`${tag}   attempt ${attempt}/${maxAttempts}; to fix: ${prescriptions[0]}`);
 

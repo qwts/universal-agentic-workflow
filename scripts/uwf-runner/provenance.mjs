@@ -799,6 +799,77 @@ function matchGlobSegment(pattern, name) {
   return dp[n] === 1;
 }
 
+function isOutsideRel(rel) {
+  return rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
+}
+
+function readRegularFileNoFollow(filePath) {
+  let fd;
+  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+  try {
+    fd = openSync(filePath, openFlags);
+  } catch (err) {
+    if (err.code === "ELOOP" || err.code === "EFTYPE") {
+      throw new Error(`Declared output "${filePath}" must not be a symlink`);
+    }
+    throw new Error(`Failed to open declared output "${filePath}": ${err.message}`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      throw new Error(`Declared output "${filePath}" must be a regular file`);
+    }
+    return readFileSync(fd);
+  } finally {
+    try { closeSync(fd); } catch { /* ignore close errors */ }
+  }
+}
+
+function assertSafeOutputAncestors(targetPath, { outputPath, repoRoot, skillsRoot }) {
+  const absRepo = resolve(repoRoot);
+  const absOut = resolve(absRepo, outputPath);
+  const roots = [absOut, absRepo, ...(skillsRoot ? [resolve(skillsRoot)] : [])];
+  const dirToCheck = dirname(targetPath);
+  const sepPrefix = (r) => (r.endsWith(sep) ? r : r + sep);
+  if (dirToCheck === absOut || dirToCheck.startsWith(sepPrefix(absOut))) {
+    let outSt = null;
+    try {
+      outSt = lstatSync(absOut);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        throw new Error(`Cannot inspect declared output root "${absOut}": ${err.message}`);
+      }
+    }
+    if (outSt && (outSt.isSymbolicLink() || !outSt.isDirectory())) {
+      throw new Error(`Declared output root "${absOut}" must be a regular directory`);
+    }
+  }
+  const matched = roots
+    .filter((r) => dirToCheck === r || dirToCheck.startsWith(sepPrefix(r)))
+    .sort((a, b) => a.length - b.length);
+  const root = matched[0];
+  if (!root) return;
+  const rel = relative(root, dirToCheck);
+  if (!rel || isOutsideRel(rel)) return;
+  let cur = root;
+  for (const seg of rel.split(sep).filter(Boolean)) {
+    cur = join(cur, seg);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch (err) {
+      if (err.code === "ENOENT") break;
+      throw new Error(`Cannot inspect declared output ancestor "${cur}": ${err.message}`);
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Declared output ancestor "${cur}" must not be a symlink`);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`Declared output ancestor "${cur}" is not a directory`);
+    }
+  }
+}
+
 function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
   const expanded = String(template)
     .replace(/\{\{output_path\}\}/g, () => outputPath)
@@ -806,31 +877,76 @@ function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
     .replace(/\{\{skills_root\}\}/g, () => skillsRoot ?? repoRoot);
 
   const absPattern = isAbsolute(expanded) ? expanded : resolve(repoRoot, expanded);
+  assertSafeOutputAncestors(absPattern, { outputPath, repoRoot, skillsRoot });
   if (!/[*?[\]]/.test(basename(absPattern))) {
-    return existsSync(absPattern) ? [absPattern] : [];
+    let st = null;
+    try {
+      st = lstatSync(absPattern);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        throw new Error(`Cannot inspect declared output "${absPattern}": ${err.message}`);
+      }
+      return [];
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Declared output "${absPattern}" must not be a symlink`);
+    }
+    if (!st.isFile()) {
+      throw new Error(`Declared output "${absPattern}" must be a regular file`);
+    }
+    return [absPattern];
   }
   const dir = dirname(absPattern);
   const basePattern = basename(absPattern);
-  if (!existsSync(dir)) return [];
-  const matches = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isFile() && !entry.isSymbolicLink() && matchGlobSegment(basePattern, entry.name)) {
-      matches.push(join(dir, entry.name));
+  let dirSt = null;
+  try {
+    dirSt = lstatSync(dir);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      throw new Error(`Cannot inspect declared output directory "${dir}": ${err.message}`);
     }
+    return [];
+  }
+  if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) {
+    throw new Error(`Declared output directory "${dir}" must be a regular directory`);
+  }
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch (err) {
+    throw new Error(`Cannot read declared output directory "${dir}": ${err.message}`);
+  }
+  const matches = [];
+  for (const name of entries) {
+    if (!matchGlobSegment(basePattern, name)) continue;
+    const entryPath = join(dir, name);
+    let st;
+    try {
+      st = lstatSync(entryPath);
+    } catch (err) {
+      throw new Error(`Cannot inspect declared output "${entryPath}": ${err.message}`);
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Declared output "${entryPath}" must not be a symlink`);
+    }
+    if (!st.isFile()) {
+      throw new Error(`Declared output "${entryPath}" must be a regular file`);
+    }
+    matches.push(entryPath);
   }
   return matches;
 }
 
 function normalizeArtifactPath(absPath, repoRoot) {
   const rel = relative(resolve(repoRoot), resolve(absPath));
-  if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+  if (rel && !isOutsideRel(rel)) {
     return toPosix(rel);
   }
   return toPosix(resolve(absPath));
 }
 
 export function hashFileEntry(absPath, repoRoot) {
-  const buf = readFileSync(absPath);
+  const buf = readRegularFileNoFollow(absPath);
   return {
     path: normalizeArtifactPath(absPath, repoRoot),
     sha256: sha256Hex(buf),
@@ -845,12 +961,8 @@ export function captureStageOutputs(stageOutputs, { outputPath, repoRoot, skills
   const seen = new Map();
   for (const tmpl of stageOutputs ?? []) {
     for (const absPath of expandOutputTemplate(tmpl, { outputPath, repoRoot, skillsRoot })) {
-      try {
-        const st = lstatSync(absPath);
-        if (!st.isFile()) continue;
-        const entry = hashFileEntry(absPath, repoRoot);
-        seen.set(entry.path, entry);
-      } catch { /* ignore unreadable */ }
+      const entry = hashFileEntry(absPath, repoRoot);
+      seen.set(entry.path, entry);
     }
   }
   return [...seen.values()].sort((a, b) => compareUtf16(a.path, b.path));
