@@ -137,9 +137,9 @@ cells:
   check("export is deterministic", ["runs", "stage_outcomes", "ratings"].every((t) => readFileSync(join(out1, `${t}.csv`), "utf8") === readFileSync(join(out2, `${t}.csv`), "utf8")));
 }
 
-// 3. nocli stub, harness errors, usage -------------------------------------------
+// 3. nocli execution (fake adapter + missing fixture), harness errors, usage ----------
 {
-  console.log("# nocli stub and harness errors");
+  console.log("# nocli execution and harness errors");
   const base = mkdtempSync(join(tmpdir(), "uwf-bench-test-"));
   bases.push(base);
   writeFileSync(join(base, "matrix.yaml"), `fixtures:
@@ -157,11 +157,61 @@ cells:
   const r = bench(["run", "--matrix", join(base, "matrix.yaml"), "--db", join(base, "r.db")]);
   const runs = query(join(base, "r.db"), "SELECT * FROM runs ORDER BY cell");
   check("matrix survives a failing run", r.code === 0 && runs.length === 2, r.err.slice(-400));
-  check("nocli recorded as not_implemented, no failure class", runs[1].terminal_state === "not_implemented" && runs[1].failure_class === null);
+  check("nocli with missing fixture is harness_error", runs[1].terminal_state === "harness_error" && runs[1].failure_class === "harness_error");
   check("missing fixture is harness_error", runs[0].failure_class === "harness_error" && /not found/.test(runs[0].notes));
   check("--help exits 0", bench(["--help"]).code === 0);
   check("missing --matrix exits 2", bench(["run"]).code === 2);
   check("invalid matrix exits 2", (writeFileSync(join(base, "bad.yaml"), "cells:\n"), bench(["run", "--matrix", join(base, "bad.yaml")]).code === 2));
+
+  // Offline nocli run via fake backend + monolith.json steps (repaired intake -> firstTryPass=false for intake)
+  const ncBase = mkdtempSync(join(tmpdir(), "uwf-bench-nocli-"));
+  bases.push(ncBase);
+  mkdirSync(join(ncBase, "repo"));
+  writeFileSync(join(ncBase, "repo", "README.md"), "# fixture\n");
+  mkdirSync(join(ncBase, "fx-nocli"));
+
+  // Build monolith.json steps from RUNNER_FIXTURES stage fixtures (adjusting output paths into dataDir/workflow-artifacts? Wait: monolith runner with --data-dir uses ./tmp/workflow-artifacts when --output-path is omitted by bench!)
+  const stageOrder = ["intake", "discovery", "requirements", "risk-plan", "test-plan", "blueprint", "work-plan", "implementation", "review", "technical-writing", "acceptance", "snapshot", "retro"];
+  const allFiles = {};
+  const steps = [];
+  for (const st of stageOrder) {
+    const fxPath = join(RUNNER_FIXTURES, `${st}.json`);
+    if (!existsSync(fxPath)) continue;
+    const fx = JSON.parse(readFileSync(fxPath, "utf8"));
+    Object.assign(allFiles, fx.files ?? {});
+    if (st === "intake") {
+      // Simulate first attempt failing (empty intake) followed by repair on second mark
+      steps.push({ stage: "intake", files: { "tmp/workflow-artifacts/issues-intake.md": "" } });
+    }
+    steps.push({ stage: st, files: fx.files ?? {} });
+  }
+  writeFileSync(join(ncBase, "fx-nocli", "monolith.json"), JSON.stringify({
+    steps,
+    files: allFiles,
+    transcript: "nocli monolith complete",
+    sessionId: "nc-fake-1",
+  }));
+  writeFileSync(join(ncBase, "matrix.yaml"), `workflow: sw_dev
+runs_per_cell: 1
+output_path: ./out
+timeout_ms: 60000
+fixtures:
+  - name: bare
+    repo: ./repo
+    goal: "Add a widget"
+cells:
+  - name: nc-fake
+    adapter: fake
+    state_location: nocli
+    fake_fixture_dir: ./fx-nocli
+`);
+  const ncr = bench(["run", "--matrix", join(ncBase, "matrix.yaml")]);
+  const ncDb = join(ncBase, "out", "results.db");
+  const ncRuns = query(ncDb, "SELECT * FROM runs");
+  check("nocli fake matrix run exits 0 and completes", ncr.code === 0 && ncRuns.length === 1 && ncRuns[0].terminal_state === "complete" && ncRuns[0].failure_class === "none", ncr.err.slice(-600));
+  check("nocli records repaired intake as first_try_pass_rate < 1 and retries_total >= 1", ncRuns[0].first_try_pass_rate > 0 && ncRuns[0].first_try_pass_rate < 1 && ncRuns[0].retries_total >= 1, JSON.stringify(ncRuns[0]));
+  const ncIntake = query(ncDb, `SELECT * FROM stage_outcomes WHERE run_id = ${ncRuns[0].run_id} AND stage = 'intake' ORDER BY attempt`);
+  check("nocli intake has 2 attempts: first failed, second passed, first_try_pass=0", ncIntake.length === 2 && ncIntake[0].passed === 0 && ncIntake[0].first_try_pass === 0 && ncIntake[1].passed === 1, JSON.stringify(ncIntake));
 }
 
 // Whole-run timeout must kill the runner's entire tree, including a grandchild that detached into its

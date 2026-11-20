@@ -23,6 +23,8 @@ export interface InvokeStageOptions {
   skillsRoot?: string;
   /** Transcripts go to <dataDir>/transcripts/. Default: UWF_DATA_DIR ?? ./tmp/uwf */
   dataDir?: string;
+  /** Additional host directories writable by sandboxed adapters (e.g., sibling dataDir/outputPath). */
+  writableRoots?: string[];
 }
 
 export interface Usage {
@@ -47,4 +49,4 @@ export interface Adapter {
   invokeStage(opts: InvokeStageOptions, extra?: { fixture?: string }): Promise<InvokeStageResult>;
 }
 
-export function loadAdapter(name: "claude-code" | "codex" | "fake" | string): Promise<Adapter>;
+export function loadAdapter(name: "claude-code" | "codex" | "fake" | "grokbot" | "monolith" | string): Promise<Adapter>;

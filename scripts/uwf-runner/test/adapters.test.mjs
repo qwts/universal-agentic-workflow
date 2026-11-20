@@ -22,7 +22,7 @@ function cliAvailable(bin) {
   try { execFileSync(bin, ["--version"], { stdio: "ignore" }); return true; } catch { return false; }
 }
 
-async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase }) {
+async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase, extraOpts }) {
   console.log(`# adapter: ${adapterName}`);
   const adapter = await loadAdapter(adapterName);
   const root = mkdtempSync(join(tmpdir(), `uwf-adapter-${adapterName}-`));
@@ -30,7 +30,7 @@ async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase })
   const dataDir = join(root, "data");
   mkdirSync(cwd);
   try {
-    const base = { prompt, cwd, dataDir, model, permissions: "read-only", timeoutMs: 180000 };
+    const base = { prompt, cwd, dataDir, model, permissions: "read-only", timeoutMs: 180000, ...extraOpts };
     const extraFor = (n) => (fixtureFor ? { fixture: fixtureFor(root, n) } : undefined);
 
     const r1 = await adapter.invokeStage({ ...base }, extraFor(1));
@@ -82,6 +82,24 @@ async function contract(adapterName, { prompt, model, fixtureFor, timeoutCase })
   check("fake: usage is null", r.usage === null);
 }
 
+// --- monolith adapter (offline: delegates to fake backend) ---
+{
+  const r = await contract("monolith", {
+    prompt: "Run the monolith stage for the sw_dev workflow.",
+    timeoutCase: { timeoutMs: 50 },
+    extraOpts: { backend: "fake" },
+    fixtureFor: (root, n) => {
+      const p = join(root, `monolith-fixture-${n}.json`);
+      writeFileSync(p, JSON.stringify(n === "slow"
+        ? { transcript: "slow", delayMs: 2000 }
+        : { files: { "out/result.md": "# done\n" }, transcript: "OK", sessionId: "monolith-sess-1" }));
+      return p;
+    },
+  });
+  check("monolith: sessionId from backend fixture", r.sessionId === "monolith-sess-1");
+  check("monolith: usage is null under fake backend", r.usage === null);
+}
+
 // --- claude-code argv (offline: a fake `claude` on PATH records the argv it was spawned with) ---
 {
   const root = mkdtempSync(join(tmpdir(), "uwf-argv-"));
@@ -130,6 +148,77 @@ process.stdout.write(JSON.stringify({ result: "OK", session_id: "argv-sess", is_
     check("read-only+review: --tools has Bash, allow-list has no bare Bash", toolsArg.split(",").includes("Bash") && !allowedArg.split(",").includes("Bash"), `${toolsArg} | ${allowedArg}`);
     check("claude-code argv passes --setting-sources right after --permission-mode dontAsk",
       i > 0 && argv[i - 1] === "dontAsk" && argv[i - 2] === "--permission-mode", JSON.stringify(argv));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// --- codex adapter (argv contract check with fake binary; offline) ---
+{
+  const root = mkdtempSync(join(tmpdir(), "uwf-codex-argv-"));
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const argvFile = join(root, "argv.json");
+  const fakeCodex = join(bin, "codex");
+  writeFileSync(fakeCodex, `#!${process.execPath}
+const { writeFileSync } = require("node:fs");
+writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-argv-sess" }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "OK" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n");
+`);
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const adapter = await loadAdapter("codex");
+    const cwd = join(root, "work");
+    const dataDir = join(root, "sibling-data");
+    const outDir = join(root, "sibling-out");
+    mkdirSync(cwd);
+    const codexEnv = { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` };
+
+    const rEdit = await adapter.invokeStage({
+      prompt: "argv check",
+      cwd,
+      dataDir,
+      writableRoots: [dataDir, outDir],
+      permissions: "edit",
+      timeoutMs: 20000,
+      env: codexEnv,
+    });
+    check("codex argv edit run ok", rEdit.ok === true, rEdit.error ?? "");
+    const argvEdit = JSON.parse(readFileSync(argvFile, "utf8"));
+    const wrIdx = argvEdit.findIndex((a) => String(a).startsWith("sandbox_workspace_write.writable_roots="));
+    check("codex edit passes sandbox_workspace_write.writable_roots", wrIdx >= 0, JSON.stringify(argvEdit));
+    const wrParsed = JSON.parse(argvEdit[wrIdx].split("=", 2)[1]);
+    check("codex writable_roots contains sibling dataDir and outDir", wrParsed.includes(dataDir) && wrParsed.includes(outDir), JSON.stringify(wrParsed));
+
+    const rResume = await adapter.invokeStage({
+      prompt: "resume check",
+      cwd,
+      dataDir,
+      sessionId: "codex-argv-sess",
+      permissions: "edit+exec",
+      timeoutMs: 20000,
+      env: codexEnv,
+    });
+    check("codex argv resume run ok", rResume.ok === true, rResume.error ?? "");
+    const argvResume = JSON.parse(readFileSync(argvFile, "utf8"));
+    check("codex resume includes writable_roots for sibling dataDir",
+      argvResume.some((a) => a === `sandbox_workspace_write.writable_roots=${JSON.stringify([dataDir])}`),
+      JSON.stringify(argvResume));
+
+    const rRo = await adapter.invokeStage({
+      prompt: "ro check",
+      cwd,
+      dataDir,
+      writableRoots: [outDir],
+      permissions: "read-only",
+      timeoutMs: 20000,
+      env: codexEnv,
+    });
+    check("codex argv read-only run ok", rRo.ok === true, rRo.error ?? "");
+    const argvRo = JSON.parse(readFileSync(argvFile, "utf8"));
+    check("codex read-only omits writable_roots", !argvRo.some((a) => String(a).includes("writable_roots")), JSON.stringify(argvRo));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
