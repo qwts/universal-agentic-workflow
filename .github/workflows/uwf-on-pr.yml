@@ -292,7 +292,8 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE/target"
             --skills-root "$GITHUB_WORKSPACE/uwf"
             --data-dir "$UWF_DATA_DIR"
-            --max-cost-usd "$INPUT_MAX_COST_USD")
+            --max-cost-usd "$INPUT_MAX_COST_USD"
+            --defer-seal)
           # skip keeps the old behaviour (questions are marked skipped); pause lets required ones end the run with exit 3.
           if [ "$INPUT_ON_QUESTIONS" = skip ]; then
             args+=(--non-interactive)
@@ -358,6 +359,7 @@ jobs:
           GITHUB_API_URL: ${{ github.api_url }}
         run: |
           set -uo pipefail
+          rm -f "$RESULT_FILE"
           node uwf/scripts/uwf-on-pr/push-as-bot.mjs
 
       - name: Pause for questions
@@ -408,12 +410,129 @@ jobs:
         id: scrub
         if: ${{ always() }}
         shell: bash
+        env:
+          TARGET_DIR: ${{ github.workspace }}/target
+          INPUT_WORKFLOW: ${{ inputs.workflow }}
         run: |
           set -uo pipefail
-          node uwf/scripts/uwf-on-pr/scrub.mjs \
+          rc=0
+          if [ -d "$UWF_DATA_DIR" ]; then
+            if node uwf/scripts/uwf-runner/provenance.mjs scrub \
+              --data-dir "$UWF_DATA_DIR" \
+              --workflow "$INPUT_WORKFLOW" \
+              --repo-root "$TARGET_DIR" \
+              --skills-root "$GITHUB_WORKSPACE/uwf" \
+              --output-path "$TARGET_DIR/tmp/workflow-artifacts"; then
+              :
+            else
+              rc=$?
+            fi
+          fi
+          if node uwf/scripts/uwf-on-pr/scrub.mjs \
             "$UWF_DATA_DIR" \
             "$RUNNER_TEMP/runner.log" \
-            "$GITHUB_WORKSPACE/target/tmp/workflow-artifacts"
+            "$TARGET_DIR/tmp/workflow-artifacts"; then
+            :
+          else
+            rc=$?
+          fi
+          exit "$rc"
+
+      - name: Seal provenance manifest
+        id: seal
+        if: ${{ always() && steps.run.outputs.exit_code == '0' && steps.push.outcome == 'success' && steps.scrub.outcome == 'success' }}
+        shell: bash
+        env:
+          STEP_GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PUSH_RESULT: ${{ runner.temp }}/push-result.json
+          TARGET_DIR: ${{ github.workspace }}/target
+          INPUT_WORKFLOW: ${{ inputs.workflow }}
+        run: |
+          set -euo pipefail
+          seal_git_dir=""
+          cleanup_seal_git() {
+            if [ -n "${seal_git_dir:-}" ]; then
+              rm -rf "$seal_git_dir"
+            fi
+          }
+          trap cleanup_seal_git EXIT
+          if [ ! -f "$PUSH_RESULT" ]; then
+            unset STEP_GH_TOKEN
+            echo "::notice::skipping provenance seal (missing push-result.json); manifest remains closed"
+            exit 0
+          fi
+          push_status=$(node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.env.PUSH_RESULT,"utf8"));process.stdout.write(String(r.status||""));')
+          pushed_sha=$(node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.env.PUSH_RESULT,"utf8"));process.stdout.write(String(r.sha||""));')
+          if [ "$push_status" = pushed ]; then
+            case "$pushed_sha" in
+              (*[!0-9a-f]*|'')
+                unset STEP_GH_TOKEN
+                echo "::error::unexpected pushed sha in push-result.json"
+                exit 1
+                ;;
+            esac
+            if [ "${#pushed_sha}" -ne 40 ]; then
+              unset STEP_GH_TOKEN
+              echo "::error::unexpected pushed sha length in push-result.json"
+              exit 1
+            fi
+            seal_git_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/uaw-seal-git-XXXXXX")"
+            git -C "$seal_git_dir" init --bare -q
+            basic_auth=$(node -e 'process.stdout.write("AUTHORIZATION: basic " + Buffer.from("x-access-token:" + process.env.STEP_GH_TOKEN).toString("base64"));')
+            unset STEP_GH_TOKEN
+            env -i \
+              PATH="$PATH" \
+              HOME="$HOME" \
+              TMPDIR="${TMPDIR:-/tmp}" \
+              GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL%/}/.extraheader" \
+              GIT_CONFIG_VALUE_0="$basic_auth" \
+              git \
+                -c protocol.allow=never \
+                -c protocol.https.allow=always \
+                -c http.sslVerify=true \
+                -c http.proxy= \
+                -c core.fsmonitor=false \
+                -c core.hooksPath=/dev/null \
+                -c core.pager=cat \
+                -c core.sshCommand=false \
+                -c credential.helper= \
+                -C "$seal_git_dir" fetch --depth=1 --no-tags -- "${GITHUB_SERVER_URL%/}/${REPO}.git" "$pushed_sha"
+            unset basic_auth
+            head_commit="$pushed_sha"
+          elif [ "$push_status" = no-changes ]; then
+            unset STEP_GH_TOKEN
+            head_commit="$EXPECTED_SHA"
+          else
+            unset STEP_GH_TOKEN
+            echo "::notice::skipping provenance seal (push status: ${push_status:-unknown}); manifest remains closed"
+            exit 0
+          fi
+          unset STEP_GH_TOKEN
+          if [ -n "$seal_git_dir" ]; then
+            node uwf/scripts/uwf-runner/provenance.mjs seal \
+              --data-dir "$UWF_DATA_DIR" \
+              --workflow "$INPUT_WORKFLOW" \
+              --repo-root "$TARGET_DIR" \
+              --skills-root "$GITHUB_WORKSPACE/uwf" \
+              --head-commit "$head_commit" \
+              --pr-url "$PR_URL" \
+              --commit-git-dir "$seal_git_dir"
+          else
+            node uwf/scripts/uwf-runner/provenance.mjs seal \
+              --data-dir "$UWF_DATA_DIR" \
+              --workflow "$INPUT_WORKFLOW" \
+              --repo-root "$TARGET_DIR" \
+              --skills-root "$GITHUB_WORKSPACE/uwf" \
+              --head-commit "$head_commit" \
+              --pr-url "$PR_URL"
+          fi
 
       - name: Upload workflow artifacts and transcripts
         if: ${{ always() && steps.scrub.outcome == 'success' && env.UWF_KEEP != 'true' }}
@@ -424,6 +543,7 @@ jobs:
             target/tmp/workflow-artifacts
             ${{ runner.temp }}/uwf-${{ github.run_id }}/transcripts
             ${{ runner.temp }}/uwf-${{ github.run_id }}/workflow-artifacts
+            ${{ runner.temp }}/uwf-${{ github.run_id }}/uaw-manifest.json
             ${{ runner.temp }}/runner.log
           if-no-files-found: warn
           retention-days: 14

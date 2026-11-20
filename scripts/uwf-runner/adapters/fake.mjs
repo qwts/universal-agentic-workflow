@@ -199,6 +199,7 @@ export async function invokeStage(opts, extra = {}) {
   const transcriptPath = writeTranscript(dataDir, {
     adapter: name, prompt: opts.prompt, sessionId: sid, exitCode,
     stdout: fx.claudeResult ? JSON.stringify({ result: stdout, ...fx.claudeResult }) : stdout, files: Object.keys(fx.files ?? {}),
+    ...(typeof opts.stage === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(opts.stage.trim()) ? { stage: opts.stage.trim() } : {}),
   });
   const res = { ok: exitCode === 0, sessionId: sid, transcriptPath, stdout, exitCode, usage: null };
   if (exitCode !== 0) res.error = `fake adapter: fixture exitCode ${exitCode}`;

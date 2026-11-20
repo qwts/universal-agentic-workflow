@@ -161,6 +161,7 @@ function readState(db) {
     ready_for_implementation: !!row.ready_for_implementation,
     model_profile: row.model_profile ?? null,
     model_name: row.model_name ?? null,
+    run_id: row.run_id ?? null,
     history,
   };
 }
@@ -216,16 +217,17 @@ function cmdRead(db) {
 
 function cmdInit(db) {
   const mode = flags["mode"] ?? null;
+  const runId = flags["run-id"] ?? process.env.UAW_RUN_ID ?? null;
   db.transaction(() => {
     db.prepare("DELETE FROM workflow_history").run();
     db.prepare(
       `UPDATE workflow_state
        SET phase = 'idea', mode = ?, status = 'idle', current_agent = NULL,
-           artifact_path = ?, ready_for_implementation = 0
+           artifact_path = ?, ready_for_implementation = 0, run_id = ?
        WHERE id = 1`
-    ).run(mode, outputPath);
+    ).run(mode, outputPath, runId);
   })();
-  succeed({ procedure: "init", mode, state: readState(db) });
+  succeed({ procedure: "init", mode, run_id: runId, state: readState(db) });
 }
 
 function cmdAdvance(db) {

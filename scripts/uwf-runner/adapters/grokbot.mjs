@@ -21,6 +21,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { resolveDataDir, writeTranscript, buildSystemPrompt } from "./index.mjs";
+import { matchPromptStage, normalizeStageName } from "../stage-match.mjs";
 
 export const name = "grokbot";
 
@@ -34,9 +35,8 @@ function nextId(dir) {
 
 // The runner passes the stage name; the prompt is only a last resort (it starts with user goal text).
 function stageOf(stage, prompt) {
-  if (stage) return String(stage).replace(/[^\w-]/g, "-");
-  const m = /^Run the ([\w-]+) stage/m.exec(prompt ?? "");
-  return m ? m[1] : "stage";
+  if (typeof stage === "string" && stage.trim()) return stage.trim().replace(/[^\w-]/g, "-");
+  return matchPromptStage(prompt, { allowBareStageHeader: true }) ?? "stage";
 }
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts */
@@ -89,7 +89,12 @@ export async function invokeStage(opts) {
   const ok = resp.ok !== false;
   const stdout = String(resp.summary ?? resp.stdout ?? "");
   const outSid = resp.sessionId ?? sid;
-  const transcriptPath = writeTranscript(dataDir, { adapter: name, requestId: id, prompt, systemPrompt, sessionId: outSid, exitCode: ok ? 0 : 1, stdout });
+  const explicitStage = normalizeStageName(stageName);
+  const transcriptPath = writeTranscript(dataDir, {
+    adapter: name,
+    ...(explicitStage ? { stage: explicitStage } : {}),
+    requestId: id, prompt, systemPrompt, sessionId: outSid, exitCode: ok ? 0 : 1, stdout,
+  });
   const res = { ok, sessionId: outSid, transcriptPath, stdout, exitCode: ok ? 0 : 1, usage: null };
   if (!ok) res.error = `grokbot agent reported failure: ${resp.error ?? "unspecified"}`;
   return res;

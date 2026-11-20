@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -40,6 +40,7 @@ import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { GIT_ENV_OVERRIDES } from "./mark-stage.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
+import { ensureRunMeta, materializeManifest, readContainedDataFile, readManifestRaw, readRoutingState, sealManifest, writeFileAtomic } from "./provenance.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -50,6 +51,121 @@ const QUESTIONS = join(SKILLS, "uwf-question-protocol", "questions.mjs");
 const AGENT_ID = "uwf-runner";
 const GOAL_FILE = "runner-goal.md";
 const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings, so `resume` keeps them
+const FINALIZE_PENDING_FILE = "runner-finalize-pending.json";
+
+function readFinalizePending(dataDir) {
+  let raw;
+  try {
+    raw = readContainedDataFile(dataDir, FINALIZE_PENDING_FILE, "Finalize pending marker").toString("utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Corrupt finalize pending marker at ${join(resolve(dataDir), FINALIZE_PENDING_FILE)}: ${err.message}`);
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed.defer_seal !== undefined && typeof parsed.defer_seal !== "boolean")
+  ) {
+    throw new Error(`Corrupt finalize pending marker at ${join(resolve(dataDir), FINALIZE_PENDING_FILE)}: invalid JSON shape`);
+  }
+  return parsed;
+}
+
+function needsFinalization(dataDir) {
+  try {
+    lstatSync(join(dataDir, FINALIZE_PENDING_FILE));
+    return true;
+  } catch (err) {
+    if (err.code !== "ENOENT") return true;
+  }
+  try {
+    const parsed = JSON.parse(readManifestRaw(dataDir));
+    return parsed?.phase !== "closed" && parsed?.phase !== "sealed";
+  } catch {
+    return true;
+  }
+}
+
+async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log }) {
+  mkdirSync(dataDir, { recursive: true });
+  let pending;
+  try {
+    pending = readFinalizePending(dataDir);
+    const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal);
+    const finalPhase = effectiveDeferSeal ? "closed" : "sealed";
+    writeFileAtomic(
+      join(dataDir, FINALIZE_PENDING_FILE),
+      JSON.stringify({ phase: finalPhase, defer_seal: effectiveDeferSeal, ts: new Date().toISOString() }) + "\n",
+    );
+    const m = effectiveDeferSeal
+      ? await materializeManifest({
+          dataDir,
+          workflow,
+          repoRoot,
+          skillsRoot,
+          outputPath,
+          phase: "closed",
+          deferSeal: true,
+          dispatchSink: false,
+        })
+      : await sealManifest({
+          dataDir,
+          workflow,
+          repoRoot,
+          skillsRoot,
+          outputPath,
+          allowDirtyWorktree: true,
+        });
+    if (!m.ok) {
+      if (m.sink && !m.sink.ok) {
+        return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
+      }
+      return finish(EXIT.GATE, rows, `provenance manifest seal failed (${m.error ?? "unknown"})`, note);
+    }
+    if (!effectiveDeferSeal && m.manifest?.deliverable?.git_tree_sha && !m.manifest?.deliverable?.head_commit_sha) {
+      log("[runner] working tree has uncommitted tracked changes; sealed working-tree deliverable (run provenance.mjs seal after commit to bind head_commit_sha)");
+    }
+  } catch (err) {
+    log(`[runner] provenance manifest failed: ${err.message}`);
+    return finish(EXIT.GATE, rows, `provenance manifest generation failed (${err.message})`, note);
+  }
+  rmSync(join(dataDir, FINALIZE_PENDING_FILE), { force: true });
+  rmSync(join(dataDir, ROUTING_FILE), { force: true });
+  return finish(EXIT.OK, rows, "workflow complete", note);
+}
+
+function readRecordedOutputPath(dataDir, cliCommon) {
+  const metaPath = join(dataDir, "run-meta.json");
+  try {
+    const st = lstatSync(metaPath);
+    if (!st.isSymbolicLink() && st.isFile()) {
+      const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+      if (typeof parsed?.output_path === "string" && parsed.output_path.length > 0) {
+        return parsed.output_path;
+      }
+    }
+  } catch {
+    /* ignore unreadable or absent run-meta.json */
+  }
+  if (cliCommon && existsSync(join(dataDir, "uwf-state.db"))) {
+    try {
+      const artifactPath = cliCommon(STATE, ["read"])?.data?.state?.artifact_path;
+      if (typeof artifactPath === "string" && artifactPath.length > 0) {
+        return artifactPath;
+      }
+    } catch {
+      /* ignore unreadable state db */
+    }
+  }
+  return null;
+}
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (canonical order; each workflow visits a subsequence of it).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
 const isDone = (status) => status === "passed" || status === "skipped";
@@ -171,7 +287,7 @@ function pickRunScript(skillsRoot, workflow) {
 function parseArgs(argv) {
   const flags = {};
   const positional = [];
-  const bool = new Set(["non-interactive", "dry-run", "force", "unlock"]);
+  const bool = new Set(["non-interactive", "dry-run", "force", "unlock", "defer-seal"]);
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (!t.startsWith("--")) { positional.push(t); continue; }
@@ -267,7 +383,7 @@ async function main(argv) {
 
   const dryRun = flags["dry-run"] === true;
   const nonInteractive = flags["non-interactive"] === true;
-  const outputPath = flags["output-path"] ?? "./tmp/workflow-artifacts";
+  const deferSeal = flags["defer-seal"] === true;
 
   // Dry run must write nothing: point every store at a throwaway dir.
   const scratch = dryRun ? mkdtempSync(join(tmpdir(), "uwf-dry-")) : null;
@@ -285,11 +401,18 @@ async function main(argv) {
 
   const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
-  const withOut = ["--output-path", outputPath, ...common];
   const cli = (script, args, extra = common) => runCli(script, [...args, ...extra], { cwd: repoRoot, env: cliEnv });
-  const note = (text) => cli(STATE, ["note", "--agent", AGENT_ID, "--note", text], withOut);
 
   try {
+    const outputPath =
+      flags["output-path"] ??
+      (!scratch && (command === "resume" || (Boolean(flags["from-stage"]) && flags.force !== true))
+        ? readRecordedOutputPath(dataDir, cli)
+        : null) ??
+      "./tmp/workflow-artifacts";
+    const withOut = ["--output-path", outputPath, ...common];
+    const note = (text) => cli(STATE, ["note", "--agent", AGENT_ID, "--note", text], withOut);
+
     const listed = cli(runScript, ["--list-stages"], withOut);
     if (!listed.ok || !Array.isArray(listed.data)) throw new UsageError(`Cannot list stages: ${listed.error}`);
     const stages = listed.data;
@@ -360,9 +483,16 @@ async function main(argv) {
       reconcilePhase(tracked);
       start = stages.findIndex((st) => !isDone(tracked.find((x) => x.stage === st.name)?.status));
       if (start < 0) {
+        if (needsFinalization(dataDir)) {
+          ensureRunMeta(dataDir, { workflow, outputPath, skillsRoot, repoRoot });
+          const n = note("runner resume: retrying pending provenance finalization");
+          if (!n.ok) log(`[runner] note not recorded: ${n.error}`);
+          return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows: tableRows(tracked), note, log });
+        }
         process.stdout.write(formatTable(tableRows(tracked)));
         return EXIT.OK;
       }
+      ensureRunMeta(dataDir, { workflow, outputPath, skillsRoot, repoRoot });
       const status = tracked.find((x) => x.stage === stages[start].name)?.status;
       const reason = status === "active" || status === "failed" ? status : "pending";
       // A failed stage restarts with retries reset (resume is an explicit human action).
@@ -379,17 +509,43 @@ async function main(argv) {
       const n = note(`runner resume: from=${stages[start].name} reason=${reason}`);
       if (!n.ok) log(`[runner] note not recorded: ${n.error}`);
     } else {
+      const priorTracked = readTracker();
       if (!flags["from-stage"] && flags.force !== true) {
-        const tracked = readTracker();
-        if (tracked.length && stages.every((st) => isDone(tracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
+        if (priorTracked.length && stages.every((st) => isDone(priorTracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
+          if (needsFinalization(dataDir)) {
+            const finalOutputPath = flags["output-path"] ?? readRecordedOutputPath(dataDir, cli) ?? outputPath;
+            ensureRunMeta(dataDir, { workflow, outputPath: finalOutputPath, skillsRoot, repoRoot });
+            log("[runner] all stages complete; retrying pending provenance finalization");
+            return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath: finalOutputPath, deferSeal, rows: tableRows(priorTracked), note, log });
+          }
           log("[runner] workflow already complete; nothing to do (use --force to start over)");
-          process.stdout.write(formatTable(tableRows(tracked)));
+          process.stdout.write(formatTable(tableRows(priorTracked)));
           return EXIT.OK;
         }
       }
       if (!flags["from-stage"]) {
+        let existingMetaWorkflow = null;
+        const existingMetaPath = join(dataDir, "run-meta.json");
+        if (existsSync(existingMetaPath)) {
+          try { existingMetaWorkflow = JSON.parse(readFileSync(existingMetaPath, "utf8"))?.workflow ?? null; } catch { /* ignore */ }
+        }
+        const hadPriorRun =
+          priorTracked.length > 0 ||
+          existsSync(join(dataDir, "uaw-manifest.json")) ||
+          existsSync(join(dataDir, "uwf-stages.db")) ||
+          existsSync(join(dataDir, "uwf-state.db")) ||
+          Boolean(existingMetaWorkflow && existingMetaWorkflow !== workflow);
+        const meta = ensureRunMeta(dataDir, {
+          workflow,
+          outputPath,
+          skillsRoot,
+          repoRoot,
+          forceNew: flags.force === true || hadPriorRun,
+        });
         rmSync(join(dataDir, ROUTING_FILE), { force: true });
-        for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init"]]]) {
+        rmSync(join(dataDir, FINALIZE_PENDING_FILE), { force: true });
+        rmSync(join(dataDir, "uaw-manifest.json"), { force: true });
+        for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init", "--run-id", meta.run_id]]]) {
           const r = cli(script, args, withOut);
           if (!r.ok) throw new UsageError(`Store init failed (${args[0]}): ${r.error}`);
         }
@@ -397,11 +553,12 @@ async function main(argv) {
         const qr = cli(QUESTIONS, ["reset"]);
         if (!qr.ok) log(`[runner] questions reset not applied: ${qr.error}`);
       } else {
+        ensureRunMeta(dataDir, { workflow, outputPath, skillsRoot, repoRoot });
         resetFrom(start);
         rollbackPhase(start);
       }
       mkdirSync(dataDir, { recursive: true });
-      writeFileSync(goalPath, goal + "\n");
+      writeFileAtomic(goalPath, goal + "\n");
       const noted = note(`runner start: workflow=${workflow} adapter=${adapterName} from=${stages[start].name}`);
       if (!noted.ok) log(`[runner] note not recorded: ${noted.error}`);
     }
@@ -426,7 +583,7 @@ async function main(argv) {
     }
     const rows = command === "resume" ? priorRows : [];
     return await stageLoop({ command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal,
-      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext,
+      repoRoot, skillsRoot, outputPath, dataDir, timeoutMs, nonInteractive, deferSeal, cli, note, withOut, maxCostUsd, resumeMaxContext,
       resetFrom, rollbackPhase, phaseFlags, resuming: command === "resume" });
   } finally {
     releaseLock();
@@ -440,7 +597,7 @@ async function main(argv) {
  */
 async function stageLoop(ctx) {
   const { command, resumeSessionId, stages, start, rows, workflow, runScript, adapter, adapterName, fixtureDir, flags, goal, repoRoot, skillsRoot,
-    outputPath, dataDir, timeoutMs, nonInteractive, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, phaseFlags, resuming } = ctx;
+    outputPath, dataDir, timeoutMs, nonInteractive, deferSeal, cli, note, withOut, maxCostUsd, resumeMaxContext, resetFrom, rollbackPhase, phaseFlags, resuming } = ctx;
   let first = true;
   let lastModelLine = null;
   if (maxCostUsd !== undefined) log(`[runner] ${COST_CAP_NOTE(maxCostUsd)}`);
@@ -454,14 +611,12 @@ async function stageLoop(ctx) {
   const routingPath = join(dataDir, ROUTING_FILE);
   const saveRouting = () => {
     mkdirSync(dataDir, { recursive: true });
-    writeFileSync(routingPath, JSON.stringify({ trips: Object.fromEntries(trips), findings: Object.fromEntries(findings) }, null, 2) + "\n");
+    writeFileAtomic(routingPath, JSON.stringify({ trips: Object.fromEntries(trips), findings: Object.fromEntries(findings) }, null, 2) + "\n");
   };
   if (resuming || flags["from-stage"]) {
-    try {
-      const saved = JSON.parse(readFileSync(routingPath, "utf8"));
-      for (const [k, v] of Object.entries(saved.trips ?? {})) trips.set(k, v);
-      for (const [k, v] of Object.entries(saved.findings ?? {})) findings.set(k, v);
-    } catch { /* nothing recorded */ }
+    const savedRouting = readRoutingState(dataDir);
+    for (const [k, v] of Object.entries(savedRouting.trips)) trips.set(k, v);
+    for (const [k, v] of Object.entries(savedRouting.findings)) findings.set(k, v);
   }
   // Stages skipped (this run or recorded earlier): inputs only they would produce are optional downstream.
   const recorded = cli(TRACKER, ["read", "--workflow", workflow], withOut);
@@ -624,22 +779,48 @@ async function stageLoop(ctx) {
       } else {
         const g = cli(runScript, ["--check-gate", st.name], withOut);
         if (g.ok) {
-          log(`${tag} gate: PASS`);
-          cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
-          row.result = "passed";
-          // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
-          const had = [...findings].filter(([, v]) => v.from === st.name);
-          if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
-          const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
-          if (adv) row.result += ` (${adv})`;
-          if (over) return capStop(`${st.name} passed`);
-          break;
+          const sc = cli(TRACKER, ["stage-complete", "--workflow", workflow, "--stage", st.name, ...sessionArgs(sessionId)], withOut);
+          if (sc.ok) {
+            log(`${tag} gate: PASS`);
+            row.result = "passed";
+            // The reviewer passing means its findings are addressed: stop feeding them to the re-run stages.
+            const had = [...findings].filter(([, v]) => v.from === st.name);
+            if (had.length) { for (const [k] of had) findings.delete(k); saveRouting(); }
+            const adv = st.advancesTo ? advancePhase(st.advancesTo, st.name, phaseFlags) : null;
+            if (adv) row.result += ` (${adv})`;
+            if (st.name === "snapshot") {
+              let snapErr = null;
+              try {
+                const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal: false });
+                if (!m.ok) snapErr = `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`;
+              } catch (err) {
+                log(`[runner] provenance manifest at snapshot failed: ${err.message}`);
+                snapErr = `provenance manifest generation failed (${err.message})`;
+              }
+              if (snapErr) {
+                resetFrom(i);
+                rollbackPhase(i);
+                if (sessionId && st.retryMode !== "fresh") {
+                  cli(TRACKER, ["stage-session", "--workflow", workflow, "--stage", st.name, "--session-id", sessionId], withOut);
+                }
+                row.result = "failed (provenance)";
+                return finish(EXIT.GATE, rows, `${tag}: ${snapErr}`, note);
+              }
+            }
+            if (over) return capStop(`${st.name} passed`);
+            break;
+          }
+          const scErr = sc.data?.error ?? sc.error ?? "stage-complete failed";
+          failures = [scErr];
+          prescriptions = [`Ensure all declared stage outputs exist as regular non-symlink files so stage-complete succeeds (${scErr}).`];
+          log(`${tag} stage-complete: FAIL — ${scErr}`);
+        } else {
+          failures = g.data?.failures ?? [g.error];
+          verdict = typeof g.data?.verdict === "string" ? g.data.verdict : null;
+          gateRan = true;
+          prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
+          log(`${tag} gate: FAIL — ${failures.join("; ")}`);
         }
-        failures = g.data?.failures ?? [g.error];
-        verdict = typeof g.data?.verdict === "string" ? g.data.verdict : null;
-        gateRan = true;
-        prescriptions = Array.isArray(g.data?.prescriptions) && g.data.prescriptions.length ? g.data.prescriptions : failures;
-        log(`${tag} gate: FAIL — ${failures.join("; ")}`);
       }
       log(`${tag}   attempt ${attempt}/${maxAttempts}; to fix: ${prescriptions[0]}`);
 
@@ -711,8 +892,7 @@ async function stageLoop(ctx) {
     const doneTrips = [...trips].filter(([k]) => k.startsWith(`${st.name}|`)).reduce((n, [, v]) => n + v, 0);
     if (doneTrips && row.result.startsWith("passed")) row.result += ` after ${doneTrips} round trip(s)`;
   }
-  rmSync(routingPath, { force: true });
-  return finish(EXIT.OK, rows, "workflow complete", note);
+  return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log });
 
   function advancePhase(target, stageName, phaseFlags) {
     const cur = cli(STATE, ["read"], withOut);

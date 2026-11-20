@@ -35,9 +35,10 @@
  */
 
 import Database from "better-sqlite3";
-import { readFileSync, existsSync, statSync, readdirSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
-import { resolve, join, dirname, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 import { resolveDataDir, resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
@@ -289,6 +290,7 @@ const [command, ...rest] = args;
 const flags = parseFlags(rest);
 
 const workflow   = flags["workflow"];
+if (flags["repo-root"] === true) usageError("--repo-root requires a path.");
 const dataDirFlag = resolveDataDir(flags, undefined);
 const outputPath = flags["output-path"] ?? (dataDirFlag ? join(dataDirFlag, "workflow-artifacts") : "./tmp/workflow-artifacts");
 const DB_PATH = resolveDbPath(flags, "uwf-stages.db", __dirname);
@@ -566,6 +568,260 @@ function cmdRead(db) {
   succeed({ procedure: "read", workflow, state: readState(db) });
 }
 
+function compareUtf16(a, b) {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const diff = a.charCodeAt(i) - b.charCodeAt(i);
+    if (diff !== 0) return diff;
+  }
+  return a.length - b.length;
+}
+
+function compileGlobSegment(pattern) {
+  const tokens = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      tokens.push({ type: "star" });
+    } else if (ch === "?") {
+      tokens.push({ type: "any" });
+    } else if (ch === "[") {
+      const close = pattern.indexOf("]", i + 1);
+      if (close === -1) {
+        tokens.push({ type: "lit", ch: "[" });
+      } else {
+        let body = pattern.slice(i + 1, close);
+        let negate = false;
+        if (body.startsWith("!") || body.startsWith("^")) {
+          negate = true;
+          body = body.slice(1);
+        }
+        const ranges = [];
+        for (let k = 0; k < body.length; k++) {
+          if (k + 2 < body.length && body[k + 1] === "-") {
+            const a = body.charCodeAt(k);
+            const b = body.charCodeAt(k + 2);
+            ranges.push([Math.min(a, b), Math.max(a, b)]);
+            k += 2;
+          } else {
+            const c = body.charCodeAt(k);
+            ranges.push([c, c]);
+          }
+        }
+        tokens.push({ type: "class", negate, ranges });
+        i = close;
+      }
+    } else {
+      tokens.push({ type: "lit", ch });
+    }
+  }
+  return tokens;
+}
+
+function matchGlobSegment(pattern, name) {
+  const tokens = compileGlobSegment(pattern);
+  const n = name.length;
+  let dp = new Uint8Array(n + 1);
+  dp[0] = 1;
+  for (const tok of tokens) {
+    const next = new Uint8Array(n + 1);
+    if (tok.type === "star") {
+      let matched = false;
+      for (let j = 0; j <= n; j++) {
+        if (dp[j]) matched = true;
+        if (matched) next[j] = 1;
+        if (j < n && name.charCodeAt(j) === 47) matched = false;
+      }
+    } else {
+      for (let j = 0; j < n; j++) {
+        if (!dp[j]) continue;
+        const code = name.charCodeAt(j);
+        if (code === 47) continue;
+        if (tok.type === "any") {
+          next[j + 1] = 1;
+        } else if (tok.type === "lit") {
+          if (name[j] === tok.ch) next[j + 1] = 1;
+        } else if (tok.type === "class") {
+          const inRange = tok.ranges.some(([lo, hi]) => code >= lo && code <= hi);
+          if (tok.negate ? !inRange : inRange) next[j + 1] = 1;
+        }
+      }
+    }
+    dp = next;
+  }
+  return dp[n] === 1;
+}
+
+function isOutsideRel(rel) {
+  return rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
+}
+
+function readRegularFileNoFollow(filePath, stageName) {
+  let fd;
+  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+  try {
+    fd = openSync(filePath, openFlags);
+  } catch (err) {
+    if (err.code === "ELOOP" || err.code === "EFTYPE") {
+      fail(`Stage "${stageName}": declared output "${filePath}" must not be a symlink.`);
+    }
+    fail(`Stage "${stageName}": failed to open declared output "${filePath}": ${err.message}`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      fail(`Stage "${stageName}": declared output "${filePath}" must be a regular file.`);
+    }
+    return readFileSync(fd);
+  } catch (err) {
+    fail(`Stage "${stageName}": failed to read declared output "${filePath}": ${err.message}`);
+  } finally {
+    try { closeSync(fd); } catch { /* ignore close errors */ }
+  }
+}
+
+function assertSafeOutputAncestors(targetPath, roots, stageName) {
+  const dirToCheck = dirname(targetPath);
+  const absOut = roots[0];
+  const sepPrefix = (r) => (r.endsWith(sep) ? r : r + sep);
+  if (absOut && (dirToCheck === absOut || dirToCheck.startsWith(sepPrefix(absOut)))) {
+    try {
+      const outSt = lstatSync(absOut);
+      if (outSt.isSymbolicLink() || !outSt.isDirectory()) {
+        fail(`Stage "${stageName}": declared output root "${absOut}" must be a regular directory.`);
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        fail(`Stage "${stageName}": cannot inspect declared output root "${absOut}": ${err.message}`);
+      }
+    }
+  }
+  const matched = roots
+    .filter((r) => dirToCheck === r || dirToCheck.startsWith(sepPrefix(r)))
+    .sort((a, b) => a.length - b.length);
+  const root = matched[0];
+  if (!root) return;
+  const rel = relative(root, dirToCheck);
+  if (!rel || isOutsideRel(rel)) return;
+  let cur = root;
+  for (const seg of rel.split(sep).filter(Boolean)) {
+    cur = join(cur, seg);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch (err) {
+      if (err.code === "ENOENT") break;
+      fail(`Stage "${stageName}": cannot inspect declared output ancestor "${cur}": ${err.message}`);
+    }
+    if (st.isSymbolicLink()) {
+      fail(`Stage "${stageName}": declared output ancestor "${cur}" must not be a symlink.`);
+    }
+    if (!st.isDirectory()) {
+      fail(`Stage "${stageName}": declared output ancestor "${cur}" is not a directory.`);
+    }
+  }
+}
+
+function captureStageOutputsJson(stageDef) {
+  const captureRoot = flags["repo-root"] ? resolve(String(flags["repo-root"])) : process.cwd();
+  const absOutRoot = resolve(captureRoot, outputPath);
+  const roots = [absOutRoot, captureRoot, ...(SKILLS_ROOT ? [resolve(SKILLS_ROOT)] : [])];
+  const resolveCaptureTemplate = (str) => {
+    if (typeof str !== "string") return str;
+    return str
+      .replace(/\{\{output_path\}\}/g, outputPath)
+      .replace(/\{\{cwd\}\}/g,         captureRoot)
+      .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? captureRoot);
+  };
+  const seen = new Map();
+  for (const tmpl of stageDef?.outputs ?? []) {
+    const resolved = resolveCaptureTemplate(tmpl);
+    const absPattern = isAbsolute(resolved) ? resolved : resolve(captureRoot, resolved);
+    assertSafeOutputAncestors(absPattern, roots, stageDef?.name);
+    let paths = [];
+    if (/[*?[\]]/.test(basename(absPattern))) {
+      const dir = dirname(absPattern);
+      const basePattern = basename(absPattern);
+      let dirSt;
+      try {
+        dirSt = lstatSync(dir);
+      } catch (err) {
+        if (err.code === "ENOENT") {
+          fail(`Stage "${stageDef?.name}": declared output pattern "${absPattern}" matched no files (directory "${dir}" does not exist).`);
+        }
+        fail(`Stage "${stageDef?.name}": cannot inspect declared output directory "${dir}": ${err.message}`);
+      }
+      if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) {
+        fail(`Stage "${stageDef?.name}": declared output directory "${dir}" must be a regular directory.`);
+      }
+      let entries;
+      try {
+        entries = readdirSync(dir);
+      } catch (err) {
+        fail(`Stage "${stageDef?.name}": cannot read declared output directory "${dir}": ${err.message}`);
+      }
+      for (const name of entries) {
+        if (!matchGlobSegment(basePattern, name)) continue;
+        const entryPath = join(dir, name);
+        let st;
+        try {
+          st = lstatSync(entryPath);
+        } catch (err) {
+          fail(`Stage "${stageDef?.name}": cannot inspect declared output "${entryPath}": ${err.message}`);
+        }
+        if (st.isSymbolicLink()) {
+          fail(`Stage "${stageDef?.name}": declared output "${entryPath}" must not be a symlink.`);
+        }
+        if (!st.isFile()) {
+          fail(`Stage "${stageDef?.name}": declared output "${entryPath}" must be a regular file.`);
+        }
+        paths.push(entryPath);
+      }
+      if (paths.length === 0) {
+        fail(`Stage "${stageDef?.name}": declared output pattern "${absPattern}" matched no files.`);
+      }
+    } else {
+      let st;
+      try {
+        st = lstatSync(absPattern);
+      } catch (err) {
+        if (err.code === "ENOENT") {
+          fail(`Stage "${stageDef?.name}": declared output missing on disk: "${absPattern}".`);
+        }
+        fail(`Stage "${stageDef?.name}": cannot inspect declared output "${absPattern}": ${err.message}`);
+      }
+      if (st.isSymbolicLink()) {
+        fail(`Stage "${stageDef?.name}": declared output "${absPattern}" must not be a symlink.`);
+      }
+      if (!st.isFile()) {
+        fail(`Stage "${stageDef?.name}": declared output "${absPattern}" must be a regular file.`);
+      }
+      paths = [absPattern];
+    }
+    for (const abs of paths) {
+      const buf = readRegularFileNoFollow(abs, stageDef?.name);
+      let rel = relative(captureRoot, abs);
+      if (!rel || isOutsideRel(rel)) {
+        try {
+          const realRel = relative(realpathSync(captureRoot), realpathSync(abs));
+          if (realRel && !isOutsideRel(realRel)) {
+            rel = realRel;
+          }
+        } catch (err) {
+          fail(`Stage "${stageDef?.name}": cannot resolve declared output "${abs}": ${err.message}`);
+        }
+      }
+      const normPath = (rel && !isOutsideRel(rel) ? rel : abs).split(sep).join("/");
+      seen.set(normPath, {
+        path: normPath,
+        sha256: createHash("sha256").update(buf).digest("hex"),
+        bytes: buf.length,
+      });
+    }
+  }
+  return JSON.stringify([...seen.values()].sort((a, b) => compareUtf16(a.path, b.path)));
+}
+
 function cmdStageUpdate(db, toStatus) {
   requireFlag("workflow", command);
   requireFlag("stage",    command);
@@ -575,11 +831,15 @@ function cmdStageUpdate(db, toStatus) {
   ensureRow(db, stageName);
   const row = db.prepare(`SELECT * FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, stageName);
   const now = new Date().toISOString();
+  const { stages } = loadStagesYaml(workflow);
+  const stageDef   = stages.find((s) => s.name === stageName);
 
   const updates = { status: toStatus };
   if (flags["session-id"]) updates.session_id = flags["session-id"];
   if (toStatus === "active")  updates.started_at   = now;
   if (toStatus === "passed" || toStatus === "skipped") updates.completed_at = now;
+  if (toStatus === "passed")  updates.outputs_json = captureStageOutputsJson(stageDef);
+  if (toStatus === "skipped") updates.outputs_json = "[]";
   if (note) updates.notes = note;
 
   const keys = Object.keys(updates);
@@ -589,8 +849,6 @@ function cmdStageUpdate(db, toStatus) {
   appendHistory(db, workflow, stageName, row.status, toStatus, note);
 
   // Build next-action hints for the orchestrator
-  const { stages } = loadStagesYaml(workflow);
-  const stageDef   = stages.find((s) => s.name === stageName);
   const agentId    = stageDef?.agent ?? "uwf-core-orchestrator";
   const STATE_MJS  = skillCliPath("uwf-state-manager/state.mjs");
   const Q_MJS      = skillCliPath("uwf-question-protocol/questions.mjs");
@@ -676,7 +934,7 @@ function cmdResetFrom(db) {
       ensureRow(db, name);
       const row = db.prepare(`SELECT status FROM stage_runs WHERE workflow = ? AND stage = ?`).get(workflow, name);
       db.prepare(
-        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL, session_id = NULL WHERE workflow = ? AND stage = ?`
+        `UPDATE stage_runs SET status = 'pending', retry_count = 0, started_at = NULL, completed_at = NULL, gate_result = NULL, notes = NULL, session_id = NULL, outputs_json = NULL WHERE workflow = ? AND stage = ?`
       ).run(workflow, name);
       appendHistory(db, workflow, name, row.status, "pending", note);
     }

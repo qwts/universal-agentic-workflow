@@ -130,7 +130,9 @@ export async function invokeStage(opts) {
       else if (!parsed) error = "claude output was not valid JSON";
       else if (parsed.is_error) error = `claude reported error: ${String(parsed.result).slice(0, 500)}`;
       const transcriptPath = writeTranscript(dataDir, {
-        adapter: name, args: args.filter((a) => a !== system), prompt, sessionId: sid,
+        adapter: name,
+        ...(typeof opts.stage === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(opts.stage.trim()) ? { stage: opts.stage.trim() } : {}),
+        args: args.filter((a) => a !== system), prompt, sessionId: sid,
         exitCode, stdout: out, stderr: err, error: error ?? null,
       });
       const res = { ok: !error, sessionId: sid, transcriptPath, stdout: text, exitCode, usage };
