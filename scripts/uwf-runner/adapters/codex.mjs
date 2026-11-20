@@ -136,7 +136,9 @@ export async function invokeStage(opts) {
       else if (eventError) error = `codex reported error: ${eventError.slice(0, 500)}`;
       else if (!text) error = "codex produced no final message";
       const transcriptPath = writeTranscript(dataDir, {
-        adapter: name, args, prompt, sessionId: sid, exitCode, stdout: out, stderr: err, error: error ?? null,
+        adapter: name,
+        ...(typeof opts.stage === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(opts.stage.trim()) ? { stage: opts.stage.trim() } : {}),
+        args, prompt, sessionId: sid, exitCode, stdout: out, stderr: err, error: error ?? null,
       });
       const res = { ok: !error, sessionId: sid, transcriptPath, stdout: text, exitCode, usage };
       if (error) res.error = error;

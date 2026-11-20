@@ -25,13 +25,16 @@ const CHARS_PER_TOKEN = 4;
 const k = (n) => (n / 1000).toFixed(1) + "K";
 const num = (v) => (Number.isFinite(v) ? v : 0);
 
+// Placed below top-level constants so top-of-file imports merge cleanly with sibling branches.
+import { inferTranscriptStage } from "./stage-match.mjs";
+
 /** Parse one transcript file into a row (null when it is not a claude-code JSON result). */
 export function transcriptRow(file, t) {
   let r;
   try { r = JSON.parse(t.stdout); } catch { return null; }
   const u = r?.usage;
   if (!u || !Number.isFinite(r.num_turns) || r.num_turns <= 0) return null;
-  const m = String(t.prompt ?? "").match(/^Run the (\S+) stage for the/m);
+  const stage = inferTranscriptStage(t) ?? "?";
   const input = num(u.input_tokens), read = num(u.cache_read_input_tokens), write = num(u.cache_creation_input_tokens);
   const models = Object.values(r.modelUsage ?? {});
   const thinking = u.output_tokens_details?.thinking_tokens ?? (models.length ? models.reduce((a, x) => a + num(x.thinkingTokens), 0) : undefined);
@@ -39,7 +42,7 @@ export function transcriptRow(file, t) {
   const lastCtx = last ? num(last.input_tokens) + num(last.cache_read_input_tokens) + num(last.cache_creation_input_tokens) : 0;
   const perTurn = (input + read + write) / r.num_turns;
   return {
-    file, stage: m ? m[1] : "?", turns: r.num_turns, perTurn, lastCtx, input, read, write,
+    file, stage, turns: r.num_turns, perTurn, lastCtx, input, read, write,
     output: num(u.output_tokens), thinking, cost: typeof r.total_cost_usd === "number" ? r.total_cost_usd : null,
     flags: [perTurn > AVG_LIMIT ? "!50K" : null, lastCtx > TURN_LIMIT || perTurn > TURN_LIMIT ? "!100K" : null, write > read && write > AVG_LIMIT ? "!MISS" : null].filter(Boolean),
   };

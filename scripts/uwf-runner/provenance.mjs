@@ -57,8 +57,9 @@ import {
 } from "./context-hub-sink.mjs";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import { listTranscripts, transcriptRow } from "./cost.mjs";
+import { inferTranscriptStage, matchPromptStage, normalizeStageName } from "./stage-match.mjs";
 
-export { canonicalizeJcs, compareUtf16, computeIdempotencyKey, scrubDeep, sha256Hex };
+export { canonicalizeJcs, compareUtf16, computeIdempotencyKey, inferTranscriptStage, matchPromptStage, normalizeStageName, scrubDeep, sha256Hex };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -1862,12 +1863,6 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
     let parsed;
     try { parsed = JSON.parse(raw.toString("utf8")); } catch { continue; }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-    const explicitStage =
-      typeof parsed.stage === "string" && parsed.stage.trim() && parsed.stage.trim() !== "?"
-        ? parsed.stage.trim()
-        : null;
-    const promptMatch = String(parsed.prompt ?? "").match(/^Run the (\S+) stage for the/m);
-    const promptStage = promptMatch && promptMatch[1] !== "?" ? promptMatch[1] : null;
     const row = transcriptRow(f, parsed);
     if (row) {
       costSummary.turns += row.turns ?? 0;
@@ -1877,7 +1872,7 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
       costSummary.output_tokens += row.output ?? 0;
       costSummary.cost_usd += row.cost ?? 0;
     }
-    const effectiveStage = (row?.stage && row.stage !== "?" ? row.stage : null) ?? explicitStage ?? promptStage;
+    const effectiveStage = inferTranscriptStage(parsed) ?? (row?.stage && row.stage !== "?" ? row.stage : null);
     if (effectiveStage) {
       perStage.set(effectiveStage, digest);
     }
