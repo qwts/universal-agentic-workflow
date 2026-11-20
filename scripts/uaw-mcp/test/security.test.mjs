@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SECRET_PATTERNS } from "../../hooks/secret-patterns.mjs";
+import { materializePrompt, validateWorkflowStageInputs } from "../../uwf-runner/prompt.mjs";
 import { execNodeAsync } from "../commands.mjs";
 import { claimDataDirLock, pidAlive } from "../ownership.mjs";
 import { assertAllowedPath, canonicalPathKey, listRegisteredRuns, lookupRunById, readRunMeta, registerRunIndex, writeRunMeta } from "../paths.mjs";
@@ -1573,6 +1574,200 @@ setTimeout(() => {}, 30000);
     });
     assert.equal(resumedTransferred.isError, false, resumedTransferred.structuredContent?.stderr ?? resumedTransferred.structuredContent?.error ?? "");
     assert.equal(resumedTransferred.structuredContent.exit_code, 0);
+
+    // Adapter state symlinks in data_dir (fake-attempts.json, fake-sessions.json, grokbot/) must fail closed
+    for (const adapterSymRel of ["fake-attempts.json", "fake-sessions.json", join("grokbot", "requests", "0001.json")]) {
+      const symTargetPath = join(overlapData, adapterSymRel);
+      const hadOrig = existsSync(symTargetPath);
+      const origBytes = hadOrig ? readFileSync(symTargetPath) : null;
+      mkdirSync(dirname(symTargetPath), { recursive: true });
+      rmSync(symTargetPath, { force: true });
+      symlinkSync("/etc/hosts", symTargetPath);
+      try {
+        const symRun = await regHandler.callTool("uaw_run", {
+          workflow: "mcp_fixture",
+          goal: `Reject symlinked adapter state ${adapterSymRel}`,
+          adapter: "fake",
+          fake_fixture_dir: parentFx,
+          data_dir: overlapData,
+          output_path: parentOut,
+          repo_root: regWs.repoRoot,
+          skills_root: regWs.skillsRoot,
+          force: true,
+        });
+        assert.equal(symRun.isError, true, `uaw_run must reject ${adapterSymRel} symlink`);
+        assert.equal(symRun.structuredContent.exit_code, 2);
+        assert.match(symRun.structuredContent.error, /symlink/i);
+
+        const symResume = await regHandler.callTool("uaw_resume", {
+          data_dir: overlapData,
+          adapter: "fake",
+          fake_fixture_dir: parentFx,
+          repo_root: regWs.repoRoot,
+          skills_root: regWs.skillsRoot,
+        });
+        assert.equal(symResume.isError, true, `uaw_resume must reject ${adapterSymRel} symlink`);
+        assert.equal(symResume.structuredContent.exit_code, 2);
+        assert.match(symResume.structuredContent.error, /symlink/i);
+      } finally {
+        rmSync(symTargetPath, { force: true });
+        if (hadOrig) {
+          writeFileSync(symTargetPath, origBytes);
+        } else if (adapterSymRel.startsWith("grokbot")) {
+          rmSync(join(overlapData, "grokbot"), { recursive: true, force: true });
+        }
+      }
+    }
+
+    // Stage input symlinks (output_path literal & repo_root glob) must fail closed before prompt materialization
+    const stageOut = join(regWs.repoRoot, "stage-input-sym-out");
+    const stageFx = regWs.writeFixturesForOutput(stageOut);
+    mkdirSync(stageOut, { recursive: true });
+    symlinkSync("/etc/hosts", join(stageOut, "plan.md"));
+    try {
+      const symStageInputRun = await regHandler.callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Reject symlinked stage input plan.md",
+        adapter: "fake",
+        fake_fixture_dir: stageFx,
+        data_dir: join(regWs.repoRoot, "stage-input-sym-data"),
+        output_path: stageOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      });
+      assert.equal(symStageInputRun.isError, true);
+      assert.equal(symStageInputRun.structuredContent.exit_code, 2);
+      assert.match(symStageInputRun.structuredContent.error, /symlink/i);
+    } finally {
+      rmSync(join(stageOut, "plan.md"), { force: true });
+    }
+
+    const adrDir = join(regWs.repoRoot, "docs", "adr");
+    mkdirSync(adrDir, { recursive: true });
+    const adrSym = join(adrDir, "ADR-0001.md");
+    symlinkSync("/etc/hosts", adrSym);
+    try {
+      const symGlobInputRun = await regHandler.callTool("uaw_run", {
+        workflow: "sw_dev",
+        goal: "Reject symlinked ADR glob input",
+        adapter: "fake",
+        fake_fixture_dir: stageFx,
+        data_dir: join(regWs.repoRoot, "stage-glob-sym-data"),
+        output_path: join(regWs.repoRoot, "stage-glob-sym-out"),
+        repo_root: regWs.repoRoot,
+      });
+      assert.equal(symGlobInputRun.isError, true);
+      assert.equal(symGlobInputRun.structuredContent.exit_code, 2);
+      assert.match(symGlobInputRun.structuredContent.error, /symlink/i);
+    } finally {
+      rmSync(adrSym, { force: true });
+    }
+
+    // node_modules/.bin symlinks must NOT falsely fail stage-input validation, and {a,b} brace globs must enforce symlink checks
+    const nmBinDir = join(regWs.repoRoot, "node_modules", ".bin");
+    const nmPkgDir = join(regWs.repoRoot, "node_modules", "sample-tool");
+    mkdirSync(nmBinDir, { recursive: true });
+    mkdirSync(nmPkgDir, { recursive: true });
+    writeFileSync(join(nmPkgDir, "cli.js"), "#!/usr/bin/env node\n");
+    symlinkSync("../sample-tool/cli.js", join(nmBinDir, "tool"));
+
+    const braceSkills = join(regWs.root, "brace-skills");
+    const braceSkillDir = join(braceSkills, ".github", "skills", "uwf-brace");
+    mkdirSync(join(braceSkillDir), { recursive: true });
+    mkdirSync(join(braceSkills, ".github", "agents"), { recursive: true });
+    writeFileSync(
+      join(braceSkills, ".github", "agents", "brace.agent.md"),
+      "---\nname: brace\ndescription: test agent\ntools: []\n---\nWork in {{cwd}} writing to {{output_path}}.\n",
+    );
+    writeFileSync(
+      join(braceSkillDir, "stages.yaml"),
+      [
+        "stages:",
+        "  - name: check",
+        "    agent: brace",
+        "    inputs:",
+        '      - "**/*.md"',
+        '      - "docs/{adr,rfcs}/*.md"',
+        "    outputs: []",
+        "",
+      ].join("\n"),
+    );
+    const rfcsDir = join(regWs.repoRoot, "docs", "rfcs");
+    mkdirSync(rfcsDir, { recursive: true });
+    writeFileSync(join(rfcsDir, "RFC-0001.md"), "# RFC 1\nValid input\n");
+
+    // Clean regular brace-glob + recursive-glob inputs alongside node_modules/.bin symlink succeed
+    validateWorkflowStageInputs({
+      workflow: "brace",
+      repoRoot: regWs.repoRoot,
+      skillsRoot: braceSkills,
+      outputPath: stageOut,
+    });
+    const bracePrompt = await materializePrompt({
+      workflow: "brace",
+      stage: "check",
+      repoRoot: regWs.repoRoot,
+      skillsRoot: braceSkills,
+      outputPath: stageOut,
+    });
+    assert.deepEqual(bracePrompt.inputsMissing, []);
+    assert.match(bracePrompt.prompt, /Valid input/);
+
+    // Symlinked file matched via {a,b} brace glob must fail closed
+    const braceFileSym = join(rfcsDir, "sym.md");
+    symlinkSync("/etc/hosts", braceFileSym);
+    try {
+      assert.throws(
+        () => validateWorkflowStageInputs({ workflow: "brace", repoRoot: regWs.repoRoot, skillsRoot: braceSkills, outputPath: stageOut }),
+        /symlink/i,
+      );
+      await assert.rejects(
+        () => materializePrompt({ workflow: "brace", stage: "check", repoRoot: regWs.repoRoot, skillsRoot: braceSkills, outputPath: stageOut }),
+        /symlink/i,
+      );
+    } finally {
+      rmSync(braceFileSym, { force: true });
+    }
+
+    // Symlinked directory targeted via {a,b} brace glob must fail closed even when empty
+    const emptyOutside = mkdtempSync(join(regWs.root, "outside-empty-"));
+    rmSync(adrDir, { recursive: true, force: true });
+    symlinkSync(emptyOutside, adrDir);
+    try {
+      assert.throws(
+        () => validateWorkflowStageInputs({ workflow: "brace", repoRoot: regWs.repoRoot, skillsRoot: braceSkills, outputPath: stageOut }),
+        /symlink/i,
+      );
+      await assert.rejects(
+        () => materializePrompt({ workflow: "brace", stage: "check", repoRoot: regWs.repoRoot, skillsRoot: braceSkills, outputPath: stageOut }),
+        /symlink/i,
+      );
+    } finally {
+      rmSync(adrDir, { force: true });
+    }
+
+    // Repo root path containing glob metacharacters (e.g. "repo[1]") must not break glob input matching
+    const bracketRepo = join(regWs.root, "repo[1]");
+    const bracketRfcs = join(bracketRepo, "docs", "rfcs");
+    const bracketOut = join(bracketRepo, "stage-out");
+    mkdirSync(bracketRfcs, { recursive: true });
+    mkdirSync(bracketOut, { recursive: true });
+    writeFileSync(join(bracketRfcs, "RFC-0001.md"), "# Bracket RFC\nWorks inside [1] path\n");
+    validateWorkflowStageInputs({
+      workflow: "brace",
+      repoRoot: bracketRepo,
+      skillsRoot: braceSkills,
+      outputPath: bracketOut,
+    });
+    const bracketPrompt = await materializePrompt({
+      workflow: "brace",
+      stage: "check",
+      repoRoot: bracketRepo,
+      skillsRoot: braceSkills,
+      outputPath: bracketOut,
+    });
+    assert.deepEqual(bracketPrompt.inputsMissing, []);
+    assert.match(bracketPrompt.prompt, /Works inside \[1\] path/);
   } finally {
     rmSync(regWs.root, { recursive: true, force: true });
   }

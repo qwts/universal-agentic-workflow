@@ -287,14 +287,19 @@ const RUNTIME_CONTROL_FILES = new Set([
   "runner-routing.json",
   "runner-finalize-pending.json",
   "uaw-manifest.json",
+  "fake-attempts.json",
+  "fake-sessions.json",
+  "uwf-state.json",
+  "runner.log",
 ]);
 
 /**
- * Verify that `dataDir` (if present) is a non-symlink directory whose top-level runtime
- * entries (`*.db`, `-wal`, `-shm`, `-journal`, control files, and `transcripts/*`) are
- * regular non-symlink entries contained inside `dataDir`.
+ * Verify that `dataDir` (if present) is a non-symlink directory whose runtime
+ * entries (SQLite stores/sidecars, control/log files, adapter state in
+ * `fake-attempts.json`, `fake-sessions.json`, `grokbot/`, `monolith/`, `codex/`,
+ * plus `transcripts/*`) are regular non-symlink entries contained inside `dataDir`.
  *
- * Does not recurse into `workflow-artifacts/` (agents may leave build/package symlinks there).
+ * Does not recurse into `workflow-artifacts/` or unrelated scratch files.
  * Note: pre-spawn checks are defense-in-depth alongside child-CLI confinement.
  */
 export function assertSafeDataDir(dataDir, { strictTranscripts = true } = {}) {
@@ -316,7 +321,11 @@ export function assertSafeDataDir(dataDir, { strictTranscripts = true } = {}) {
     const isDbEntry = /\.db(?:-wal|-shm|-journal)?$/i.test(entry.name);
     const isCtrlEntry = RUNTIME_CONTROL_FILES.has(entry.name);
     const isTranscripts = entry.name === "transcripts";
-    if (!isDbEntry && !isCtrlEntry && !isTranscripts) continue;
+    const isAdapterDir = entry.name === "grokbot" || entry.name === "monolith" || entry.name === "codex";
+    const isArtifactDir = entry.name === "workflow-artifacts";
+    if (!isDbEntry && !isCtrlEntry && !isTranscripts && !isAdapterDir && !isArtifactDir) {
+      continue;
+    }
 
     const full = join(absDir, entry.name);
     let lst;
@@ -329,13 +338,19 @@ export function assertSafeDataDir(dataDir, { strictTranscripts = true } = {}) {
     if (lst.isSymbolicLink()) {
       throw new UsageError(`Symlinks are disallowed in data_dir: "${full}"`);
     }
+    const realFull = realpathSync(full);
+    if (!insideRoot(realFull)) {
+      throw new UsageError(`data_dir entry escapes "${absDir}": "${full}"`);
+    }
+    if (isArtifactDir) {
+      if (!lst.isDirectory()) {
+        throw new UsageError(`data_dir/workflow-artifacts must be a directory: "${full}"`);
+      }
+      continue;
+    }
     if (isTranscripts) {
       if (!lst.isDirectory()) {
         throw new UsageError(`data_dir/transcripts must be a directory: "${full}"`);
-      }
-      const realFull = realpathSync(full);
-      if (!insideRoot(realFull)) {
-        throw new UsageError(`data_dir entry escapes "${absDir}": "${full}"`);
       }
       if (strictTranscripts) {
         const insideTranscripts = (p) => (realFull.endsWith(sep) ? p.startsWith(realFull) : p.startsWith(realFull + sep));
@@ -359,12 +374,15 @@ export function assertSafeDataDir(dataDir, { strictTranscripts = true } = {}) {
       }
       continue;
     }
+    if (isAdapterDir) {
+      if (!lst.isDirectory()) {
+        throw new UsageError(`data_dir/${entry.name} must be a directory: "${full}"`);
+      }
+      assertSafeRegularTree(full, `data_dir/${entry.name}`, { rootReal: realRoot });
+      continue;
+    }
     if (!lst.isFile()) {
       throw new UsageError(`data_dir runtime entry "${entry.name}" must be a regular file: "${full}"`);
-    }
-    const realFull = realpathSync(full);
-    if (!insideRoot(realFull)) {
-      throw new UsageError(`data_dir entry escapes "${absDir}": "${full}"`);
     }
   }
 }

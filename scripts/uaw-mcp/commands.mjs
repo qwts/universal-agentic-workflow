@@ -21,6 +21,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import { costReport, transcriptRow } from "../uwf-runner/cost.mjs";
+import { PromptError, validateWorkflowStageInputs } from "../uwf-runner/prompt.mjs";
 import { assertNoActiveRunLock, claimDataDirLock, claimOutputPath } from "./ownership.mjs";
 import {
   assertAllowedPath,
@@ -572,6 +573,15 @@ function assertBoundedTimeoutMs(value, label = "timeout_ms") {
   return String(n);
 }
 
+function assertSafeStageInputsForRun({ workflow, repoRoot, skillsRoot, outputPath, dataDir }) {
+  try {
+    validateWorkflowStageInputs({ workflow, repoRoot, skillsRoot, outputPath, dataDir });
+  } catch (err) {
+    if (err instanceof UsageError) throw err;
+    throw new UsageError(err?.message ?? String(err));
+  }
+}
+
 function resolveOptionalPath(value, allowedRoots, label) {
   if (!value) return undefined;
   return assertAllowedPath(value, allowedRoots, label);
@@ -689,6 +699,7 @@ export async function cmdRun(params = {}, ctx = {}) {
     const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
+    assertSafeStageInputsForRun({ workflow, repoRoot, skillsRoot, outputPath, dataDir });
     const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
     if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
     const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
@@ -849,6 +860,7 @@ export async function cmdRun(params = {}, ctx = {}) {
       assertSafeSkillDbs(repoRoot, "repo_root");
       if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
       if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
+      assertSafeStageInputsForRun({ workflow, repoRoot, skillsRoot, outputPath, dataDir });
       res = await execNodeAsync(RUNNER_CLI, args, {
         cwd: repoRoot,
         env,
@@ -1049,6 +1061,7 @@ export async function cmdResume(params = {}, ctx = {}) {
       assertSafeSkillDbs(repoRoot, "repo_root");
       if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
       if (fakeFixtureDir) assertSafeRegularTree(fakeFixtureDir, "fake_fixture_dir");
+      assertSafeStageInputsForRun({ workflow, repoRoot, skillsRoot, outputPath, dataDir });
 
       res = await execNodeAsync(RUNNER_CLI, args, {
         cwd: repoRoot,
