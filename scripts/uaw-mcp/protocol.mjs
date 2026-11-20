@@ -10,6 +10,7 @@
  *   - 11 read-only CQRS resource URI templates (`uaw://<run>/...`)
  */
 
+import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import {
   cmdCost,
   cmdGates,
@@ -18,6 +19,7 @@ import {
   cmdRun,
   cmdStageTransition,
   EXIT,
+  EXIT_STATUS,
 } from "./commands.mjs";
 import {
   listRegisteredRuns,
@@ -356,24 +358,27 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
     stateDir: resolveUawStateDir(stateDir),
   };
 
+  const isUnexpectedExit = (res) =>
+    res.exit_code === EXIT.INTERNAL || !Object.hasOwn(EXIT_STATUS, res.exit_code);
+
   async function callTool(name, args = {}) {
     try {
       switch (name) {
         case "uaw_run": {
           const res = await cmdRun(args, ctx);
-          return toolResponse(res, { isError: false });
+          return toolResponse(res, { isError: isUnexpectedExit(res) });
         }
         case "uaw_resume": {
           const res = await cmdResume(args, ctx);
-          return toolResponse(res, { isError: false });
+          return toolResponse(res, { isError: isUnexpectedExit(res) });
         }
         case "uaw_gates": {
           const res = await cmdGates(args, ctx);
-          return toolResponse(res, { isError: false });
+          return toolResponse(res, { isError: isUnexpectedExit(res) });
         }
         case "uaw_cost": {
           const res = await cmdCost(args, ctx);
-          return toolResponse(res, { isError: false });
+          return toolResponse(res, { isError: isUnexpectedExit(res) });
         }
         case "uaw_stage_transition": {
           const res = await cmdStageTransition(args, ctx);
@@ -381,7 +386,7 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
         }
         case "uaw_question_resolve": {
           const res = await cmdQuestionResolve(args, ctx);
-          return toolResponse(res, { isError: false });
+          return toolResponse(res, { isError: isUnexpectedExit(res) });
         }
         case "uaw_read_state": {
           const { dataDir } = resolveRunTarget({ ...args, ...ctx, requireExisting: true });
@@ -432,13 +437,26 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
           );
       }
     } catch (err) {
-      const exitCode = err instanceof UsageError ? err.exitCode : EXIT.USAGE;
+      if (err instanceof UsageError) {
+        return toolResponse(
+          {
+            ok: false,
+            exit_code: err.exitCode,
+            status: "usage_error",
+            error: redactSecrets(err.message ?? String(err)).text,
+          },
+          { isError: true },
+        );
+      }
+      process.stderr.write(
+        `[uaw-mcp] internal error in tool ${name}: ${redactSecrets(err?.stack ?? String(err)).text}\n`,
+      );
       return toolResponse(
         {
           ok: false,
-          exit_code: exitCode,
-          status: "usage_error",
-          error: err.message ?? String(err),
+          exit_code: EXIT.INTERNAL,
+          status: "internal_error",
+          error: "Internal server error",
         },
         { isError: true },
       );
@@ -505,7 +523,7 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
   }
 
   function listResources() {
-    const runs = listRegisteredRuns(ctx.stateDir);
+    const runs = listRegisteredRuns(ctx.stateDir, { allowedRoots: ctx.allowedRoots });
     const resources = [];
     for (const r of runs) {
       const enc = encodeURIComponent(r.run_id);
@@ -608,14 +626,26 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
       return { jsonrpc: "2.0", id, result };
     } catch (err) {
       if (isNotification) return null;
-      const code = err instanceof UsageError ? -32602 : -32603;
+      if (err instanceof UsageError) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32602,
+            message: redactSecrets(err.message ?? String(err)).text,
+            data: { exit_code: err.exitCode },
+          },
+        };
+      }
+      process.stderr.write(
+        `[uaw-mcp] internal RPC error (${method}): ${redactSecrets(err?.stack ?? String(err)).text}\n`,
+      );
       return {
         jsonrpc: "2.0",
         id,
         error: {
-          code,
-          message: err.message ?? String(err),
-          data: err instanceof UsageError ? { exit_code: err.exitCode } : undefined,
+          code: -32603,
+          message: "Internal server error",
         },
       };
     }

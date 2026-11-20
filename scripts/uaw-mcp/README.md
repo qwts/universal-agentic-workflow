@@ -18,7 +18,7 @@ Standalone Model Context Protocol server implementing [ADR-0008](../../docs/adr/
 
 ## Command Tools
 
-All command tools preserve `scripts/uwf-runner/runner.mjs` exit codes (`0` OK, `1` GATE, `2` USAGE, `3` QUESTIONS, `4` COST):
+All command tools preserve `scripts/uwf-runner/runner.mjs` exit codes (`0` OK, `1` GATE, `2` USAGE, `3` QUESTIONS, `4` COST), and return `70` (`INTERNAL`) on child timeouts, output-cap aborts, or unexpected signal termination (rolling back newly created run metadata when failure occurs prior to database initialization):
 
 - `uaw_run`: Runs a workflow via `runner.mjs run`, persisting durable `run_id` and resolved `output_path` (defaulting to `<data-dir>/workflow-artifacts`) in `<data-dir>/run-meta.json` and enforcing out-of-tree ownership in `<uaw-state-dir>/output-owners/<sha256(realpath(output_path))>.{json,lock}`.
 - `uaw_resume`: Reloads persisted `run_id` and `output_path` and invokes `runner.mjs resume`.
@@ -29,7 +29,7 @@ All command tools preserve `scripts/uwf-runner/runner.mjs` exit codes (`0` OK, `
 
 ## Read-Only CQRS Resources & Query Tools
 
-All eight SQLite stores are opened strictly read-only (`readonly: true`, `PRAGMA query_only = ON`), and free-text notes/transcripts are scrubbed through `redactSecrets()` in `scripts/hooks/secret-patterns.mjs`:
+All eight SQLite stores (`uwf-state.db`, `uwf-stages.db`, `uwf-requirements.db`, `uwf-adrs.db`, `uwf-discoveries.db`, `uwf-issues.db`, `uwf-reviews.db`, and `uwf-questions.db`) are opened strictly read-only (`readonly: true`, `PRAGMA query_only = ON`), and free-text notes/transcripts are scrubbed through `redactSecrets()` in `scripts/hooks/secret-patterns.mjs`:
 
 | Resource URI | Query Tool | Backing Store |
 | --- | --- | --- |

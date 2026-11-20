@@ -1,21 +1,22 @@
 /**
- * store.mjs — Strictly read-only CQRS queries across all eight UAW SQLite stores,
+ * store.mjs — Strictly read-only CQRS queries across UAW SQLite stores,
  * runner-routing.json, and secret-scrubbed transcripts.
  *
  * Invariants (ADR-0008):
  *   - Opens every SQLite database with `{ readonly: true, fileMustExist: true }`
  *     and executes `PRAGMA query_only = ON` immediately.
- *   - Never creates directories, never creates `.db` files, never mutates WAL state.
+ *   - Never creates directories or `.db` files and never issues SQLite writes
+ *     (SQLite's WAL read path may still map transient `-shm` memory on active DBs).
  *   - Scrubs every free-text field and transcript payload through `redactSecrets()`
  *     in `scripts/hooks/secret-patterns.mjs` before returning.
  */
 
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
-import { assertRegularFileInDir, readRunMeta, UsageError } from "./paths.mjs";
+import { assertRegularFileInDir, readRegularFileBounded, readRunMeta, UsageError } from "./paths.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
@@ -96,9 +97,18 @@ function withReadOnlyDb(dbPath, fn) {
   if (!realDb) return null;
   assertRegularFileInDir(absDir, `${base}-wal`, `${base}-wal`);
   assertRegularFileInDir(absDir, `${base}-shm`, `${base}-shm`);
+  assertRegularFileInDir(absDir, `${base}-journal`, `${base}-journal`);
+  const inoBefore = statSync(realDb).ino;
   const Database = loadDatabaseCtor();
   const db = new Database(realDb, { readonly: true, fileMustExist: true });
   try {
+    const realAfter = assertRegularFileInDir(absDir, base, base);
+    if (!realAfter || statSync(realAfter).ino !== inoBefore) {
+      throw new UsageError(`${base} changed concurrently while opening read-only`);
+    }
+    assertRegularFileInDir(absDir, `${base}-wal`, `${base}-wal`);
+    assertRegularFileInDir(absDir, `${base}-shm`, `${base}-shm`);
+    assertRegularFileInDir(absDir, `${base}-journal`, `${base}-journal`);
     db.pragma("query_only = ON");
     return fn(db);
   } finally {
@@ -120,6 +130,13 @@ function safeJsonParse(raw) {
   } catch {
     return raw;
   }
+}
+
+function assertOptionalFilter(val, label) {
+  if (val !== undefined && val !== null && typeof val !== "string" && typeof val !== "number") {
+    throw new UsageError(`${label} filter must be a string or number`);
+  }
+  return val;
 }
 
 /**
@@ -169,6 +186,7 @@ export function readState(dataDir) {
  * Read `uwf-stages.db` (`stage_runs` + `stage_history`) + `runner-routing.json`.
  */
 export function readStages(dataDir, { workflow } = {}) {
+  assertOptionalFilter(workflow, "workflow");
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const wf = workflow ?? meta?.workflow ?? null;
@@ -198,10 +216,13 @@ export function readStages(dataDir, { workflow } = {}) {
   });
 
   let routing = { trips: {}, findings: {} };
-  const realRouting = assertRegularFileInDir(absDir, "runner-routing.json", "runner-routing.json");
-  if (realRouting) {
+  const rawRouting = readRegularFileBounded(absDir, "runner-routing.json", {
+    maxBytes: 4 * 1024 * 1024,
+    label: "runner-routing.json",
+  });
+  if (rawRouting !== null) {
     try {
-      const parsed = JSON.parse(readFileSync(realRouting, "utf8"));
+      const parsed = JSON.parse(rawRouting);
       routing = {
         trips: parsed?.trips ?? {},
         findings: parsed?.findings ?? {},
@@ -257,6 +278,10 @@ export function readGate(dataDir, stageName, { workflow } = {}) {
  * Read `uwf-requirements.db` (`requirements`).
  */
 export function readRequirements(dataDir, { role, type, status, priority } = {}) {
+  assertOptionalFilter(role, "role");
+  assertOptionalFilter(type, "type");
+  assertOptionalFilter(status, "status");
+  assertOptionalFilter(priority, "priority");
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dbPath = join(absDir, "uwf-requirements.db");
@@ -284,6 +309,8 @@ export function readRequirements(dataDir, { role, type, status, priority } = {})
  * Read `uwf-adrs.db` (`adrs`).
  */
 export function readAdrs(dataDir, { status, impact } = {}) {
+  assertOptionalFilter(status, "status");
+  assertOptionalFilter(impact, "impact");
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dbPath = join(absDir, "uwf-adrs.db");
@@ -309,6 +336,13 @@ export function readAdrs(dataDir, { status, impact } = {}) {
  * Read `uwf-discoveries.db` (`discoveries`).
  */
 export function readDiscoveries(dataDir, { role, category, status, impact, gaps_only } = {}) {
+  assertOptionalFilter(role, "role");
+  assertOptionalFilter(category, "category");
+  assertOptionalFilter(status, "status");
+  assertOptionalFilter(impact, "impact");
+  if (gaps_only !== undefined && typeof gaps_only !== "boolean") {
+    throw new UsageError("gaps_only filter must be a boolean");
+  }
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dbPath = join(absDir, "uwf-discoveries.db");
@@ -340,6 +374,9 @@ export function readDiscoveries(dataDir, { role, category, status, impact, gaps_
  * Read `uwf-issues.db` (`issues`).
  */
 export function readIssues(dataDir, { status, milestone, sprint } = {}) {
+  assertOptionalFilter(status, "status");
+  assertOptionalFilter(milestone, "milestone");
+  assertOptionalFilter(sprint, "sprint");
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dbPath = join(absDir, "uwf-issues.db");
@@ -366,6 +403,11 @@ export function readIssues(dataDir, { status, milestone, sprint } = {}) {
  * Read `uwf-reviews.db` (`reviews` + `findings`).
  */
 export function readReviews(dataDir, { role, stage, verdict, severity, status } = {}) {
+  assertOptionalFilter(role, "role");
+  assertOptionalFilter(stage, "stage");
+  assertOptionalFilter(verdict, "verdict");
+  assertOptionalFilter(severity, "severity");
+  assertOptionalFilter(status, "status");
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dbPath = join(absDir, "uwf-reviews.db");
@@ -415,6 +457,8 @@ export function readReviews(dataDir, { role, stage, verdict, severity, status } 
  * Read `uwf-questions.db` (`questions`).
  */
 export function readQuestions(dataDir, { stage, status } = {}) {
+  assertOptionalFilter(stage, "stage");
+  assertOptionalFilter(status, "status");
   const absDir = resolve(dataDir);
   const meta = readRunMeta(absDir);
   const dbPath = join(absDir, "uwf-questions.db");
@@ -439,6 +483,9 @@ export function readQuestions(dataDir, { stage, status } = {}) {
   }).value;
 }
 
+const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
+const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
 /**
  * List transcripts under `<data-dir>/transcripts/*.json`.
  */
@@ -462,22 +509,29 @@ export function listTranscriptRecords(dataDir) {
   const transcripts = [];
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
     const full = join(dir, file);
-    let lst;
+    let fd;
     try {
-      lst = lstatSync(full);
+      const lst = lstatSync(full);
+      if (lst.isSymbolicLink() || !lst.isFile()) continue;
+      const realFile = realpathSync(full);
+      if (!realFile.startsWith(realDir + "/") && !realFile.startsWith(realDir + "\\")) continue;
+      fd = openSync(full, OPEN_NOFOLLOW_FLAGS);
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > MAX_TRANSCRIPT_BYTES) continue;
+      const id = file.slice(0, -5);
+      transcripts.push({
+        id,
+        file,
+        size_bytes: st.size,
+        mtime: st.mtime.toISOString(),
+      });
     } catch {
       continue;
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
     }
-    if (lst.isSymbolicLink() || !lst.isFile()) continue;
-    const realFile = realpathSync(full);
-    if (!realFile.startsWith(realDir + "/") && !realFile.startsWith(realDir + "\\")) continue;
-    const id = file.slice(0, -5);
-    transcripts.push({
-      id,
-      file,
-      size_bytes: lst.size,
-      mtime: lst.mtime.toISOString(),
-    });
   }
   return {
     run_id: meta?.run_id ?? null,
@@ -492,7 +546,7 @@ export function listTranscriptRecords(dataDir) {
  * through `redactSecrets()`. Rejects path traversal and symlinks with UsageError (exit 2).
  */
 export function readTranscriptRecord(dataDir, transcriptId) {
-  if (!transcriptId || typeof transcriptId !== "string") {
+  if (!transcriptId || typeof transcriptId !== "string" || transcriptId.includes("\0")) {
     throw new UsageError("transcript_id is required");
   }
   const cleanId = transcriptId.endsWith(".json") ? transcriptId.slice(0, -5) : transcriptId;
@@ -508,25 +562,13 @@ export function readTranscriptRecord(dataDir, transcriptId) {
   if (lstatSync(dir).isSymbolicLink()) {
     throw new UsageError(`Transcripts directory must not be a symlink: "${dir}"`);
   }
-  const full = resolve(dir, `${cleanId}.json`);
-  if (!full.startsWith(dir + "/") && !full.startsWith(dir + "\\")) {
-    throw new UsageError(`Transcript path escapes transcripts directory: "${transcriptId}"`);
-  }
-  let lst;
-  try {
-    lst = lstatSync(full);
-  } catch {
+  const rawText = readRegularFileBounded(dir, `${cleanId}.json`, {
+    maxBytes: MAX_TRANSCRIPT_BYTES,
+    label: `Transcript "${cleanId}"`,
+  });
+  if (rawText === null) {
     throw new UsageError(`Transcript "${cleanId}" not found in ${dir}`);
   }
-  if (lst.isSymbolicLink() || !lst.isFile()) {
-    throw new UsageError(`Transcript "${cleanId}" must be a regular file (symlinks disallowed)`);
-  }
-  const realDir = realpathSync(dir);
-  const realFull = realpathSync(full);
-  if (!realFull.startsWith(realDir + "/") && !realFull.startsWith(realDir + "\\")) {
-    throw new UsageError(`Transcript path escapes transcripts directory: "${transcriptId}"`);
-  }
-  const rawText = readFileSync(realFull, "utf8");
   let parsed;
   try {
     parsed = JSON.parse(rawText);

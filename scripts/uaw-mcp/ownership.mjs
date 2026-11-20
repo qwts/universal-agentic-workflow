@@ -12,11 +12,12 @@
  *   - Inspects `<data-dir>/run.lock` before direct state/stage/question mutations.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   linkSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -24,10 +25,19 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
-import { assertRegularFileInDir, canonicalizePath, resolveUawStateDir, UsageError } from "./paths.mjs";
+import { basename, join, resolve } from "node:path";
+import {
+  assertRegularFileInDir,
+  canonicalPathKey,
+  defaultOutputPath,
+  isSameOrAncestorPath,
+  pathsOverlap,
+  resolveUawStateDir,
+  UsageError,
+} from "./paths.mjs";
 
-const LOCK_WAIT_MS = 3_000;
+const UNREADABLE_LOCK_WAIT_MS = 100;
+const REGISTRY_LOCK_WAIT_MS = 300;
 const LOCK_UNREADABLE_STALE_MS = 10_000;
 
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -43,7 +53,7 @@ export function pidAlive(pid) {
 }
 
 export function outputOwnerKey(outputPath) {
-  return createHash("sha256").update(canonicalizePath(outputPath)).digest("hex");
+  return createHash("sha256").update(canonicalPathKey(outputPath)).digest("hex");
 }
 
 export function outputOwnerPaths(outputPath, stateDir) {
@@ -77,7 +87,7 @@ function acquireFileLock({
 }) {
   const lockTmp = `${lockPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   const reclaimPath = `${lockPath}.reclaim`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = Date.now() + UNREADABLE_LOCK_WAIT_MS;
   let allowUnlock = unlock === true;
 
   try {
@@ -123,7 +133,7 @@ function acquireFileLock({
         if (Date.now() >= deadline) {
           throw new UsageError(waitMessage);
         }
-        sleepMs(50);
+        sleepMs(10);
         continue;
       }
       if (!allowUnlock) {
@@ -174,7 +184,7 @@ function acquireFileLock({
 
 export function dataDirLockPath(dataDir, stateDir) {
   const locksDir = join(resolveUawStateDir(stateDir), "data-locks");
-  const key = createHash("sha256").update(canonicalizePath(dataDir)).digest("hex");
+  const key = createHash("sha256").update(canonicalPathKey(dataDir)).digest("hex");
   return {
     key,
     locksDir,
@@ -188,7 +198,13 @@ export function dataDirLockPath(dataDir, stateDir) {
  */
 export function claimDataDirLock({ dataDir, runId = "mcp", stateDir, unlock = false }) {
   if (!dataDir) throw new UsageError("dataDir is required for data_dir lock");
-  const canonicalDataDir = canonicalizePath(dataDir);
+  const canonicalDataDir = canonicalPathKey(dataDir);
+  const canonicalStateDir = canonicalPathKey(resolveUawStateDir(stateDir));
+  if (pathsOverlap(canonicalDataDir, canonicalStateDir)) {
+    throw new UsageError(
+      `data_dir "${canonicalDataDir}" cannot overlap UAW state directory "${canonicalStateDir}"`,
+    );
+  }
   const { locksDir, lockPath } = dataDirLockPath(canonicalDataDir, stateDir);
   mkdirSync(locksDir, { recursive: true });
 
@@ -213,6 +229,88 @@ export function claimDataDirLock({ dataDir, runId = "mcp", stateDir, unlock = fa
   });
 }
 
+function withOwnersRegistryLock(ownersDir, fn) {
+  const lockPath = join(ownersDir, ".registry.lock");
+  const reclaimPath = `${lockPath}.reclaim`;
+  const token = `${process.pid}-${Date.now()}-${randomUUID()}`;
+  const tmpPath = `${lockPath}.${token}.tmp`;
+  const deadline = Date.now() + REGISTRY_LOCK_WAIT_MS;
+  let linkedIno = null;
+
+  try {
+    writeFileSync(tmpPath, JSON.stringify({ pid: process.pid, token }) + "\n", { encoding: "utf8", flag: "wx" });
+    while (true) {
+      try {
+        linkSync(tmpPath, lockPath);
+        linkedIno = statSync(lockPath).ino;
+        break;
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+
+      let st;
+      try {
+        st = statSync(lockPath);
+      } catch {
+        continue;
+      }
+      const other = readJsonQuiet(lockPath);
+      const deadPid = Boolean(other && Number.isInteger(other.pid) && !pidAlive(other.pid));
+      const corruptStale = (!other || !Number.isInteger(other.pid)) && Date.now() - st.mtimeMs > 1_000;
+      if (deadPid || corruptStale) {
+        let holdingReclaim = false;
+        try {
+          linkSync(tmpPath, reclaimPath);
+          holdingReclaim = true;
+        } catch (reclaimErr) {
+          if (reclaimErr.code === "EEXIST") {
+            try {
+              const rst = statSync(reclaimPath);
+              if (Date.now() - rst.mtimeMs > 1_000) {
+                rmSync(reclaimPath, { force: true });
+              }
+            } catch {
+              /* reclaim released */
+            }
+          }
+        }
+        if (holdingReclaim) {
+          try {
+            const stNow = statSync(lockPath);
+            const cur = readJsonQuiet(lockPath);
+            if (stNow.ino === st.ino && (!other?.token || cur?.token === other.token)) {
+              unlinkSync(lockPath);
+            }
+          } catch {
+            /* lock already gone */
+          } finally {
+            rmSync(reclaimPath, { force: true });
+          }
+          continue;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new UsageError("Could not acquire output ownership registry lock; retry shortly.");
+      }
+      sleepMs(5);
+    }
+  } finally {
+    rmSync(tmpPath, { force: true });
+  }
+
+  try {
+    return fn();
+  } finally {
+    try {
+      if (statSync(lockPath).ino === linkedIno && readJsonQuiet(lockPath)?.token === token) {
+        unlinkSync(lockPath);
+      }
+    } catch {
+      /* already removed */
+    }
+  }
+}
+
 /**
  * Claim durable out-of-tree ownership of `outputPath` for `(runId, dataDir)` and
  * acquire the paired atomic execution lock for the duration of a mutating operation.
@@ -225,10 +323,81 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
   if (!runId) throw new UsageError("runId is required for ownership claim");
   if (!dataDir) throw new UsageError("dataDir is required for ownership claim");
 
-  const canonicalOutput = canonicalizePath(outputPath);
-  const canonicalDataDir = canonicalizePath(dataDir);
+  const canonicalOutput = canonicalPathKey(outputPath);
+  const canonicalDataDir = canonicalPathKey(dataDir);
+  const canonicalStateDir = canonicalPathKey(resolveUawStateDir(stateDir));
+
+  if (pathsOverlap(canonicalDataDir, canonicalStateDir)) {
+    throw new UsageError(
+      `data_dir "${canonicalDataDir}" cannot overlap UAW state directory "${canonicalStateDir}"`,
+    );
+  }
+  if (pathsOverlap(canonicalOutput, canonicalStateDir)) {
+    throw new UsageError(
+      `output_path "${canonicalOutput}" cannot overlap UAW state directory "${canonicalStateDir}"`,
+    );
+  }
+  if (isSameOrAncestorPath(canonicalOutput, canonicalDataDir)) {
+    throw new UsageError(
+      `output_path "${canonicalOutput}" cannot equal or contain data_dir "${canonicalDataDir}"`,
+    );
+  }
+  const canonicalDefaultOut = canonicalPathKey(defaultOutputPath(canonicalDataDir));
+  if (isSameOrAncestorPath(canonicalDataDir, canonicalOutput) && !isSameOrAncestorPath(canonicalDefaultOut, canonicalOutput)) {
+    throw new UsageError(
+      `output_path "${canonicalOutput}" inside data_dir "${canonicalDataDir}" must be under "${canonicalDefaultOut}"`,
+    );
+  }
+
   const { ownersDir, recordPath, lockPath } = outputOwnerPaths(canonicalOutput, stateDir);
   mkdirSync(ownersDir, { recursive: true });
+
+  const assertNoOverlappingOwner = () => {
+    const myRecordName = basename(recordPath);
+    for (const file of readdirSync(ownersDir)) {
+      if (!file.endsWith(".json")) continue;
+      const other = readJsonQuiet(join(ownersDir, file));
+      if (!other?.output_path) continue;
+      let sameDataDir = false;
+      let otherDataDir = null;
+      if (other.data_dir) {
+        try {
+          otherDataDir = canonicalPathKey(other.data_dir);
+          sameDataDir = otherDataDir === canonicalDataDir;
+        } catch {
+          otherDataDir = null;
+        }
+      }
+      if (file === myRecordName && sameDataDir) continue;
+      let otherOut;
+      try {
+        otherOut = canonicalPathKey(other.output_path);
+      } catch {
+        continue;
+      }
+      const sameRun = Boolean(other.run_id) && other.run_id === runId;
+      if (otherDataDir && !sameDataDir) {
+        if (pathsOverlap(canonicalOutput, otherDataDir)) {
+          throw new UsageError(
+            `Output path "${canonicalOutput}" overlaps with run "${other.run_id ?? "unknown"}" data_dir "${otherDataDir}".`,
+          );
+        }
+        if (pathsOverlap(canonicalDataDir, otherOut)) {
+          throw new UsageError(
+            `data_dir "${canonicalDataDir}" overlaps with output_path "${otherOut}" owned by run "${other.run_id ?? "unknown"}".`,
+          );
+        }
+      }
+      if (file === myRecordName) continue;
+      if (!pathsOverlap(canonicalOutput, otherOut)) continue;
+      if (!sameDataDir || (!sameRun && !force)) {
+        throw new UsageError(
+          `Output path "${canonicalOutput}" overlaps with "${otherOut}" owned by run "${other.run_id ?? "unknown"}" (data_dir: ${other.data_dir ?? "unknown"}).`,
+        );
+      }
+    }
+  };
+  assertNoOverlappingOwner();
 
   // Acquire the paired execution lock BEFORE linking/updating the durable .json record,
   // so lock contention or stale-lock refusal never leaves an orphaned .json ownership record behind.
@@ -238,8 +407,8 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
     output_path: canonicalOutput,
     claimed_at: new Date().toISOString(),
   };
-  const recordTmp = `${recordPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  const lockToken = `${runId}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const recordTmp = `${recordPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+  const lockToken = `${runId}-${process.pid}-${Date.now()}-${randomUUID()}`;
   const lockPayload = {
     run_id: runId,
     data_dir: canonicalDataDir,
@@ -264,32 +433,35 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
       stalePrefix: `Output path "${canonicalOutput}" has a stale execution lock`,
       unlock,
       beforeReturn: () => {
-        try {
-          linkSync(recordTmp, recordPath);
-          createdRecord = true;
-        } catch (e) {
-          if (e.code !== "EEXIST") throw e;
-          const existing = readJsonQuiet(recordPath);
-          const sameDataDir = Boolean(existing?.data_dir) && canonicalizePath(existing.data_dir) === canonicalDataDir;
-          const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
-          if (!existing || !sameDataDir || (!sameRun && !force)) {
-            const ownerDesc = existing?.run_id
-              ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
-              : "another run (unreadable ownership record)";
-            throw new UsageError(
-              `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
-            );
-          }
-          if (!sameRun && force) {
-            try {
-              previousRecordRaw = readFileSync(recordPath, "utf8");
-            } catch {
-              previousRecordRaw = null;
+        withOwnersRegistryLock(ownersDir, () => {
+          assertNoOverlappingOwner();
+          try {
+            linkSync(recordTmp, recordPath);
+            createdRecord = true;
+          } catch (e) {
+            if (e.code !== "EEXIST") throw e;
+            const existing = readJsonQuiet(recordPath);
+            const sameDataDir = Boolean(existing?.data_dir) && canonicalPathKey(existing.data_dir) === canonicalDataDir;
+            const sameRun = Boolean(existing?.run_id) && existing.run_id === runId;
+            if (!existing || !sameDataDir || (!sameRun && !force)) {
+              const ownerDesc = existing?.run_id
+                ? `run "${existing.run_id}" (data_dir: ${existing.data_dir})`
+                : "another run (unreadable ownership record)";
+              throw new UsageError(
+                `Output path "${canonicalOutput}" is already owned by ${ownerDesc}; refusing run "${runId}" (data_dir: ${canonicalDataDir}).`,
+              );
             }
-            renameSync(recordTmp, recordPath);
-            updatedRecord = true;
+            if (!sameRun && force) {
+              try {
+                previousRecordRaw = readFileSync(recordPath, "utf8");
+              } catch {
+                previousRecordRaw = null;
+              }
+              renameSync(recordTmp, recordPath);
+              updatedRecord = true;
+            }
           }
-        }
+        });
       },
     });
     return {

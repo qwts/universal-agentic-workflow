@@ -14,13 +14,15 @@
  * Also used by the runner: attemptUsage() (one transcript) and listTranscripts() (all transcripts in a data dir).
  */
 
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { materializePrompt } from "./prompt.mjs";
 
 export const AVG_LIMIT = 50_000;
 export const TURN_LIMIT = 100_000;
 const CHARS_PER_TOKEN = 4;
+const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
+const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
 const k = (n) => (n / 1000).toFixed(1) + "K";
 const num = (v) => (Number.isFinite(v) ? v : 0);
@@ -111,7 +113,34 @@ export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outp
     }
     if (!realFull.startsWith(realDir + sep)) continue;
     let t;
-    try { t = JSON.parse(readFileSync(realFull, "utf8")); } catch { continue; }
+    let fd;
+    try {
+      fd = openSync(full, OPEN_NOFOLLOW_FLAGS);
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > MAX_TRANSCRIPT_BYTES) continue;
+      const chunks = [];
+      let total = 0;
+      const chunkBuf = Buffer.allocUnsafe(65536);
+      let tooBig = false;
+      while (true) {
+        const n = readSync(fd, chunkBuf, 0, chunkBuf.length, null);
+        if (n === 0) break;
+        total += n;
+        if (total > MAX_TRANSCRIPT_BYTES) {
+          tooBig = true;
+          break;
+        }
+        chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
+      }
+      if (tooBig) continue;
+      t = JSON.parse(Buffer.concat(chunks, total).toString("utf8"));
+    } catch {
+      continue;
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
     const row = transcriptRow(f, t);
     if (row) rows.push(row);
   }

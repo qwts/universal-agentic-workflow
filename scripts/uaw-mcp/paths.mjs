@@ -5,12 +5,17 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   readlinkSync,
   realpathSync,
   renameSync,
@@ -43,17 +48,92 @@ export function resolveUawStateDir(explicit) {
   return resolve(xdgState, "uaw");
 }
 
+const caseInsensitiveCache = new Map();
+
+function probeNameCaseInsensitive(parentDir, name) {
+  const m = name.match(/[A-Za-z]/);
+  if (!m) return null;
+  const ch = m[0];
+  const flippedCh = ch >= "a" ? ch.toUpperCase() : ch.toLowerCase();
+  const flippedName = name.slice(0, m.index) + flippedCh + name.slice(m.index + 1);
+  let origSt;
+  try {
+    origSt = lstatSync(join(parentDir, name));
+  } catch {
+    return null;
+  }
+  try {
+    const flipSt = lstatSync(join(parentDir, flippedName));
+    return origSt.dev === flipSt.dev && origSt.ino === flipSt.ino;
+  } catch (err) {
+    if (err?.code === "ENOENT") return false;
+    return null;
+  }
+}
+
+function isCaseInsensitiveDir(dirPath) {
+  let dirSt;
+  try {
+    dirSt = lstatSync(dirPath);
+  } catch {
+    return false;
+  }
+  if (!dirSt.isDirectory()) return false;
+
+  const cacheKey = `${dirSt.dev}:${dirPath}`;
+  if (caseInsensitiveCache.has(cacheKey)) {
+    return caseInsensitiveCache.get(cacheKey);
+  }
+  const remember = (value) => {
+    if (caseInsensitiveCache.size >= 1024) caseInsensitiveCache.clear();
+    caseInsensitiveCache.set(cacheKey, value);
+    return value;
+  };
+
+  // Probe the directory itself, then walk same-volume ancestors on all platforms so empty
+  // directories (including Linux output_path/data_dir) never receive transient probe dotfiles.
+  let cur = dirPath;
+  while (true) {
+    try {
+      const entries = readdirSync(cur);
+      for (const name of entries) {
+        const probed = probeNameCaseInsensitive(cur, name);
+        if (probed !== null) return remember(probed);
+      }
+    } catch {
+      /* ignore unreadable directory entries */
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    let parentSt;
+    try {
+      parentSt = lstatSync(parent);
+    } catch {
+      break;
+    }
+    if (parentSt.dev !== dirSt.dev) break;
+    const probedSelf = probeNameCaseInsensitive(parent, basename(cur));
+    if (probedSelf !== null) return remember(probedSelf);
+    cur = parent;
+  }
+  return process.platform === "darwin" || process.platform === "win32";
+}
+
 /**
  * Canonicalize a path even if the leaf does not yet exist or traverses a dangling symlink:
  * resolves symlinks at every existing/symlinked ancestor with hop limit.
  */
 export function canonicalizePath(targetPath, _hops = 0) {
+  if (typeof targetPath !== "string" || targetPath.length === 0 || targetPath.includes("\0")) {
+    throw new UsageError("path must be a non-empty string without NUL bytes");
+  }
   if (_hops > 40) {
     throw new UsageError(`Too many symbolic link levels resolving "${targetPath}"`);
   }
   const abs = resolve(targetPath);
+  const realNative = realpathSync.native ?? realpathSync;
   try {
-    return realpathSync(abs);
+    return realNative(abs);
   } catch {
     /* leaf or intermediate component absent or dangling symlink */
   }
@@ -76,7 +156,7 @@ export function canonicalizePath(targetPath, _hops = 0) {
       }
       let base = cur;
       try {
-        base = realpathSync(cur);
+        base = realNative(cur);
       } catch {
         base = cur;
       }
@@ -90,29 +170,68 @@ export function canonicalizePath(targetPath, _hops = 0) {
 }
 
 /**
+ * Stable canonical key for path equality, hashing (`outputOwnerKey`, `dataDirLockPath`),
+ * and ancestor/overlap checks across both existing and not-yet-created paths.
+ * On case-insensitive/Unicode-normalizing filesystems (e.g. macOS APFS), folds the entire
+ * canonical path with `normalize("NFD").toLowerCase()` so pre-creation and post-creation keys match.
+ */
+export function canonicalPathKey(targetPath) {
+  const canon = canonicalizePath(targetPath);
+  const realNative = realpathSync.native ?? realpathSync;
+  let probe = canon;
+  while (true) {
+    try {
+      const lst = lstatSync(probe);
+      const checkDir = lst.isDirectory() ? probe : dirname(probe);
+      let realCheck = checkDir;
+      try {
+        realCheck = realNative(checkDir);
+      } catch {
+        realCheck = checkDir;
+      }
+      if (isCaseInsensitiveDir(realCheck)) {
+        return process.platform === "darwin"
+          ? canon.normalize("NFD").toLowerCase()
+          : canon.toLowerCase();
+      }
+      return canon;
+    } catch {
+      const parent = dirname(probe);
+      if (parent === probe) return canon;
+      probe = parent;
+    }
+  }
+}
+
+/**
  * Verify that `targetPath` lies within at least one configured workspace root.
  * When `allowedRoots` is empty/unset, no root restriction is applied (local stdio mode).
  */
 export function assertAllowedPath(targetPath, allowedRoots, label = "path") {
-  if (!targetPath || typeof targetPath !== "string") {
-    throw new UsageError(`${label} must be a non-empty string`);
+  if (!targetPath || typeof targetPath !== "string" || targetPath.includes("\0")) {
+    throw new UsageError(`${label} must be a non-empty string without NUL bytes`);
   }
   const canonicalTarget = canonicalizePath(targetPath);
   if (!Array.isArray(allowedRoots) || allowedRoots.length === 0) {
     return canonicalTarget;
   }
-  const allowed = allowedRoots.some((root) => {
-    const canonicalRoot = canonicalizePath(root);
-    if (canonicalTarget === canonicalRoot) return true;
-    const rel = relative(canonicalRoot, canonicalTarget);
-    return rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
-  });
+  const allowed = allowedRoots.some((root) => isSameOrAncestorPath(root, canonicalTarget));
   if (!allowed) {
     throw new UsageError(
       `${label} "${targetPath}" is outside the configured workspace root allowlist`,
     );
   }
   return canonicalTarget;
+}
+
+export function isSameOrAncestorPath(ancestorPath, descendantPath) {
+  const ca = canonicalPathKey(ancestorPath);
+  const cd = canonicalPathKey(descendantPath);
+  return ca === cd || (ca.endsWith(sep) ? cd.startsWith(ca) : cd.startsWith(ca + sep));
+}
+
+export function pathsOverlap(pathA, pathB) {
+  return isSameOrAncestorPath(pathA, pathB) || isSameOrAncestorPath(pathB, pathA);
 }
 
 /**
@@ -130,8 +249,13 @@ export function generateRunId(workflow = "uaw") {
 
 export function assertRegularFileInDir(dirPath, fileName, label = fileName) {
   const absDir = resolve(dirPath);
-  if (!existsSync(absDir)) return null;
-  const dirLst = lstatSync(absDir);
+  let dirLst;
+  try {
+    dirLst = lstatSync(absDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
   if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
     throw new UsageError(`Invalid directory for ${label}: "${absDir}"`);
   }
@@ -148,18 +272,219 @@ export function assertRegularFileInDir(dirPath, fileName, label = fileName) {
   }
   const realDir = realpathSync(absDir);
   const realFull = realpathSync(full);
-  const inside = realDir === "/" ? realFull.startsWith("/") : realFull.startsWith(realDir + sep);
+  const inside = realDir.endsWith(sep) ? realFull.startsWith(realDir) : realFull.startsWith(realDir + sep);
   if (!inside) {
     throw new UsageError(`${label} escapes directory "${absDir}"`);
   }
   return realFull;
 }
 
-export function readRunMeta(dataDir) {
-  const realMeta = assertRegularFileInDir(dataDir, RUN_META_FILE, "run-meta.json");
-  if (!realMeta) return null;
+const RUNTIME_CONTROL_FILES = new Set([
+  RUN_META_FILE,
+  "run.lock",
+  "mark-stage.lock",
+  "runner-goal.md",
+  "runner-routing.json",
+  "runner-finalize-pending.json",
+  "uaw-manifest.json",
+]);
+
+/**
+ * Verify that `dataDir` (if present) is a non-symlink directory whose top-level runtime
+ * entries (`*.db`, `-wal`, `-shm`, `-journal`, control files, and `transcripts/`) are
+ * regular non-symlink entries contained inside `dataDir`.
+ *
+ * Does not recurse into `workflow-artifacts/` (agents may leave build/package symlinks
+ * there) or `transcripts/` (cost/transcript readers already filter individual entries).
+ * Note: pre-spawn checks are defense-in-depth alongside child-CLI confinement.
+ */
+export function assertSafeDataDir(dataDir) {
+  const absDir = resolve(dataDir);
+  let dirLst;
   try {
-    const parsed = JSON.parse(readFileSync(realMeta, "utf8"));
+    dirLst = lstatSync(absDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+    throw new UsageError(`data_dir must be a regular directory (symlinks disallowed): "${absDir}"`);
+  }
+  const realRoot = realpathSync(absDir);
+  const insideRoot = (p) => (realRoot.endsWith(sep) ? p.startsWith(realRoot) : p.startsWith(realRoot + sep));
+
+  for (const entry of readdirSync(absDir, { withFileTypes: true })) {
+    const isDbEntry = /\.db(?:-wal|-shm|-journal)?$/i.test(entry.name);
+    const isCtrlEntry = RUNTIME_CONTROL_FILES.has(entry.name);
+    const isTranscripts = entry.name === "transcripts";
+    if (!isDbEntry && !isCtrlEntry && !isTranscripts) continue;
+
+    const full = join(absDir, entry.name);
+    let lst;
+    try {
+      lst = lstatSync(full);
+    } catch (e) {
+      if (e.code === "ENOENT") continue;
+      throw e;
+    }
+    if (lst.isSymbolicLink()) {
+      throw new UsageError(`Symlinks are disallowed in data_dir: "${full}"`);
+    }
+    if (isTranscripts) {
+      if (!lst.isDirectory()) {
+        throw new UsageError(`data_dir/transcripts must be a directory: "${full}"`);
+      }
+    } else if (!lst.isFile()) {
+      throw new UsageError(`data_dir runtime entry "${entry.name}" must be a regular file: "${full}"`);
+    }
+    const realFull = realpathSync(full);
+    if (!insideRoot(realFull)) {
+      throw new UsageError(`data_dir entry escapes "${absDir}": "${full}"`);
+    }
+  }
+}
+
+/**
+ * Reject symlinked `.github/skills` directories or symlinked SQLite DB/sidecar files
+ * under `<rootPath>/.github/skills/<skill>/` before spawning child CLIs.
+ */
+export function assertSafeSkillDbs(rootPath, label = "repo_root") {
+  if (!rootPath) return;
+  const absRoot = resolve(rootPath);
+  let rootLst;
+  try {
+    rootLst = lstatSync(absRoot);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+    throw new UsageError(`${label} must be a regular directory: "${absRoot}"`);
+  }
+  const realRoot = realpathSync(absRoot);
+  const dotGithub = join(absRoot, ".github");
+  let ghLst;
+  try {
+    ghLst = lstatSync(dotGithub);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (ghLst.isSymbolicLink()) {
+    throw new UsageError(`${label}/.github must not be a symlink: "${dotGithub}"`);
+  }
+  if (!ghLst.isDirectory()) return;
+
+  const skillsDir = join(dotGithub, "skills");
+  let skLst;
+  try {
+    skLst = lstatSync(skillsDir);
+  } catch (e) {
+    if (e.code === "ENOENT") return;
+    throw e;
+  }
+  if (skLst.isSymbolicLink()) {
+    throw new UsageError(`${label}/.github/skills must not be a symlink: "${skillsDir}"`);
+  }
+  if (!skLst.isDirectory()) return;
+
+  for (const skillEntry of readdirSync(skillsDir, { withFileTypes: true })) {
+    const skillPath = join(skillsDir, skillEntry.name);
+    let lst;
+    try {
+      lst = lstatSync(skillPath);
+    } catch (e) {
+      if (e.code === "ENOENT") continue;
+      throw e;
+    }
+    if (lst.isSymbolicLink()) {
+      throw new UsageError(`${label} skill directory must not be a symlink: "${skillPath}"`);
+    }
+    if (!lst.isDirectory()) continue;
+
+    for (const item of readdirSync(skillPath, { withFileTypes: true })) {
+      if (item.name === "node_modules") continue;
+      if (!/\.db(?:-wal|-shm|-journal)?$/i.test(item.name)) continue;
+      const itemPath = join(skillPath, item.name);
+      let itemLst;
+      try {
+        itemLst = lstatSync(itemPath);
+      } catch (e) {
+        if (e.code === "ENOENT") continue;
+        throw e;
+      }
+      if (itemLst.isSymbolicLink() || !itemLst.isFile()) {
+        throw new UsageError(`${label} skill DB file must be a regular file (symlinks disallowed): "${itemPath}"`);
+      }
+      const realItem = realpathSync(itemPath);
+      const inside = realRoot.endsWith(sep) ? realItem.startsWith(realRoot) : realItem.startsWith(realRoot + sep);
+      if (!inside) {
+        throw new UsageError(`${label} skill DB file escapes root "${absRoot}": "${itemPath}"`);
+      }
+    }
+  }
+}
+
+const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/**
+ * Safely read a bounded regular UTF-8 file inside `dirPath` without following symlinks
+ * or blocking on FIFOs, capping actual bytes read even if the file grows after `fstat`.
+ * Returns `null` if missing; throws `UsageError` on symlinks, non-regular files, or oversized files.
+ */
+export function readRegularFileBounded(
+  dirPath,
+  fileName,
+  { maxBytes = 16 * 1024 * 1024, label = fileName } = {},
+) {
+  const realFile = assertRegularFileInDir(dirPath, fileName, label);
+  if (!realFile) return null;
+  const full = join(resolve(dirPath), fileName);
+  let fd;
+  try {
+    fd = openSync(full, OPEN_NOFOLLOW_FLAGS);
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      throw new UsageError(`${label} must be a regular file (symlinks disallowed): "${full}"`);
+    }
+    if (st.size > maxBytes) {
+      throw new UsageError(`${label} exceeds ${maxBytes} byte limit: "${full}"`);
+    }
+    const chunks = [];
+    let total = 0;
+    const chunkBuf = Buffer.allocUnsafe(65536);
+    while (true) {
+      const n = readSync(fd, chunkBuf, 0, chunkBuf.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > maxBytes) {
+        throw new UsageError(`${label} exceeds ${maxBytes} byte limit: "${full}"`);
+      }
+      chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } catch (err) {
+    if (err instanceof UsageError) throw err;
+    if (err.code === "ENOENT") return null;
+    if (err.code === "ELOOP") {
+      throw new UsageError(`${label} must be a regular file (symlinks disallowed): "${full}"`);
+    }
+    throw err;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+export function readRunMeta(dataDir) {
+  const raw = readRegularFileBounded(dataDir, RUN_META_FILE, {
+    maxBytes: 1024 * 1024,
+    label: "run-meta.json",
+  });
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw);
     return parsed && typeof parsed === "object" ? parsed : null;
   } catch {
     return null;
@@ -168,6 +493,18 @@ export function readRunMeta(dataDir) {
 
 export function writeRunMeta(dataDir, meta) {
   const absDir = resolve(dataDir);
+  try {
+    if (lstatSync(absDir).isSymbolicLink()) {
+      throw new UsageError(`data_dir must not be a symlink: "${absDir}"`);
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+  const previousRaw = readRegularFileBounded(absDir, RUN_META_FILE, {
+    maxBytes: 1024 * 1024,
+    label: "run-meta.json",
+  });
+  const existed = previousRaw !== null;
   mkdirSync(absDir, { recursive: true });
   if (lstatSync(absDir).isSymbolicLink()) {
     throw new UsageError(`data_dir must not be a symlink: "${absDir}"`);
@@ -180,14 +517,29 @@ export function writeRunMeta(dataDir, meta) {
   } catch (e) {
     if (e.code !== "ENOENT") throw e;
   }
-  const tmpPath = `${metaPath}.${process.pid}.${Date.now()}.tmp`;
+  const tmpPath = `${metaPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   try {
-    writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
+    writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
     renameSync(tmpPath, metaPath);
   } finally {
     rmSync(tmpPath, { force: true });
   }
-  return metaPath;
+  return {
+    metaPath,
+    rollback() {
+      if (!existed) {
+        rmSync(metaPath, { force: true });
+        return;
+      }
+      const restoreTmp = `${metaPath}.${process.pid}.${Date.now()}.${randomUUID()}.restore.tmp`;
+      try {
+        writeFileSync(restoreTmp, previousRaw, { encoding: "utf8", flag: "wx" });
+        renameSync(restoreTmp, metaPath);
+      } finally {
+        rmSync(restoreTmp, { force: true });
+      }
+    },
+  };
 }
 
 function runIndexPath(stateDir, runId) {
@@ -226,7 +578,7 @@ function withRunIndexLock(stateDir, runId, fn) {
   mkdirSync(locksDir, { recursive: true });
   const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const tmpPath = `${lockPath}.${token}.tmp`;
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + 300;
   let acquired = false;
   let linkedIno = null;
 
@@ -288,7 +640,7 @@ function withRunIndexLock(stateDir, runId, fn) {
           `Could not acquire run_id "${runId}" index lock (held by pid ${other?.pid ?? "unknown"}); retry shortly.`,
         );
       }
-      sleepSyncMs(15);
+      sleepSyncMs(10);
     }
     return fn();
   } finally {
@@ -307,7 +659,7 @@ function withRunIndexLock(stateDir, runId, fn) {
 
 export function pruneSupersededRunIndices(stateDir, meta) {
   if (!meta?.run_id || !meta?.data_dir) return;
-  const canonicalDataDir = canonicalizePath(meta.data_dir);
+  const canonicalDataDir = canonicalPathKey(meta.data_dir);
   const currentIdxPath = runIndexPath(stateDir, meta.run_id);
   const runsDir = dirname(currentIdxPath);
   if (!existsSync(runsDir)) return;
@@ -322,7 +674,7 @@ export function pruneSupersededRunIndices(stateDir, meta) {
         !parsed?.run_id ||
         parsed.run_id === meta.run_id ||
         !parsed?.data_dir ||
-        canonicalizePath(parsed.data_dir) !== canonicalDataDir
+        canonicalPathKey(parsed.data_dir) !== canonicalDataDir
       ) {
         continue;
       }
@@ -336,7 +688,7 @@ export function pruneSupersededRunIndices(stateDir, meta) {
           if (
             latest?.run_id === parsed.run_id &&
             latest?.data_dir &&
-            canonicalizePath(latest.data_dir) === canonicalDataDir
+            canonicalPathKey(latest.data_dir) === canonicalDataDir
           ) {
             rmSync(otherPath, { force: true });
           }
@@ -352,10 +704,10 @@ export function pruneSupersededRunIndices(stateDir, meta) {
 
 export function registerRunIndex(stateDir, meta, { pruneSuperseded = true } = {}) {
   if (!meta?.run_id || !meta?.data_dir) return null;
-  const canonicalDataDir = canonicalizePath(meta.data_dir);
+  const canonicalDataDir = canonicalPathKey(meta.data_dir);
   const reg = withRunIndexLock(stateDir, meta.run_id, () => {
     const existing = lookupRunById(stateDir, meta.run_id);
-    if (existing?.data_dir && canonicalizePath(existing.data_dir) !== canonicalDataDir) {
+    if (existing?.data_dir && canonicalPathKey(existing.data_dir) !== canonicalDataDir) {
       throw new UsageError(
         `run_id "${meta.run_id}" is already registered to data_dir "${existing.data_dir}" (refusing to reassign to "${meta.data_dir}")`,
       );
@@ -372,9 +724,9 @@ export function registerRunIndex(stateDir, meta, { pruneSuperseded = true } = {}
     }
     const runsDir = dirname(idxPath);
     mkdirSync(runsDir, { recursive: true });
-    const tmpPath = `${idxPath}.${process.pid}.${Date.now()}.tmp`;
+    const tmpPath = `${idxPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
+      writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
       renameSync(tmpPath, idxPath);
     } finally {
       rmSync(tmpPath, { force: true });
@@ -386,15 +738,15 @@ export function registerRunIndex(stateDir, meta, { pruneSuperseded = true } = {}
         withRunIndexLock(stateDir, meta.run_id, () => {
           if (createdNew) {
             const cur = lookupRunById(stateDir, meta.run_id);
-            if (cur?.data_dir && canonicalizePath(cur.data_dir) === canonicalDataDir) {
+            if (cur?.data_dir && canonicalPathKey(cur.data_dir) === canonicalDataDir) {
               rmSync(idxPath, { force: true });
             }
             return;
           }
           if (previousRaw !== null) {
-            const restoreTmp = `${idxPath}.${process.pid}.${Date.now()}.restore.tmp`;
+            const restoreTmp = `${idxPath}.${process.pid}.${Date.now()}.${randomUUID()}.restore.tmp`;
             try {
-              writeFileSync(restoreTmp, previousRaw, "utf8");
+              writeFileSync(restoreTmp, previousRaw, { encoding: "utf8", flag: "wx" });
               renameSync(restoreTmp, idxPath);
             } finally {
               rmSync(restoreTmp, { force: true });
@@ -422,14 +774,18 @@ export function lookupRunById(stateDir, runId) {
   }
 }
 
-export function listRegisteredRuns(stateDir) {
+export function listRegisteredRuns(stateDir, { allowedRoots } = {}) {
   const dir = join(resolveUawStateDir(stateDir), "runs");
   if (!existsSync(dir)) return [];
+  const hasAllowlist = Array.isArray(allowedRoots) && allowedRoots.length > 0;
   const runs = [];
   for (const name of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
     try {
       const parsed = JSON.parse(readFileSync(join(dir, name), "utf8"));
       if (parsed?.run_id && parsed?.data_dir) {
+        if (hasAllowlist) {
+          assertAllowedPath(parsed.data_dir, allowedRoots, "data_dir");
+        }
         try {
           const liveMeta = readRunMeta(parsed.data_dir);
           if (liveMeta?.run_id && liveMeta.run_id !== parsed.run_id) continue;
@@ -439,21 +795,22 @@ export function listRegisteredRuns(stateDir) {
         runs.push(parsed);
       }
     } catch {
-      /* ignore corrupt index entry */
+      /* ignore corrupt or disallowed index entry */
     }
   }
   return runs;
 }
 
 /**
- * Resolve a run target from either `run_id`, `data_dir`, or `UWF_DATA_DIR`,
+ * Resolve a run target from either `run_id` or `data_dir`,
  * validating against `allowedRoots` when configured.
  */
 export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, requireExisting = false } = {}) {
   const resolvedStateDir = resolveUawStateDir(stateDir);
+  const canonicalStateDir = canonicalizePath(resolvedStateDir);
   if (run_id !== undefined && run_id !== null) {
-    if (typeof run_id !== "string" || !run_id.trim()) {
-      throw new UsageError("run_id must be a non-empty string");
+    if (typeof run_id !== "string" || !run_id.trim() || run_id.includes("\0")) {
+      throw new UsageError("run_id must be a non-empty string without NUL bytes");
     }
     if (run_id === "." || run_id.includes("/") || run_id.includes("\\") || run_id.includes("..")) {
       throw new UsageError(`Invalid run_id "${run_id}": path traversal sequences are disallowed`);
@@ -462,11 +819,18 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
   let resolvedDataDir = null;
   let meta = null;
 
+  const assertNotInStateDir = (dir) => {
+    if (pathsOverlap(dir, canonicalStateDir)) {
+      throw new UsageError(`data_dir "${dir}" cannot overlap UAW state directory "${canonicalStateDir}"`);
+    }
+  };
+
   if (data_dir) {
     resolvedDataDir = assertAllowedPath(data_dir, allowedRoots, "data_dir");
+    assertNotInStateDir(resolvedDataDir);
     if (run_id) {
       const indexed = lookupRunById(resolvedStateDir, run_id);
-      if (indexed?.data_dir && canonicalizePath(indexed.data_dir) !== canonicalizePath(resolvedDataDir)) {
+      if (indexed?.data_dir && canonicalPathKey(indexed.data_dir) !== canonicalPathKey(resolvedDataDir)) {
         throw new UsageError(
           `run_id "${run_id}" is already registered to data_dir "${indexed.data_dir}" (refusing to reassign to "${resolvedDataDir}")`,
         );
@@ -477,6 +841,7 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
     const indexed = lookupRunById(resolvedStateDir, run_id);
     if (indexed?.data_dir) {
       resolvedDataDir = assertAllowedPath(indexed.data_dir, allowedRoots, "data_dir");
+      assertNotInStateDir(resolvedDataDir);
       meta = readRunMeta(resolvedDataDir) ?? indexed;
     } else if (!requireExisting) {
       const safeRun = String(run_id).replace(/[^A-Za-z0-9._-]+/g, "_");
@@ -485,16 +850,16 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
       }
       const baseDir = Array.isArray(allowedRoots) && allowedRoots.length > 0
         ? join(canonicalizePath(allowedRoots[0]), ".uaw-runs")
-        : join(resolvedStateDir, "runs-data");
+        : (process.env.UAW_RUNS_DIR
+            ? canonicalizePath(process.env.UAW_RUNS_DIR)
+            : join(dirname(canonicalStateDir), "uaw-runs"));
       const candidate = join(baseDir, safeRun);
       resolvedDataDir = assertAllowedPath(candidate, allowedRoots, "data_dir");
+      assertNotInStateDir(resolvedDataDir);
       meta = readRunMeta(resolvedDataDir);
     } else {
       throw new UsageError(`Unknown run_id "${run_id}" (no registered data_dir found)`);
     }
-  } else if (process.env.UWF_DATA_DIR) {
-    resolvedDataDir = assertAllowedPath(process.env.UWF_DATA_DIR, allowedRoots, "data_dir");
-    meta = readRunMeta(resolvedDataDir);
   } else {
     throw new UsageError("Either run_id or data_dir is required");
   }
@@ -508,7 +873,7 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
   const effectiveRunId = run_id ?? meta?.run_id ?? null;
   if (effectiveRunId) {
     const indexed = lookupRunById(resolvedStateDir, effectiveRunId);
-    if (indexed?.data_dir && canonicalizePath(indexed.data_dir) !== canonicalizePath(resolvedDataDir)) {
+    if (indexed?.data_dir && canonicalPathKey(indexed.data_dir) !== canonicalPathKey(resolvedDataDir)) {
       throw new UsageError(
         `run_id "${effectiveRunId}" is already registered to data_dir "${indexed.data_dir}" (refusing to reassign to "${resolvedDataDir}")`,
       );
