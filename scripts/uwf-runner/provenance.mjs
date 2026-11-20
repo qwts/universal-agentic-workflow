@@ -311,8 +311,25 @@ export function ensureRunMeta(
         `Run ID mismatch for ${absDataDir}: run-meta.json records "${existing.run_id}", requested "${explicitRunId}"`,
       );
     }
+    let existingWorkflow =
+      typeof existing.workflow === "string" && existing.workflow.trim() ? existing.workflow.trim() : null;
+    if (!existingWorkflow) {
+      const recovered = recoverPersistedRunIdentity(absDataDir);
+      if (recovered.runId && recovered.runId === existing.run_id && recovered.workflow) {
+        existingWorkflow = recovered.workflow;
+      }
+    }
+    if (workflow && existingWorkflow && workflow !== existingWorkflow) {
+      throw new Error(
+        `Workflow mismatch for ${absDataDir}: run-meta.json records "${existingWorkflow}", requested "${workflow}"`,
+      );
+    }
     let dirty = false;
-    if (!existing.workflow && workflow) { existing.workflow = workflow; dirty = true; }
+    const resolvedWf = existingWorkflow ?? workflow;
+    if ((typeof existing.workflow !== "string" || !existing.workflow.trim()) && resolvedWf) {
+      existing.workflow = resolvedWf;
+      dirty = true;
+    }
     if (!existing.output_path && outputPath) { existing.output_path = outputPath; dirty = true; }
     if (!existing.base_commit_sha) {
       const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);

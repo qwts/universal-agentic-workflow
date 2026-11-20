@@ -1592,9 +1592,52 @@ try {
     assert.match(mismatchStderr, /Run ID mismatch/i);
     assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
 
+    // Conflicting workflow against intact run-meta.json fails closed during ensureRunMeta and runner --from-stage
+    assert.throws(
+      () => ensureRunMeta(replayData, { workflow: "project_manager", repoRoot: replayRepo }),
+      /Workflow mismatch/i,
+    );
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).workflow, "sw_dev");
+
+    let wfFromStageExit = 0;
+    let wfFromStageStderr = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "project_manager", "--goal", "Cross-workflow from-stage mismatch", "--from-stage", "intake", "--adapter", "fake", "--repo-root", replayRepo, "--data-dir", replayData, "--defer-seal"],
+        { encoding: "utf8", env: replayEnv, stdio: "pipe" },
+      );
+    } catch (err) {
+      wfFromStageExit = err.status ?? 1;
+      wfFromStageStderr = String(err.stderr ?? "");
+    }
+    assert.notEqual(wfFromStageExit, 0, "runner --from-stage with conflicting workflow against intact run-meta.json must fail closed");
+    assert.match(wfFromStageStderr, /Workflow mismatch/i);
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).run_id, sealedRunId);
+    assert.equal(JSON.parse(readFileSync(join(replayData, "run-meta.json"), "utf8")).workflow, "sw_dev");
+    {
+      const pmCheckDb = new Database(join(replayData, "uwf-stages.db"), { readonly: true });
+      const pmCount = pmCheckDb.prepare("SELECT COUNT(*) AS n FROM stage_runs WHERE workflow = 'project_manager'").get().n;
+      pmCheckDb.close();
+      assert.equal(pmCount, 0, "rejected cross-workflow --from-stage must not seed or execute stages under prior run");
+    }
+
+    // Intact run-meta.json without workflow must not adopt an unrelated run_id's workflow from state/stage DBs
+    const intactNoWfData = join(runRoot, "intact-no-wf-data");
+    cpSync(replayData, intactNoWfData, { recursive: true });
+    writeFileSync(
+      join(intactNoWfData, "run-meta.json"),
+      JSON.stringify({ run_id: "unrelated-intact-run", output_path: join(replayRepo, "tmp/workflow-artifacts") }, null, 2),
+    );
+    const repNoWf = ensureRunMeta(intactNoWfData, { workflow: "project_manager", repoRoot: replayRepo, persist: true });
+    assert.equal(repNoWf.run_id, "unrelated-intact-run");
+    assert.equal(repNoWf.workflow, "project_manager");
+
     const forceRotData = join(runRoot, "force-rotate-data");
     mkdirSync(forceRotData, { recursive: true });
     cpSync(replayData, forceRotData, { recursive: true });
+
     const forcedMeta = ensureRunMeta(forceRotData, {
       workflow: "sw_dev",
       runId: "forced-explicit-id",
