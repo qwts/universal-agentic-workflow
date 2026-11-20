@@ -55,6 +55,28 @@ const Database = loadDatabase();
 const FAKE_ANTHROPIC = "sk-ant-" + "api03-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
 const FAKE_GITHUB = "ghp_" + "Zy9Xw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe9Dc8";
 
+function markPendingStagesSkipped(targetDataDir, wf = "sw_dev") {
+  const sdb = new Database(join(targetDataDir, "uwf-stages.db"));
+  try {
+    sdb
+      .prepare(
+        "UPDATE stage_runs SET status = 'skipped', completed_at = COALESCE(completed_at, '2026-11-20T00:00:00Z'), outputs_json = COALESCE(outputs_json, '[]') WHERE workflow = ? AND status = 'pending'",
+      )
+      .run(wf);
+  } finally {
+    sdb.close();
+  }
+}
+
+function initAllSkippedStages(targetDataDir, targetRepo, wf = "sw_dev") {
+  execFileSync(
+    process.execPath,
+    [TRACKER_CLI, "init", "--workflow", wf, "--data-dir", targetDataDir, "--repo-root", targetRepo, "--skills-root", REPO_ROOT],
+    { encoding: "utf8", stdio: "pipe" },
+  );
+  markPendingStagesSkipped(targetDataDir, wf);
+}
+
 // ---------------------------------------------------------------------------
 // 1. RFC 8785 JCS Determinism + Non-NFC Decomposed Unicode Vectors
 // ---------------------------------------------------------------------------
@@ -224,24 +246,19 @@ try {
   }
 
   {
+    initAllSkippedStages(dataDir, root, "sw_dev");
     const db = new Database(join(dataDir, "uwf-stages.db"));
-    db.exec(`
-      CREATE TABLE stage_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
-        status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
-        started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
-      );
-    `);
-    const ins = db.prepare(`
-      INSERT INTO stage_runs (workflow, stage, status, retry_count, started_at, completed_at, gate_result, session_id, outputs_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const upd = db.prepare(`
+      UPDATE stage_runs
+      SET status = ?, retry_count = ?, started_at = ?, completed_at = ?, gate_result = ?, session_id = ?, outputs_json = ?
+      WHERE workflow = ? AND stage = ?
     `);
     const intakeDigest = { path: "artifacts/issues-intake.md", sha256: sha256Hex(readFileSync(intakePath)), bytes: readFileSync(intakePath).length };
-    ins.run("sw_dev", "intake", "passed", 0, "2026-11-19T12:01:00Z", "2026-11-19T12:02:00Z", JSON.stringify({ passed: true }), "sess-1", JSON.stringify([intakeDigest]));
-    ins.run("sw_dev", "security-plan", "skipped", 0, null, "2026-11-19T12:03:00Z", JSON.stringify({ passed: true, note: "conditional — not required" }), null, "[]");
-    ins.run("sw_dev", "blueprint", "passed", 0, "2026-11-19T12:04:00Z", "2026-11-19T12:05:00Z", JSON.stringify({ passed: true }), "sess-2", JSON.stringify([blueprintMdDigest, brPreDigest]));
-    ins.run("sw_dev", "snapshot", "passed", 0, "2026-11-19T12:20:00Z", "2026-11-19T12:25:00Z", JSON.stringify({ passed: true }), "sess-3", JSON.stringify([brPostDigest, drsDigest, changelogDigest]));
-    ins.run("sw_dev", "retro", "passed", 0, "2026-11-19T12:26:00Z", "2026-11-19T12:27:00Z", JSON.stringify({ passed: true }), "sess-4", JSON.stringify([retroDigest]));
+    upd.run("passed", 0, "2026-11-19T12:01:00Z", "2026-11-19T12:02:00Z", JSON.stringify({ passed: true }), "sess-1", JSON.stringify([intakeDigest]), "sw_dev", "intake");
+    upd.run("skipped", 0, null, "2026-11-19T12:03:00Z", JSON.stringify({ passed: true, note: "conditional — not required" }), null, "[]", "sw_dev", "security-plan");
+    upd.run("passed", 0, "2026-11-19T12:04:00Z", "2026-11-19T12:05:00Z", JSON.stringify({ passed: true }), "sess-2", JSON.stringify([blueprintMdDigest, brPreDigest]), "sw_dev", "blueprint");
+    upd.run("passed", 0, "2026-11-19T12:20:00Z", "2026-11-19T12:25:00Z", JSON.stringify({ passed: true }), "sess-3", JSON.stringify([brPostDigest, drsDigest, changelogDigest]), "sw_dev", "snapshot");
+    upd.run("passed", 0, "2026-11-19T12:26:00Z", "2026-11-19T12:27:00Z", JSON.stringify({ passed: true }), "sess-4", JSON.stringify([retroDigest]), "sw_dev", "retro");
     db.close();
   }
 
@@ -913,6 +930,7 @@ try {
       [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", dataSymlinkDomain, "--repo-root", rootScrub, "--skills-root", REPO_ROOT],
       { encoding: "utf8", env, stdio: "pipe" },
     );
+    markPendingStagesSkipped(dataSymlinkDomain, "sw_dev");
     symlinkSync(outsideDomainDb, join(dataSymlinkDomain, "uwf-requirements.db"));
     let symlinkDomainExit = 0;
     let symlinkDomainStderr = "";
@@ -967,6 +985,7 @@ try {
       [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", dataFsMon, "--repo-root", repoFsMon, "--skills-root", REPO_ROOT],
       { encoding: "utf8", env, stdio: "pipe" },
     );
+    markPendingStagesSkipped(dataFsMon, "sw_dev");
     const fsMonSeal = execFileSync(
       process.execPath,
       [PROVENANCE_CLI, "seal", "--data-dir", dataFsMon, "--workflow", "sw_dev", "--repo-root", repoFsMon],
@@ -1079,6 +1098,7 @@ try {
       [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", dataBareSeal, "--repo-root", localTarget, "--skills-root", REPO_ROOT],
       { encoding: "utf8", env, stdio: "pipe" },
     );
+    markPendingStagesSkipped(dataBareSeal, "sw_dev");
     const bareSealOut = execFileSync(
       process.execPath,
       [
@@ -1348,6 +1368,7 @@ try {
       [trackerCli, "stage-complete", "--workflow", "sw_dev", "--stage", "intake", "--data-dir", bracketData, "--skills-root", REPO_ROOT, "--repo-root", bracketRepo, "--output-path", bracketOutRel],
       { cwd: runRoot, encoding: "utf8", stdio: "pipe" },
     );
+    markPendingStagesSkipped(bracketData, "sw_dev");
     await materializeManifest({
       dataDir: bracketData,
       workflow: "sw_dev",
@@ -1489,6 +1510,7 @@ try {
       [TRACKER_CLI, "init", "--workflow", "sw_dev", "--data-dir", botRawData, "--repo-root", botRawRepo, "--skills-root", REPO_ROOT],
       { encoding: "utf8", env, stdio: "pipe" },
     );
+    markPendingStagesSkipped(botRawData, "sw_dev");
     execFileSync("git", ["-C", botRawRepo, "init", "-q"]);
     execFileSync("git", ["-C", botRawRepo, "config", "user.email", "test@example.com"]);
     execFileSync("git", ["-C", botRawRepo, "config", "user.name", "Test"]);
@@ -1583,18 +1605,14 @@ try {
     mkdirSync(ncRepo, { recursive: true });
     mkdirSync(join(ncData, "transcripts"), { recursive: true });
     {
+      initAllSkippedStages(ncData, ncRepo, "sw_dev");
       const sdb = new Database(join(ncData, "uwf-stages.db"));
-      sdb.exec(`
-        CREATE TABLE stage_runs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
-          status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
-          started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
-        );
-        INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
-          ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]'),
-          ('sw_dev', 'discovery', 'passed', '2026-11-20T00:00:03Z', '2026-11-20T00:00:04Z', '[]'),
-          ('sw_dev', 'review', 'passed', '2026-11-20T00:00:05Z', '2026-11-20T00:00:06Z', '[]');
-      `);
+      const upd = sdb.prepare(
+        "UPDATE stage_runs SET status = 'passed', started_at = ?, completed_at = ?, outputs_json = '[]' WHERE workflow = 'sw_dev' AND stage = ?",
+      );
+      upd.run("2026-11-20T00:00:01Z", "2026-11-20T00:00:02Z", "intake");
+      upd.run("2026-11-20T00:00:03Z", "2026-11-20T00:00:04Z", "discovery");
+      upd.run("2026-11-20T00:00:05Z", "2026-11-20T00:00:06Z", "review");
       sdb.close();
     }
     const codexTxPath = join(ncData, "transcripts", "2026-11-20T00-00-01-codex1.json");
@@ -1846,6 +1864,9 @@ try {
     const schemaMutators = [
       (m) => { m.stages = []; },
       (m) => { m.execution_audit.stages = []; },
+      (m) => { m.phase = "closed"; m.stages[0].status = "pending"; },
+      (m) => { m.phase = "closed"; m.stages[0].status = "active"; },
+      (m) => { m.phase = "sealed"; m.stages[0].status = "failed"; },
       (m) => { m.stores.requirements = {}; },
       (m) => { m.stores.adrs = { sha256: "a".repeat(64), total: 0, records: [{}] }; },
       (m) => { m.architecture.drs = { path: "x" }; },
@@ -1870,7 +1891,7 @@ try {
     cpSync(replayData, reuseData, { recursive: true });
     execFileSync(
       process.execPath,
-      [trackerCliPath, "init", "--workflow", "project_manager", "--data-dir", reuseData, "--repo-root", replayRepo],
+      [trackerCliPath, "init", "--workflow", "project_manager", "--data-dir", reuseData, "--repo-root", replayRepo, "--skills-root", REPO_ROOT],
       { encoding: "utf8", stdio: "pipe" },
     );
     execFileSync(
@@ -1912,7 +1933,7 @@ try {
     cpSync(reuseData, resumeOlderData, { recursive: true });
     execFileSync(
       process.execPath,
-      [trackerCliPath, "stage-start", "--workflow", "sw_dev", "--stage", "retro", "--data-dir", resumeOlderData, "--repo-root", replayRepo],
+      [trackerCliPath, "stage-start", "--workflow", "sw_dev", "--stage", "retro", "--data-dir", resumeOlderData, "--repo-root", replayRepo, "--skills-root", REPO_ROOT],
       { encoding: "utf8", stdio: "pipe" },
     );
     {
@@ -2590,17 +2611,13 @@ try {
     mkdirSync(legacyRepo, { recursive: true });
     mkdirSync(join(legacyData, "transcripts"), { recursive: true });
     {
+      initAllSkippedStages(legacyData, legacyRepo, "sw_dev");
       const sdb = new Database(join(legacyData, "uwf-stages.db"));
-      sdb.exec(`
-        CREATE TABLE stage_runs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
-          status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
-          started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
-        );
-        INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
-          ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]'),
-          ('sw_dev', 'review', 'passed', '2026-11-20T00:00:03Z', '2026-11-20T00:00:04Z', '[]');
-      `);
+      const upd = sdb.prepare(
+        "UPDATE stage_runs SET status = 'passed', started_at = ?, completed_at = ?, outputs_json = '[]' WHERE workflow = 'sw_dev' AND stage = ?",
+      );
+      upd.run("2026-11-20T00:00:01Z", "2026-11-20T00:00:02Z", "intake");
+      upd.run("2026-11-20T00:00:03Z", "2026-11-20T00:00:04Z", "review");
       sdb.close();
     }
     const legacyIntakeTx = join(legacyData, "transcripts", "2026-11-20T00-00-01-intake.json");
@@ -2736,16 +2753,11 @@ try {
       const symGoalData = join(runRoot, "sym-goal-data");
       mkdirSync(symGoalData, { recursive: true });
       {
+        initAllSkippedStages(symGoalData, readRepo, "sw_dev");
         const sdb = new Database(join(symGoalData, "uwf-stages.db"));
-        sdb.exec(`
-          CREATE TABLE stage_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
-            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
-            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
-          );
-          INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
-            ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]');
-        `);
+        sdb
+          .prepare("UPDATE stage_runs SET status = 'passed', started_at = ?, completed_at = ?, outputs_json = '[]' WHERE workflow = 'sw_dev' AND stage = 'intake'")
+          .run("2026-11-20T00:00:01Z", "2026-11-20T00:00:02Z");
         sdb.close();
       }
       symlinkSync(outsideSecret, join(symGoalData, "runner-goal.md"));
@@ -2784,16 +2796,11 @@ try {
       const symRunMetaData = join(runRoot, "sym-runmeta-data");
       mkdirSync(symRunMetaData, { recursive: true });
       {
+        initAllSkippedStages(symRunMetaData, readRepo, "sw_dev");
         const sdb = new Database(join(symRunMetaData, "uwf-stages.db"));
-        sdb.exec(`
-          CREATE TABLE stage_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
-            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
-            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
-          );
-          INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
-            ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]');
-        `);
+        sdb
+          .prepare("UPDATE stage_runs SET status = 'passed', started_at = ?, completed_at = ?, outputs_json = '[]' WHERE workflow = 'sw_dev' AND stage = 'intake'")
+          .run("2026-11-20T00:00:01Z", "2026-11-20T00:00:02Z");
         sdb.close();
       }
       writeFileAtomic(join(symRunMetaData, "uaw-manifest.json"), canonicalizeJcs({ schema_version: "1.0.0", run_id: "r1" }));
@@ -2872,16 +2879,11 @@ try {
       mkdirSync(txCapRepo, { recursive: true });
       mkdirSync(join(txCapData, "transcripts"), { recursive: true });
       {
+        initAllSkippedStages(txCapData, txCapRepo, "sw_dev");
         const sdb = new Database(join(txCapData, "uwf-stages.db"));
-        sdb.exec(`
-          CREATE TABLE stage_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
-            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
-            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
-          );
-          INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
-            ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]');
-        `);
+        sdb
+          .prepare("UPDATE stage_runs SET status = 'passed', started_at = ?, completed_at = ?, outputs_json = '[]' WHERE workflow = 'sw_dev' AND stage = 'intake'")
+          .run("2026-11-20T00:00:01Z", "2026-11-20T00:00:02Z");
         sdb.close();
       }
       writeFileSync(
@@ -3054,6 +3056,270 @@ try {
         () => captureStageOutputs(["{{cwd}}/docs/missing-dir/ADR-[0-9]*.md"], { outputPath: missOutDir, repoRoot: missOutRepo, skillsRoot: REPO_ROOT }),
         /matched no files/i,
       );
+    }
+
+    // 5f. Require complete configured workflow stage ledger AND reject nonterminal stages in closed/sealed manifests
+    {
+      const termRepo = join(runRoot, "term-stage-repo");
+      const termDataBase = join(runRoot, "term-stage-base");
+      mkdirSync(termRepo, { recursive: true });
+      execFileSync("git", ["-C", termRepo, "init", "-q"]);
+      execFileSync("git", ["-C", termRepo, "config", "user.email", "test@example.com"]);
+      execFileSync("git", ["-C", termRepo, "config", "user.name", "Test"]);
+      writeFileSync(join(termRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+      writeFileSync(join(termRepo, ".gitignore"), "tmp/\n");
+      execFileSync("git", ["-C", termRepo, "add", ".uwf.json", ".gitignore"]);
+      execFileSync("git", ["-C", termRepo, "commit", "-q", "-m", "init term repo"]);
+
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Terminal stage completeness", "--adapter", "fake", "--repo-root", termRepo, "--data-dir", termDataBase, "--defer-seal"],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" }, stdio: "pipe" },
+      );
+
+      // Missing configured stage row in nonempty uwf-stages.db fails closed across snapshot, closed, seal, CLI, and verifyManifest
+      const missingRowData = join(runRoot, "term-missing-row-data");
+      cpSync(termDataBase, missingRowData, { recursive: true });
+      {
+        const sdb = new Database(join(missingRowData, "uwf-stages.db"));
+        sdb.prepare("DELETE FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'security-plan'").run();
+        sdb.close();
+      }
+      assert.throws(
+        () => buildManifest({ dataDir: missingRowData, workflow: "sw_dev", repoRoot: termRepo, phase: "snapshot" }),
+        /missing configured stage\(s\).*security-plan/i,
+      );
+      assert.throws(
+        () => buildManifest({ dataDir: missingRowData, workflow: "sw_dev", repoRoot: termRepo, phase: "closed" }),
+        /missing configured stage\(s\).*security-plan/i,
+      );
+      await assert.rejects(
+        () => materializeManifest({ dataDir: missingRowData, workflow: "sw_dev", repoRoot: termRepo, phase: "closed", deferSeal: true, dispatchSink: false }),
+        /missing configured stage\(s\).*security-plan/i,
+      );
+      const missingRowSeal = await sealManifest({ dataDir: missingRowData, workflow: "sw_dev", repoRoot: termRepo });
+      assert.equal(missingRowSeal.ok, false);
+      assert.match(missingRowSeal.error ?? "", /missing configured stage\(s\).*security-plan/i);
+      const cliMissingRow = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", missingRowData, "--workflow", "sw_dev", "--repo-root", termRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(cliMissingRow.status, 1);
+      assert.match(cliMissingRow.stdout, /missing configured stage\(s\).*security-plan/i);
+
+      // Tampering on-disk uaw-manifest.json to omit a stage (with recomputed manifest_sha256) must also fail verifyManifest
+      const omittedManifest = JSON.parse(readFileSync(join(missingRowData, "uaw-manifest.json"), "utf8"));
+      omittedManifest.stages = omittedManifest.stages.filter((s) => s.stage !== "security-plan");
+      omittedManifest.execution_audit.stages = omittedManifest.execution_audit.stages.filter((s) => s.stage !== "security-plan");
+      const { execution_audit: _omEa, manifest_sha256: _omSha, ...omContent } = omittedManifest;
+      omittedManifest.manifest_sha256 = sha256Hex(canonicalizeJcs(omContent));
+      writeFileAtomic(join(missingRowData, "uaw-manifest.json"), canonicalizeJcs(omittedManifest));
+      const omittedVerify = verifyManifest({ dataDir: missingRowData, repoRoot: termRepo });
+      assert.equal(omittedVerify.ok, false);
+      assert.match(omittedVerify.errors.join("\n"), /missing configured stage\(s\).*security-plan/i);
+
+      // Duplicate stage row and unexpected stage row fail closed
+      const dupRowData = join(runRoot, "term-dup-row-data");
+      cpSync(termDataBase, dupRowData, { recursive: true });
+      {
+        const sdb = new Database(join(dupRowData, "uwf-stages.db"));
+        sdb.prepare(
+          "INSERT INTO stage_runs (workflow, stage, status, outputs_json) VALUES ('sw_dev', 'intake', 'passed', '[]')",
+        ).run();
+        sdb.close();
+      }
+      assert.throws(
+        () => buildManifest({ dataDir: dupRowData, workflow: "sw_dev", repoRoot: termRepo, phase: "closed" }),
+        /duplicate stage "intake"/i,
+      );
+
+      const extraRowData = join(runRoot, "term-extra-row-data");
+      cpSync(termDataBase, extraRowData, { recursive: true });
+      {
+        const sdb = new Database(join(extraRowData, "uwf-stages.db"));
+        sdb.prepare(
+          "INSERT INTO stage_runs (workflow, stage, status, outputs_json) VALUES ('sw_dev', 'rogue-stage', 'passed', '[]')",
+        ).run();
+        sdb.close();
+      }
+      assert.throws(
+        () => buildManifest({ dataDir: extraRowData, workflow: "sw_dev", repoRoot: termRepo, phase: "closed" }),
+        /unexpected stage "rogue-stage"/i,
+      );
+
+      // Nonterminal stage statuses (pending, active, failed) fail closed in closed/sealed manifests & block sink dispatch, while snapshot allows pending later rows
+      const termSinkEvents = [];
+      const termSinkServer = createServer((req, res) => {
+        const chunks = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          termSinkEvents.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      await new Promise((resolveListen) => termSinkServer.listen(0, "127.0.0.1", resolveListen));
+      try {
+        const termPort = termSinkServer.address().port;
+        const termSinkEnv = {
+          ...process.env,
+          UWF_FAKE_FIXTURE_DIR: fxDir,
+          UWF_DATA_DIR: "",
+          UAW_CONTEXT_HUB_SINK: "webhook",
+          UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${termPort}/webhook`,
+          UAW_CONTEXT_HUB_TOKEN: "tok",
+          UAW_CONTEXT_HUB_MODE: "strict",
+        };
+        for (const nonTermStatus of ["pending", "active", "failed"]) {
+          const nonTermData = join(runRoot, `term-status-${nonTermStatus}`);
+          cpSync(termDataBase, nonTermData, { recursive: true });
+          {
+            const sdb = new Database(join(nonTermData, "uwf-stages.db"));
+            sdb
+              .prepare("UPDATE stage_runs SET status = ?, outputs_json = '[]' WHERE workflow = 'sw_dev' AND stage = 'retro'")
+              .run(nonTermStatus);
+            sdb.close();
+          }
+          if (nonTermStatus === "pending") {
+            // Snapshot checkpoint legitimately permits later pending rows
+            const snapWithPending = await materializeManifest({
+              dataDir: nonTermData,
+              workflow: "sw_dev",
+              repoRoot: termRepo,
+              phase: "snapshot",
+              deferSeal: false,
+              dispatchSink: false,
+            });
+            assert.equal(snapWithPending.ok, true);
+            assert.equal(snapWithPending.manifest.stages.find((s) => s.stage === "retro")?.status, "pending");
+          }
+          assert.throws(
+            () => buildManifest({ dataDir: nonTermData, workflow: "sw_dev", repoRoot: termRepo, phase: "closed" }),
+            new RegExp(`nonterminal stage "retro" \\(status="${nonTermStatus}"\\)`),
+          );
+          await assert.rejects(
+            () =>
+              materializeManifest({
+                dataDir: nonTermData,
+                workflow: "sw_dev",
+                repoRoot: termRepo,
+                phase: "closed",
+                deferSeal: false,
+                dispatchSink: true,
+                sinkOptions: { env: termSinkEnv },
+              }),
+            new RegExp(`nonterminal stage "retro" \\(status="${nonTermStatus}"\\)`),
+          );
+          const sealNonTerm = await sealManifest({
+            dataDir: nonTermData,
+            workflow: "sw_dev",
+            repoRoot: termRepo,
+            sinkOptions: { env: termSinkEnv },
+          });
+          assert.equal(sealNonTerm.ok, false);
+          assert.match(sealNonTerm.error ?? "", new RegExp(`nonterminal stage "retro" \\(status="${nonTermStatus}"\\)`));
+
+          const cliCloseNonTerm = spawnSync(
+            process.execPath,
+            [PROVENANCE_CLI, "materialize", "--phase", "closed", "--data-dir", nonTermData, "--workflow", "sw_dev", "--repo-root", termRepo],
+            { encoding: "utf8", env: termSinkEnv },
+          );
+          assert.notEqual(cliCloseNonTerm.status, 0);
+          assert.match(cliCloseNonTerm.stderr ?? "", /nonterminal stage "retro"/i);
+
+          const cliSealNonTerm = spawnSync(
+            process.execPath,
+            [PROVENANCE_CLI, "seal", "--data-dir", nonTermData, "--workflow", "sw_dev", "--repo-root", termRepo],
+            { encoding: "utf8", env: termSinkEnv },
+          );
+          assert.equal(cliSealNonTerm.status, 1);
+          const cliSealNonTermJson = JSON.parse(cliSealNonTerm.stdout || "{}");
+          assert.equal(cliSealNonTermJson.ok, false);
+          assert.match(
+            cliSealNonTermJson.error ?? "",
+            new RegExp(`nonterminal stage "retro" \\(status="${nonTermStatus}"\\)`),
+          );
+        }
+        assert.equal(termSinkEvents.length, 0, "nonterminal stages must block run.finalized sink dispatch");
+      } finally {
+        await new Promise((resolveClose) => termSinkServer.close(resolveClose));
+      }
+
+      // Custom --skills-root is persisted in run-meta.json so subsequent provenance.mjs seal & verify resolve its custom stage list
+      const customSkillsRoot = join(runRoot, "custom-skills-root");
+      const customTargetRepo = join(runRoot, "custom-skills-target");
+      const customSkillsData = join(runRoot, "custom-skills-data");
+      cpSync(join(REPO_ROOT, ".github", "skills"), join(customSkillsRoot, ".github", "skills"), {
+        recursive: true,
+        filter: (src) => !src.split("/").includes("node_modules"),
+      });
+      cpSync(join(REPO_ROOT, ".github", "agents"), join(customSkillsRoot, ".github", "agents"), { recursive: true });
+      const customStagesYamlPath = join(customSkillsRoot, ".github", "skills", "uwf-sw_dev", "stages.yaml");
+      const customYaml = readFileSync(customStagesYamlPath, "utf8");
+      const updatedCustomYaml = customYaml.replace(
+        "  - name: retro\n    agent: uwf-core-retro\n",
+        "  - name: custom-extra\n    agent: uwf-core-retro\n    max_retries: 1\n    max_turns: 20\n    on_gate_failure: skip\n    run_as_subagent: true\n    inputs: []\n    outputs: []\n    gated: false\n  - name: retro\n    agent: uwf-core-retro\n",
+      );
+      assert.notEqual(updatedCustomYaml, customYaml, "custom-extra stage must be injected into custom stages.yaml");
+      writeFileSync(customStagesYamlPath, updatedCustomYaml);
+      const customFx = join(runRoot, "custom-skills-fx");
+      cpSync(fxDir, customFx, { recursive: true });
+      writeFileSync(join(customFx, "custom-extra.json"), JSON.stringify({ transcript: "custom extra stage done\n" }));
+      mkdirSync(customTargetRepo, { recursive: true });
+      execFileSync("git", ["-C", customTargetRepo, "init", "-q"]);
+      execFileSync("git", ["-C", customTargetRepo, "config", "user.email", "test@example.com"]);
+      execFileSync("git", ["-C", customTargetRepo, "config", "user.name", "Test"]);
+      writeFileSync(join(customTargetRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+      writeFileSync(join(customTargetRepo, ".gitignore"), "tmp/\n");
+      execFileSync("git", ["-C", customTargetRepo, "add", ".uwf.json", ".gitignore"]);
+      execFileSync("git", ["-C", customTargetRepo, "commit", "-q", "-m", "init custom repo"]);
+
+      const customRun = spawnSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Custom skills root", "--adapter", "fake", "--repo-root", customTargetRepo, "--skills-root", customSkillsRoot, "--data-dir", customSkillsData, "--defer-seal"],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: customFx, UWF_DATA_DIR: "" } },
+      );
+      assert.equal(customRun.status, 0, customRun.stderr || customRun.stdout);
+      const savedMeta = JSON.parse(readFileSync(join(customSkillsData, "run-meta.json"), "utf8"));
+      assert.equal(savedMeta.skills_root, resolve(customSkillsRoot));
+      const customSealCli = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", customSkillsData, "--workflow", "sw_dev", "--repo-root", customTargetRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(customSealCli.status, 0, customSealCli.stdout || customSealCli.stderr);
+      const customVerifyCli = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "verify", "--data-dir", customSkillsData, "--repo-root", customTargetRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(customVerifyCli.status, 0, customVerifyCli.stdout || customVerifyCli.stderr);
+      const customManifest = JSON.parse(readFileSync(join(customSkillsData, "uaw-manifest.json"), "utf8"));
+      assert.ok(customManifest.stages.some((s) => s.stage === "custom-extra"));
+
+      const forcedDefaultRun = spawnSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--force", "--workflow", "sw_dev", "--goal", "Reset to default skills root", "--adapter", "fake", "--repo-root", customTargetRepo, "--data-dir", customSkillsData, "--defer-seal"],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" } },
+      );
+      assert.equal(forcedDefaultRun.status, 0, forcedDefaultRun.stderr || forcedDefaultRun.stdout);
+      const resetMeta = JSON.parse(readFileSync(join(customSkillsData, "run-meta.json"), "utf8"));
+      assert.equal(resetMeta.skills_root, undefined, "--force run with default root must clear stale skills_root");
+      const resetSealCli = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", customSkillsData, "--workflow", "sw_dev", "--repo-root", customTargetRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(resetSealCli.status, 0, resetSealCli.stdout || resetSealCli.stderr);
+      const resetVerifyCli = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "verify", "--data-dir", customSkillsData, "--repo-root", customTargetRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(resetVerifyCli.status, 0, resetVerifyCli.stdout || resetVerifyCli.stderr);
+      const resetManifest = JSON.parse(readFileSync(join(customSkillsData, "uaw-manifest.json"), "utf8"));
+      assert.equal(resetManifest.stages.some((s) => s.stage === "custom-extra"), false);
     }
   } finally {
     rmSync(runRoot, { recursive: true, force: true });

@@ -480,7 +480,7 @@ async function main(argv) {
       start = stages.findIndex((st) => !isDone(tracked.find((x) => x.stage === st.name)?.status));
       if (start < 0) {
         if (needsFinalization(dataDir)) {
-          ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
+          ensureRunMeta(dataDir, { workflow, outputPath, skillsRoot, repoRoot });
           const n = note("runner resume: retrying pending provenance finalization");
           if (!n.ok) log(`[runner] note not recorded: ${n.error}`);
           return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows: tableRows(tracked), note, log });
@@ -488,7 +488,7 @@ async function main(argv) {
         process.stdout.write(formatTable(tableRows(tracked)));
         return EXIT.OK;
       }
-      ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
+      ensureRunMeta(dataDir, { workflow, outputPath, skillsRoot, repoRoot });
       const status = tracked.find((x) => x.stage === stages[start].name)?.status;
       const reason = status === "active" || status === "failed" ? status : "pending";
       // A failed stage restarts with retries reset (resume is an explicit human action).
@@ -510,7 +510,7 @@ async function main(argv) {
         if (priorTracked.length && stages.every((st) => isDone(priorTracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
           if (needsFinalization(dataDir)) {
             const finalOutputPath = flags["output-path"] ?? readRecordedOutputPath(dataDir, cli) ?? outputPath;
-            ensureRunMeta(dataDir, { workflow, outputPath: finalOutputPath, repoRoot });
+            ensureRunMeta(dataDir, { workflow, outputPath: finalOutputPath, skillsRoot, repoRoot });
             log("[runner] all stages complete; retrying pending provenance finalization");
             return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath: finalOutputPath, deferSeal, rows: tableRows(priorTracked), note, log });
           }
@@ -534,6 +534,7 @@ async function main(argv) {
         const meta = ensureRunMeta(dataDir, {
           workflow,
           outputPath,
+          skillsRoot,
           repoRoot,
           forceNew: flags.force === true || hadPriorRun,
         });
@@ -548,7 +549,7 @@ async function main(argv) {
         const qr = cli(QUESTIONS, ["reset"]);
         if (!qr.ok) log(`[runner] questions reset not applied: ${qr.error}`);
       } else {
-        ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
+        ensureRunMeta(dataDir, { workflow, outputPath, skillsRoot, repoRoot });
         resetFrom(start);
         rollbackPhase(start);
       }

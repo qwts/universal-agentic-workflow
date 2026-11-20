@@ -42,6 +42,27 @@
       }
     }
   },
+  "if": {
+    "properties": {
+      "phase": {
+        "enum": ["closed", "sealed"]
+      }
+    },
+    "required": ["phase"]
+  },
+  "then": {
+    "properties": {
+      "stages": {
+        "items": {
+          "properties": {
+            "status": {
+              "enum": ["passed", "skipped"]
+            }
+          }
+        }
+      }
+    }
+  },
   "properties": {
     "schema_version": {
       "const": "1.0.0"

@@ -324,7 +324,7 @@ function recoverPersistedRunIdentity(absDataDir) {
  */
 export function ensureRunMeta(
   dataDir,
-  { workflow = null, outputPath = null, runId = null, baseCommitSha = null, repoRoot = null, forceNew = false, persist = true } = {}
+  { workflow = null, outputPath = null, skillsRoot = null, runId = null, baseCommitSha = null, repoRoot = null, forceNew = false, persist = true } = {}
 ) {
   const absDataDir = resolve(dataDir);
   try {
@@ -366,6 +366,7 @@ export function ensureRunMeta(
   }
 
   const explicitRunId = runId || process.env.UAW_RUN_ID || null;
+  const customSkillsRoot = skillsRoot && resolve(skillsRoot) !== OWN_ROOT ? resolve(skillsRoot) : null;
   if (!forceNew && existing) {
     if (explicitRunId && existing.run_id !== explicitRunId) {
       throw new Error(
@@ -392,6 +393,7 @@ export function ensureRunMeta(
       dirty = true;
     }
     if (!existing.output_path && outputPath) { existing.output_path = outputPath; dirty = true; }
+    if (customSkillsRoot && existing.skills_root !== customSkillsRoot) { existing.skills_root = customSkillsRoot; dirty = true; }
     if (!existing.base_commit_sha) {
       const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
       if (resolvedBase) { existing.base_commit_sha = resolvedBase; dirty = true; }
@@ -416,6 +418,7 @@ export function ensureRunMeta(
         workflow: recoveredWorkflow,
         output_path: outputPath ?? recovered.outputPath ?? join(absDataDir, "workflow-artifacts"),
         created_at: new Date().toISOString(),
+        ...(customSkillsRoot ? { skills_root: customSkillsRoot } : {}),
         ...(recoveredBase ? { base_commit_sha: recoveredBase } : {}),
       };
       if (persist) {
@@ -442,7 +445,7 @@ export function ensureRunMeta(
     ? {
         ...(existing.data_dir ? { data_dir: existing.data_dir } : {}),
         ...(existing.repo_root ? { repo_root: existing.repo_root } : {}),
-        ...(existing.skills_root ? { skills_root: existing.skills_root } : {}),
+        ...(!forceNew && existing.skills_root ? { skills_root: existing.skills_root } : {}),
       }
     : {};
   const meta = {
@@ -451,6 +454,7 @@ export function ensureRunMeta(
     workflow: defaultWorkflow,
     output_path: outputPath ?? join(absDataDir, "workflow-artifacts"),
     created_at: new Date().toISOString(),
+    ...(customSkillsRoot ? { skills_root: customSkillsRoot } : {}),
     ...(resolvedBase ? { base_commit_sha: resolvedBase } : {}),
     ...(priorTranscripts.length ? { prior_transcripts: priorTranscripts } : {}),
   };
@@ -1534,25 +1538,81 @@ function assertSafeIdentifierSegment(value, label) {
   return s;
 }
 
-function resolveArtifactPrefix(workflow, skillsRoot, repoRoot) {
+function effectiveSkillsRoot(explicitSkillsRoot, persistedSkillsRoot = null) {
+  if (explicitSkillsRoot) return explicitSkillsRoot;
+  const envSkillsRoot =
+    typeof process.env.UWF_SKILLS_ROOT === "string" && process.env.UWF_SKILLS_ROOT.trim()
+      ? process.env.UWF_SKILLS_ROOT.trim()
+      : null;
+  if (envSkillsRoot) return envSkillsRoot;
+  return persistedSkillsRoot ?? null;
+}
+
+function resolveWorkflowDefinition(workflow, skillsRoot, repoRoot) {
   const safeWorkflow = assertSafeIdentifierSegment(workflow, "workflow");
-  const yaml = loadYamlLib();
-  const candidates = [
-    skillsRoot ? join(skillsRoot, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml") : null,
-    join(repoRoot, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml"),
-    join(SKILLS_DIR, `uwf-${safeWorkflow}`, "stages.yaml"),
-  ].filter(Boolean);
-  for (const p of candidates) {
-    if (existsSync(p)) {
-      try {
-        const doc = yaml.load(readFileSync(p, "utf8"));
-        if (doc?.artifact_prefix) {
-          return assertSafeIdentifierSegment(doc.artifact_prefix, "artifact_prefix");
-        }
-      } catch { /* try next */ }
+  const envSkillsRoot =
+    typeof process.env.UWF_SKILLS_ROOT === "string" && process.env.UWF_SKILLS_ROOT.trim()
+      ? process.env.UWF_SKILLS_ROOT.trim()
+      : null;
+  const absRepo = repoRoot ? resolve(repoRoot) : OWN_ROOT;
+  let rootBase;
+  let yamlPath;
+  if (skillsRoot) {
+    rootBase = resolve(skillsRoot);
+    yamlPath = join(rootBase, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml");
+  } else if (envSkillsRoot) {
+    rootBase = resolve(envSkillsRoot);
+    yamlPath = join(rootBase, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml");
+  } else {
+    const repoCandidate = join(absRepo, ".github", "skills", `uwf-${safeWorkflow}`, "stages.yaml");
+    let useRepoCandidate = false;
+    try {
+      lstatSync(repoCandidate);
+      useRepoCandidate = true;
+    } catch (err) {
+      if (err.code !== "ENOENT" && err.code !== "ENOTDIR") {
+        useRepoCandidate = true;
+      }
+    }
+    if (useRepoCandidate) {
+      rootBase = absRepo;
+      yamlPath = repoCandidate;
+    } else {
+      rootBase = OWN_ROOT;
+      yamlPath = join(SKILLS_DIR, `uwf-${safeWorkflow}`, "stages.yaml");
     }
   }
-  return "issues";
+  const realRootBase = existsSync(rootBase) ? realpathSync(rootBase) : rootBase;
+  let rawBuf;
+  try {
+    rawBuf = readRegularFileNoFollow(yamlPath, "Workflow definition", {
+      maxBytes: MAX_DATA_FILE_BYTES,
+      allowedRealRoots: [realRootBase],
+    });
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      throw new Error(`Workflow definition not found for "${safeWorkflow}" at ${yamlPath}`);
+    }
+    throw err;
+  }
+  const doc = loadYamlLib().load(rawBuf.toString("utf8"));
+  if (!isPlainObject(doc) || !Array.isArray(doc.stages) || doc.stages.length === 0) {
+    throw new Error(`Invalid workflow definition at ${yamlPath}: expected non-empty stages array`);
+  }
+  const configuredStages = [];
+  const seenStages = new Set();
+  for (const entry of doc.stages) {
+    const name = assertSafeIdentifierSegment(entry?.name, "stage");
+    if (seenStages.has(name)) {
+      throw new Error(`Duplicate stage "${name}" in workflow definition at ${yamlPath}`);
+    }
+    seenStages.add(name);
+    configuredStages.push(name);
+  }
+  const artifactPrefix = doc.artifact_prefix
+    ? assertSafeIdentifierSegment(doc.artifact_prefix, "artifact_prefix")
+    : "issues";
+  return { yamlPath, configuredStages, artifactPrefix };
 }
 
 function resolveContainedRegularFile(absOut, realOut, relName) {
@@ -1761,6 +1821,8 @@ const SUPPORTED_SCHEMA_KEYWORDS = new Set([
   "additionalProperties",
   "minItems",
   "items",
+  "if",
+  "then",
 ]);
 
 function validateAgainstSchema(val, rawSchema, rootSchema, ptr, errs) {
@@ -1843,6 +1905,14 @@ function validateAgainstSchema(val, rawSchema, rootSchema, ptr, errs) {
       val.forEach((item, i) => {
         validateAgainstSchema(item, schema.items, rootSchema, `${ptr}/${i}`, errs);
       });
+    }
+  }
+
+  if (schema.if && schema.then) {
+    const condErrs = [];
+    validateAgainstSchema(val, schema.if, rootSchema, ptr, condErrs);
+    if (condErrs.length === 0) {
+      validateAgainstSchema(val, schema.then, rootSchema, ptr, errs);
     }
   }
 }
@@ -2159,6 +2229,9 @@ export function buildManifest({
   maxTranscriptBytes = MAX_STAGE_OUTPUT_BYTES,
   now = new Date().toISOString(),
 }) {
+  if (phase !== "snapshot" && phase !== "closed" && phase !== "sealed") {
+    throw new Error(`Invalid manifest phase "${phase}"`);
+  }
   const Database = loadDatabaseCtor();
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
@@ -2212,6 +2285,7 @@ export function buildManifest({
   const meta = ensureRunMeta(absDataDir, {
     workflow: effectiveWorkflow,
     outputPath: outputPath ?? existingMeta?.output_path ?? stateArtifactPath ?? null,
+    skillsRoot,
     runId: phase === "sealed" && existingMeta?.run_id ? existingMeta.run_id : null,
     repoRoot: absRepoRoot,
     baseCommitSha: deliverableOverrides.base_commit_sha ?? null,
@@ -2221,7 +2295,7 @@ export function buildManifest({
   const resolvedWorkflow = workflow ?? meta.workflow ?? "sw_dev";
   const resolvedOutputPath =
     outputPath ?? meta.output_path ?? stateArtifactPath ?? join(absDataDir, "workflow-artifacts");
-  const resolvedSkillsRoot = skillsRoot ?? meta.skills_root ?? null;
+  const resolvedSkillsRoot = effectiveSkillsRoot(skillsRoot, meta.skills_root);
   const startedAt = firstHistTs ?? meta.created_at ?? null;
 
   let goalSha256 = null;
@@ -2246,6 +2320,8 @@ export function buildManifest({
       `Stage ledger not found at ${stagesChecked.path}; cannot build ${phase} manifest without stage history`,
     );
   }
+  let configuredStages;
+  let artifactPrefix;
   try {
     if (!tableExists(stagesDb, "stage_runs")) {
       throw new Error(`Stage ledger missing stage_runs table at ${stagesChecked.path}`);
@@ -2256,7 +2332,36 @@ export function buildManifest({
         `Stage ledger has no stage_runs records for workflow "${resolvedWorkflow}" at ${stagesChecked.path}`,
       );
     }
+    ({ configuredStages, artifactPrefix } = resolveWorkflowDefinition(resolvedWorkflow, resolvedSkillsRoot, absRepoRoot));
+    const configuredSet = new Set(configuredStages);
+    const rowByStage = new Map();
     for (const row of rows) {
+      if (typeof row.stage !== "string" || !configuredSet.has(row.stage)) {
+        throw new Error(
+          `Stage ledger has unexpected stage "${row.stage}" for workflow "${resolvedWorkflow}" at ${stagesChecked.path}`,
+        );
+      }
+      if (rowByStage.has(row.stage)) {
+        throw new Error(
+          `Stage ledger has duplicate stage "${row.stage}" for workflow "${resolvedWorkflow}" at ${stagesChecked.path}`,
+        );
+      }
+      rowByStage.set(row.stage, row);
+    }
+    const missingStages = configuredStages.filter((name) => !rowByStage.has(name));
+    if (missingStages.length > 0) {
+      throw new Error(
+        `Stage ledger is missing configured stage(s) for workflow "${resolvedWorkflow}" at ${stagesChecked.path}: ${missingStages.join(", ")}`,
+      );
+    }
+    const isTerminalManifest = phase === "closed" || phase === "sealed";
+    for (const stageName of configuredStages) {
+      const row = rowByStage.get(stageName);
+      if (isTerminalManifest && row.status !== "passed" && row.status !== "skipped") {
+        throw new Error(
+          `Cannot build ${phase} manifest with nonterminal stage "${row.stage}" (status="${row.status}") for workflow "${resolvedWorkflow}"`,
+        );
+      }
       if (row.stage === "blueprint" && row.status === "passed") blueprintRan = true;
       const outputs = parseStageOutputsJson(row.outputs_json, row.stage, row.status);
       stages.push({
@@ -2289,7 +2394,6 @@ export function buildManifest({
     cbs: readCbsStore(Database, absDataDir, absRepoRoot, blueprintRan),
   };
 
-  const artifactPrefix = resolveArtifactPrefix(resolvedWorkflow, resolvedSkillsRoot, absRepoRoot);
   const architecture = readArchitectureStrata({
     outputPath: resolvedOutputPath,
     repoRoot: absRepoRoot,
@@ -2603,7 +2707,7 @@ function verifyManifestFileIntegrity(manifestPath, absDataDir = dirname(manifest
 /**
  * Verify `<data-dir>/uaw-manifest.json` integrity and un-superseded stage output digests on disk.
  */
-export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
+export function verifyManifest({ dataDir, repoRoot = OWN_ROOT, skillsRoot = null }) {
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
   const manifestPath = join(absDataDir, MANIFEST_FILE);
@@ -2614,6 +2718,47 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
 
   const outCheck = verifyManifestStageOutputs(manifest, { dataDir: absDataDir, repoRoot: absRepoRoot });
   errors.push(...outCheck.errors);
+
+  if (isPlainObject(manifest) && typeof manifest.workflow === "string" && Array.isArray(manifest.stages)) {
+    try {
+      const meta = readExistingRunMeta(absDataDir);
+      const { configuredStages } = resolveWorkflowDefinition(
+        manifest.workflow,
+        effectiveSkillsRoot(skillsRoot, meta?.skills_root),
+        absRepoRoot,
+      );
+      const configuredSet = new Set(configuredStages);
+      const seenStages = new Set();
+      for (const st of manifest.stages) {
+        const name = st?.stage;
+        if (typeof name !== "string" || !configuredSet.has(name)) {
+          errors.push(`Manifest has unexpected stage "${name}" for workflow "${manifest.workflow}"`);
+          continue;
+        }
+        if (seenStages.has(name)) {
+          errors.push(`Manifest has duplicate stage "${name}" for workflow "${manifest.workflow}"`);
+          continue;
+        }
+        seenStages.add(name);
+      }
+      const missingStages = configuredStages.filter((name) => !seenStages.has(name));
+      if (missingStages.length > 0) {
+        errors.push(`Manifest is missing configured stage(s) for workflow "${manifest.workflow}": ${missingStages.join(", ")}`);
+      }
+      if (Array.isArray(manifest.execution_audit?.stages)) {
+        const auditNames = manifest.execution_audit.stages.map((s) => s?.stage);
+        const manifestNames = manifest.stages.map((s) => s?.stage);
+        if (
+          auditNames.length !== manifestNames.length ||
+          auditNames.some((n, idx) => n !== manifestNames[idx])
+        ) {
+          errors.push(`Manifest execution_audit.stages does not match stages for workflow "${manifest.workflow}"`);
+        }
+      }
+    } catch (err) {
+      if (!errors.includes(err.message)) errors.push(err.message);
+    }
+  }
 
   return {
     ok: errors.length === 0,
@@ -3102,7 +3247,7 @@ export async function scrubProvenanceOutputs({
       dataDir: absDataDir,
       workflow: effectiveWorkflow,
       repoRoot: absRepoRoot,
-      skillsRoot: skillsRoot ?? existingMeta?.skills_root ?? null,
+      skillsRoot: effectiveSkillsRoot(skillsRoot, existingMeta?.skills_root),
       outputPath: rawOut,
       phase: prevManifest.phase,
       deferSeal: true,
@@ -3183,7 +3328,7 @@ async function runCliMain(argv) {
   }
   const workflow = flags.workflow ?? null;
   const repoRoot = flags["repo-root"] ?? process.cwd();
-  const skillsRoot = flags["skills-root"] ?? process.env.UWF_SKILLS_ROOT ?? null;
+  const skillsRoot = flags["skills-root"] ?? null;
   const outputPath = flags["output-path"] ?? null;
 
   if (command === "read") {
@@ -3198,7 +3343,7 @@ async function runCliMain(argv) {
   }
 
   if (command === "verify") {
-    const res = verifyManifest({ dataDir, repoRoot });
+    const res = verifyManifest({ dataDir, repoRoot, skillsRoot });
     process.stdout.write(JSON.stringify(res, null, 2) + "\n");
     return res.ok ? 0 : 1;
   }
