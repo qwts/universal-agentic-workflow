@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import {
   buildManifest,
   canonicalizeJcs,
+  captureStageOutputs,
+  computeIdempotencyKey,
   computeWorktreeTreeSha,
   materializeManifest,
   resolveDeliverableKey,
@@ -21,6 +23,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
 const SCHEMA_PATH = join(REPO_ROOT, "schemas", "uaw-manifest.schema.json");
 const PROVENANCE_CLI = join(REPO_ROOT, "scripts", "uwf-runner", "provenance.mjs");
+const RUNNER_CLI = join(REPO_ROOT, "scripts", "uwf-runner", "runner.mjs");
 
 // Resolve better-sqlite3 the same way provenance.mjs does.
 function loadDatabase() {
@@ -418,6 +421,106 @@ try {
     cliExit = err.status;
   }
   assert.equal(cliExit, 1, "provenance.mjs verify must exit 1 on unexpected post-stage artifact mutation");
+
+  // Step G: stage.completed (phase=snapshot) uses snapshot outputs[] digest for dedup_tuple.sha256
+  const sentEnvelopes = [];
+  const snapRes = await materializeManifest({
+    dataDir,
+    workflow: "sw_dev",
+    repoRoot: root,
+    outputPath,
+    phase: "snapshot",
+    deferSeal: false,
+    dispatchSink: true,
+    sinkOptions: {
+      env: { UAW_CONTEXT_HUB_SINK: "mcp", UAW_CONTEXT_HUB_MODE: "strict" },
+      mcpClient: {
+        callTool: async (_name, args) => {
+          sentEnvelopes.push(args);
+          return { result: { content: [{ type: "text", text: "ok" }] } };
+        },
+      },
+    },
+  });
+  assert.equal(snapRes.ok, true);
+  assert.equal(sentEnvelopes.length, 1);
+  const env0 = sentEnvelopes[0];
+  const snapOutputs = snapRes.manifest.stages.find((s) => s.stage === "snapshot")?.outputs ?? [];
+  const expectedStageSha = sha256Hex(canonicalizeJcs(snapOutputs));
+  assert.equal(env0.event, "stage.completed");
+  assert.equal(env0.dedup_tuple.sha256, expectedStageSha);
+  assert.notEqual(env0.dedup_tuple.sha256, snapRes.manifestSha256);
+  assert.equal(env0.idempotency_key, computeIdempotencyKey(snapRes.manifest.run_id, "snapshot", expectedStageSha));
+
+  // Step H: Globbing handles regex metacharacters cleanly without throwing
+  const globOutDir = join(root, "out+dir(v1)[$]");
+  mkdirSync(globOutDir, { recursive: true });
+  writeFileSync(join(globOutDir, "ADR-0001+foo(1)$x.md"), "# ADR\n");
+  writeFileSync(join(globOutDir, "ADR-0002+bar.txt"), "skip");
+  const globCaptured = captureStageOutputs(["{{output_path}}/ADR-*.md"], {
+    outputPath: globOutDir,
+    repoRoot: root,
+    skillsRoot: root,
+  });
+  assert.equal(globCaptured.length, 1);
+  assert.equal(globCaptured[0].path, "out+dir(v1)[$]/ADR-0001+foo(1)$x.md");
+
+  // verifyManifest rejects escaping paths and symlinks
+  const escapingManifest = JSON.parse(JSON.stringify(snapRes.manifest));
+  escapingManifest.stages[0].outputs.push({ path: "/etc/hosts", sha256: "a".repeat(64), bytes: 1 });
+  const { execution_audit: _a2, manifest_sha256: _s2, ...escContent } = escapingManifest;
+  escapingManifest.manifest_sha256 = sha256Hex(canonicalizeJcs(escContent));
+  writeFileSync(join(dataDir, "uaw-manifest.json"), canonicalizeJcs(escapingManifest));
+  const vEscape = verifyManifest({ dataDir, repoRoot: root });
+  assert.equal(vEscape.ok, false);
+  assert.ok(vEscape.errors.some((e) => /escapes allowed roots/.test(e)));
+
+  // Step I: runner.mjs run --force mints new run_id & preserves prior run_manifests; manifest write error exits 1
+  const runRoot = mkdtempSync(join(tmpdir(), "uaw-prov-runner-"));
+  try {
+    writeFileSync(join(runRoot, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const fxDir = join(HERE, "fixtures", "sw_dev");
+    const runData = join(runRoot, "run-data");
+    const env = { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" };
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "First run", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData, "--defer-seal"],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const meta1 = JSON.parse(readFileSync(join(runData, "run-meta.json"), "utf8"));
+
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Forced rerun", "--force", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData, "--defer-seal"],
+      { encoding: "utf8", env, stdio: "pipe" },
+    );
+    const meta2 = JSON.parse(readFileSync(join(runData, "run-meta.json"), "utf8"));
+    assert.notEqual(meta2.run_id, meta1.run_id, "runner.mjs run --force must mint a new run_id");
+
+    const stDb = new Database(join(runData, "uwf-state.db"), { readonly: true });
+    const manifestRows = stDb.prepare("SELECT run_id FROM run_manifests").all();
+    const wsRow = stDb.prepare("SELECT run_id FROM workflow_state WHERE id = 1").get();
+    stDb.close();
+    assert.equal(wsRow.run_id, meta2.run_id, "workflow_state.run_id must reflect new run_id");
+    assert.equal(manifestRows.length, 2, "both runs must remain recorded in run_manifests");
+
+    // Force materializeManifest failure during runner.mjs completion by blocking uaw-manifest.json with a directory on --from-stage
+    rmSync(join(runData, "uaw-manifest.json"), { force: true });
+    mkdirSync(join(runData, "uaw-manifest.json"));
+    let failExit = 0;
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--from-stage", "retro", "--goal", "Fail manifest", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData, "--defer-seal"],
+        { encoding: "utf8", env, stdio: "pipe" },
+      );
+    } catch (err) {
+      failExit = err.status;
+    }
+    assert.equal(failExit, 1, "runner.mjs must exit 1 (EXIT.GATE), not 0, when materializeManifest fails");
+  } finally {
+    rmSync(runRoot, { recursive: true, force: true });
+  }
 
   console.log("provenance tests passed");
 } finally {

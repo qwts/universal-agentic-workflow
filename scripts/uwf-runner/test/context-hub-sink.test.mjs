@@ -93,6 +93,35 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
         res.end("internal error");
         return;
       }
+      if (req.url === "/mcp-rpc-error") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", error: { code: -32603, message: "hub down" } }));
+        return;
+      }
+      if (req.url === "/mcp-is-error") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: "1",
+          result: { isError: true, content: [{ type: "text", text: "rejected manifest" }] },
+        }));
+        return;
+      }
+      if (req.url === "/mcp-bad-json") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end("not-json");
+        return;
+      }
+      if (req.url === "/mcp-no-result") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ unrelated: 1 }));
+        return;
+      }
+      if (req.url === "/redirect-http") {
+        res.writeHead(302, { Location: "http://example.com/hook" });
+        res.end();
+        return;
+      }
       const key = req.headers["idempotency-key"];
       const sig = req.headers["x-uaw-signature-256"];
       received.push({ url: req.url, key, sig, auth: req.headers["authorization"], body });
@@ -100,6 +129,11 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
         dedupStore.set(key, body);
       }
       res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/mcp") {
+        const rpcReq = JSON.parse(body);
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, result: { ok: true, deduplicated: dedupStore.size } }));
+        return;
+      }
       res.end(JSON.stringify({ ok: true, deduplicated: dedupStore.size }));
     });
   });
@@ -156,6 +190,7 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
     });
     assert.equal(bestEffortFail.ok, false);
     assert.equal(bestEffortFail.status, "failed");
+    assert.equal(bestEffortFail.attempts, 2);
     assert.equal(bestEffortFail.exitCode, 0, "best_effort must not fail the run");
     assert.ok(logs.length > 0 && !logs.join("\n").includes(HUB_SECRET));
 
@@ -172,6 +207,7 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
     });
     assert.equal(strictFail.ok, false);
     assert.equal(strictFail.status, "failed");
+    assert.equal(strictFail.attempts, 2);
     assert.equal(strictFail.exitCode, 1, "strict mode must return exit code 1 (GATE)");
 
     const mcpHttpRes = await dispatchToContextHub(baseEnvelope, {
@@ -205,6 +241,83 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
     assert.equal(mcpCalls.length, 1);
     assert.equal(mcpCalls[0].name, "context_hub.ingest_manifest");
     assert.equal(mcpCalls[0].args.idempotency_key, expectedKey);
+
+    // 4. Webhook without UAW_CONTEXT_HUB_TOKEN must fail closed without sending an unsigned payload
+    const prevReceivedCount = received.length;
+    const unsignedStrict = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook-flaky`,
+        UAW_CONTEXT_HUB_MODE: "strict",
+      },
+      baseDelayMs: 5,
+      log: () => {},
+    });
+    assert.equal(unsignedStrict.ok, false);
+    assert.equal(unsignedStrict.status, "failed");
+    assert.equal(unsignedStrict.exitCode, 1);
+    assert.equal(unsignedStrict.attempts, 0);
+    assert.match(unsignedStrict.error, /UAW_CONTEXT_HUB_TOKEN is required/);
+    assert.equal(received.length, prevReceivedCount, "no unsigned webhook request may be transmitted");
+
+    const unsignedBestEffort = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook-flaky`,
+        UAW_CONTEXT_HUB_MODE: "best_effort",
+      },
+      baseDelayMs: 5,
+      log: () => {},
+    });
+    assert.equal(unsignedBestEffort.ok, false);
+    assert.equal(unsignedBestEffort.status, "failed");
+    assert.equal(unsignedBestEffort.exitCode, 0);
+
+    // 5. Invalid UAW_CONTEXT_HUB_MODE must fail closed
+    const badMode = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "webhook",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook-flaky`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "strict_typo",
+      },
+      log: () => {},
+    });
+    assert.equal(badMode.ok, false);
+    assert.equal(badMode.exitCode, 1);
+    assert.match(badMode.error, /Unknown UAW_CONTEXT_HUB_MODE/);
+
+    // 6. MCP HTTP 200 JSON-RPC error, result.isError=true, missing result, invalid JSON, redirect, and mcpClient isError=true must fail closed
+    for (const ep of ["/mcp-rpc-error", "/mcp-is-error", "/mcp-no-result", "/mcp-bad-json", "/redirect-http"]) {
+      const rFail = await dispatchToContextHub(baseEnvelope, {
+        env: {
+          UAW_CONTEXT_HUB_SINK: ep === "/redirect-http" ? "webhook" : "mcp",
+          UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}${ep}`,
+          UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+          UAW_CONTEXT_HUB_MODE: "strict",
+        },
+        maxAttempts: 2,
+        baseDelayMs: 5,
+        log: () => {},
+      });
+      assert.equal(rFail.ok, false, `expected failure for ${ep}`);
+      assert.equal(rFail.status, "failed");
+      assert.equal(rFail.exitCode, 1);
+    }
+
+    const mcpClientIsError = await dispatchToContextHub(baseEnvelope, {
+      env: { UAW_CONTEXT_HUB_SINK: "mcp", UAW_CONTEXT_HUB_MODE: "strict" },
+      mcpClient: {
+        callTool: async () => ({ isError: true, content: [{ type: "text", text: "ingest rejected" }] }),
+      },
+      maxAttempts: 2,
+      baseDelayMs: 5,
+      log: () => {},
+    });
+    assert.equal(mcpClientIsError.ok, false);
+    assert.equal(mcpClientIsError.status, "failed");
+    assert.equal(mcpClientIsError.exitCode, 1);
+    assert.match(mcpClientIsError.error, /isError=true/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

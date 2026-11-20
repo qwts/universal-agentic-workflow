@@ -26,6 +26,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -92,32 +93,74 @@ function loadYamlLib() {
 // Durable Run Metadata (<data-dir>/run-meta.json)
 // ---------------------------------------------------------------------------
 
+function resolveHeadSha(repoRoot) {
+  if (!repoRoot || !isGitRepo(repoRoot)) return null;
+  try {
+    return gitExec(repoRoot, ["rev-parse", "HEAD"]).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read or initialize `<data-dir>/run-meta.json` so `run_id` stays durable across
- * resume, replay, and post-commit seal invocations.
+ * resume, replay, and post-commit seal invocations, and rotates cleanly on forced fresh runs.
  */
-export function ensureRunMeta(dataDir, { workflow = "sw_dev", outputPath = null, runId = null, baseCommitSha = null } = {}) {
+export function ensureRunMeta(
+  dataDir,
+  { workflow = "sw_dev", outputPath = null, runId = null, baseCommitSha = null, repoRoot = null, forceNew = false } = {}
+) {
   mkdirSync(dataDir, { recursive: true });
   const metaPath = join(dataDir, RUN_META_FILE);
+  let existing = null;
   if (existsSync(metaPath)) {
     try {
-      const existing = JSON.parse(readFileSync(metaPath, "utf8"));
-      if (existing && typeof existing.run_id === "string" && existing.run_id.length > 0) {
-        let dirty = false;
-        if (!existing.workflow && workflow) { existing.workflow = workflow; dirty = true; }
-        if (!existing.output_path && outputPath) { existing.output_path = outputPath; dirty = true; }
-        if (!existing.base_commit_sha && baseCommitSha) { existing.base_commit_sha = baseCommitSha; dirty = true; }
-        if (dirty) writeFileSync(metaPath, JSON.stringify(existing, null, 2) + "\n");
-        return existing;
-      }
+      const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+      if (parsed && typeof parsed === "object") existing = parsed;
     } catch { /* fall through and recreate */ }
   }
+
+  const explicitRunId = runId || process.env.UAW_RUN_ID || null;
+  if (
+    !forceNew &&
+    existing &&
+    typeof existing.run_id === "string" &&
+    existing.run_id.length > 0 &&
+    (!explicitRunId || existing.run_id === explicitRunId)
+  ) {
+    let dirty = false;
+    if (!existing.workflow && workflow) { existing.workflow = workflow; dirty = true; }
+    if (!existing.output_path && outputPath) { existing.output_path = outputPath; dirty = true; }
+    if (!existing.base_commit_sha) {
+      const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
+      if (resolvedBase) { existing.base_commit_sha = resolvedBase; dirty = true; }
+    }
+    if (dirty) writeFileSync(metaPath, JSON.stringify(existing, null, 2) + "\n");
+    return existing;
+  }
+
+  const resolvedBase = baseCommitSha ?? resolveHeadSha(repoRoot);
+  const explicitChanged = Boolean(explicitRunId && existing?.run_id && existing.run_id !== explicitRunId);
+  const priorTranscripts = (forceNew || explicitChanged)
+    ? listTranscripts(dataDir).map((f) => basename(f))
+    : Array.isArray(existing?.prior_transcripts)
+      ? existing.prior_transcripts
+      : [];
+  const preservedPointers = existing
+    ? {
+        ...(existing.data_dir ? { data_dir: existing.data_dir } : {}),
+        ...(existing.repo_root ? { repo_root: existing.repo_root } : {}),
+        ...(existing.skills_root ? { skills_root: existing.skills_root } : {}),
+      }
+    : {};
   const meta = {
-    run_id: runId || `${workflow}-${randomUUID()}`,
+    ...preservedPointers,
+    run_id: explicitRunId || `${workflow}-${randomUUID()}`,
     workflow,
     output_path: outputPath ?? join(dataDir, "workflow-artifacts"),
     created_at: new Date().toISOString(),
-    ...(baseCommitSha ? { base_commit_sha: baseCommitSha } : {}),
+    ...(resolvedBase ? { base_commit_sha: resolvedBase } : {}),
+    ...(priorTranscripts.length ? { prior_transcripts: priorTranscripts } : {}),
   };
   writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
   return meta;
@@ -334,36 +377,86 @@ export function resolveDeliverableKey(deliverable, runId) {
 // Stage Output Digest Capture
 // ---------------------------------------------------------------------------
 
-function globToRegex(globPattern) {
-  let re = "^";
-  for (let i = 0; i < globPattern.length; i++) {
-    const ch = globPattern[i];
+function compileGlobSegment(pattern) {
+  const tokens = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
     if (ch === "*") {
-      re += "[^/]*";
+      tokens.push({ type: "star" });
     } else if (ch === "?") {
-      re += "[^/]";
+      tokens.push({ type: "any" });
     } else if (ch === "[") {
-      const end = globPattern.indexOf("]", i + 1);
-      if (end !== -1) {
-        re += globPattern.slice(i, end + 1);
-        i = end;
+      const close = pattern.indexOf("]", i + 1);
+      if (close === -1) {
+        tokens.push({ type: "lit", ch: "[" });
       } else {
-        re += "\\[";
+        let body = pattern.slice(i + 1, close);
+        let negate = false;
+        if (body.startsWith("!") || body.startsWith("^")) {
+          negate = true;
+          body = body.slice(1);
+        }
+        const ranges = [];
+        for (let k = 0; k < body.length; k++) {
+          if (k + 2 < body.length && body[k + 1] === "-") {
+            const a = body.charCodeAt(k);
+            const b = body.charCodeAt(k + 2);
+            ranges.push([Math.min(a, b), Math.max(a, b)]);
+            k += 2;
+          } else {
+            const c = body.charCodeAt(k);
+            ranges.push([c, c]);
+          }
+        }
+        tokens.push({ type: "class", negate, ranges });
+        i = close;
       }
-    } else if (".+^${}()|\\".includes(ch)) {
-      re += "\\" + ch;
     } else {
-      re += ch;
+      tokens.push({ type: "lit", ch });
     }
   }
-  return new RegExp(re + "$");
+  return tokens;
+}
+
+function matchGlobSegment(pattern, name) {
+  const tokens = compileGlobSegment(pattern);
+  const n = name.length;
+  let dp = new Uint8Array(n + 1);
+  dp[0] = 1;
+  for (const tok of tokens) {
+    const next = new Uint8Array(n + 1);
+    if (tok.type === "star") {
+      let matched = false;
+      for (let j = 0; j <= n; j++) {
+        if (dp[j]) matched = true;
+        if (matched) next[j] = 1;
+        if (j < n && name.charCodeAt(j) === 47) matched = false;
+      }
+    } else {
+      for (let j = 0; j < n; j++) {
+        if (!dp[j]) continue;
+        const code = name.charCodeAt(j);
+        if (code === 47) continue;
+        if (tok.type === "any") {
+          next[j + 1] = 1;
+        } else if (tok.type === "lit") {
+          if (name[j] === tok.ch) next[j + 1] = 1;
+        } else if (tok.type === "class") {
+          const inRange = tok.ranges.some(([lo, hi]) => code >= lo && code <= hi);
+          if (tok.negate ? !inRange : inRange) next[j + 1] = 1;
+        }
+      }
+    }
+    dp = next;
+  }
+  return dp[n] === 1;
 }
 
 function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
   const expanded = String(template)
-    .replace(/\{\{output_path\}\}/g, outputPath)
-    .replace(/\{\{cwd\}\}/g, repoRoot)
-    .replace(/\{\{skills_root\}\}/g, skillsRoot ?? repoRoot);
+    .replace(/\{\{output_path\}\}/g, () => outputPath)
+    .replace(/\{\{cwd\}\}/g, () => repoRoot)
+    .replace(/\{\{skills_root\}\}/g, () => skillsRoot ?? repoRoot);
 
   const absPattern = isAbsolute(expanded) ? expanded : resolve(repoRoot, expanded);
   if (!/[*?[\]]/.test(absPattern)) {
@@ -372,10 +465,9 @@ function expandOutputTemplate(template, { outputPath, repoRoot, skillsRoot }) {
   const dir = dirname(absPattern);
   const basePattern = basename(absPattern);
   if (!existsSync(dir)) return [];
-  const regex = globToRegex(basePattern);
   const matches = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isFile() && regex.test(entry.name)) {
+    if (entry.isFile() && !entry.isSymbolicLink() && matchGlobSegment(basePattern, entry.name)) {
       matches.push(join(dir, entry.name));
     }
   }
@@ -407,7 +499,7 @@ export function captureStageOutputs(stageOutputs, { outputPath, repoRoot, skills
   for (const tmpl of stageOutputs ?? []) {
     for (const absPath of expandOutputTemplate(tmpl, { outputPath, repoRoot, skillsRoot })) {
       try {
-        const st = statSync(absPath);
+        const st = lstatSync(absPath);
         if (!st.isFile()) continue;
         const entry = hashFileEntry(absPath, repoRoot);
         seen.set(entry.path, entry);
@@ -423,12 +515,15 @@ export function captureStageOutputs(stageOutputs, { outputPath, repoRoot, skills
 
 function openReadOnly(Database, dbPath) {
   if (!dbPath || !existsSync(dbPath)) return null;
+  let db;
   try {
-    const db = new Database(dbPath, { readonly: true });
+    db = new Database(dbPath, { readonly: true });
     db.pragma("query_only = ON");
+    db.prepare("SELECT count(*) FROM sqlite_master").get();
     return db;
-  } catch {
-    return null;
+  } catch (err) {
+    try { db?.close(); } catch { /* ignore */ }
+    throw new Error(`Failed to open SQLite store at ${dbPath}: ${err.message}`);
   }
 }
 
@@ -449,9 +544,28 @@ function safeAll(db, sql, ...params) {
   }
 }
 
+function bumpCount(obj, key) {
+  const cur = Object.hasOwn(obj, key) ? obj[key] : 0;
+  Object.defineProperty(obj, key, { value: cur + 1, enumerable: true, configurable: true, writable: true });
+}
+
+function pushToArrayProp(obj, key, val) {
+  if (!Object.hasOwn(obj, key)) {
+    Object.defineProperty(obj, key, { value: [], enumerable: true, configurable: true, writable: true });
+  }
+  obj[key].push(val);
+}
+
+function isInsideOrEqual(candidate, parentDir) {
+  const rel = relative(resolve(parentDir), resolve(candidate));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
 function resolveDomainDb(dataDir, skillDirName, dbFileName, repoRoot) {
-  const inDataDir = join(dataDir, dbFileName);
-  if (existsSync(inDataDir)) return inDataDir;
+  if (dataDir) {
+    const inDataDir = join(dataDir, dbFileName);
+    return existsSync(inDataDir) ? inDataDir : null;
+  }
   if (repoRoot) {
     const inRepoSkill = join(repoRoot, ".github", "skills", skillDirName, dbFileName);
     if (existsSync(inRepoSkill)) return inRepoSkill;
@@ -470,12 +584,11 @@ function readRequirementsStore(Database, dataDir, repoRoot) {
     const byPrefix = { FR: [], NFR: [], DR: [], AC: [], RK: [] };
     for (const r of rows) {
       const st = String(r.status ?? "unknown");
-      byStatus[st] = (byStatus[st] ?? 0) + 1;
+      bumpCount(byStatus, st);
       const num = String(r.number ?? "");
       const m = num.match(/^([A-Z]+)-/);
       const prefix = m ? m[1] : String(r.type ?? "OTHER").toUpperCase();
-      if (!byPrefix[prefix]) byPrefix[prefix] = [];
-      byPrefix[prefix].push(num || String(r.id));
+      pushToArrayProp(byPrefix, prefix, num || String(r.id));
     }
     for (const k of Object.keys(byPrefix)) {
       byPrefix[k].sort(compareUtf16);
@@ -498,13 +611,20 @@ function readAdrsStore(Database, dataDir, repoRoot) {
   try {
     if (!tableExists(db, "adrs")) return null;
     const rows = scrubDeep(safeAll(db, "SELECT * FROM adrs ORDER BY number ASC, id ASC"));
+    const realRepo = repoRoot && existsSync(repoRoot) ? realpathSync(repoRoot) : null;
+    const realData = dataDir && existsSync(dataDir) ? realpathSync(dataDir) : null;
     const records = rows.map((r) => {
       let fileSha = null;
-      if (r.file_path) {
-        const abs = isAbsolute(r.file_path) ? r.file_path : resolve(repoRoot, r.file_path);
-        if (existsSync(abs) && statSync(abs).isFile()) {
-          fileSha = sha256Hex(readFileSync(abs));
-        }
+      if (r.file_path && typeof r.file_path === "string") {
+        const abs = isAbsolute(r.file_path) ? resolve(r.file_path) : resolve(repoRoot, r.file_path);
+        try {
+          if (existsSync(abs) && lstatSync(abs).isFile()) {
+            const realAbs = realpathSync(abs);
+            if ((realRepo && isInsideOrEqual(realAbs, realRepo)) || (realData && isInsideOrEqual(realAbs, realData))) {
+              fileSha = sha256Hex(readFileSync(realAbs));
+            }
+          }
+        } catch { /* ignore unreadable or escaping ADR path */ }
       }
       return {
         number: String(r.number ?? ""),
@@ -536,7 +656,7 @@ function readDiscoveriesStore(Database, dataDir, repoRoot) {
     const unresolvedGapIds = [];
     for (const r of rows) {
       const cat = String(r.category ?? "unknown");
-      byCategory[cat] = (byCategory[cat] ?? 0) + 1;
+      bumpCount(byCategory, cat);
       if (cat === "gap" && r.status !== "resolved" && r.status !== "closed") {
         unresolvedGapIds.push(Number(r.id));
       }
@@ -571,8 +691,10 @@ function readReviewsStore(Database, dataDir, repoRoot) {
     for (const f of findings) {
       const sev = String(f.severity ?? "major");
       const st = String(f.status ?? "open");
-      if (!findingsBySeverity[sev]) findingsBySeverity[sev] = {};
-      findingsBySeverity[sev][st] = (findingsBySeverity[sev][st] ?? 0) + 1;
+      if (!Object.hasOwn(findingsBySeverity, sev)) {
+        Object.defineProperty(findingsBySeverity, sev, { value: {}, enumerable: true, configurable: true, writable: true });
+      }
+      bumpCount(findingsBySeverity[sev], st);
     }
     return {
       sha256: sha256Hex(canonicalizeJcs({ reviews, findings })),
@@ -595,7 +717,7 @@ function readIssuesStore(Database, dataDir, repoRoot) {
     const byStatus = {};
     for (const r of rows) {
       const st = String(r.status ?? "open");
-      byStatus[st] = (byStatus[st] ?? 0) + 1;
+      bumpCount(byStatus, st);
     }
     return {
       sha256: sha256Hex(canonicalizeJcs(rows)),
@@ -617,7 +739,7 @@ function readQuestionsStore(Database, dataDir, repoRoot) {
     const byStatus = {};
     for (const r of rows) {
       const st = String(r.status ?? "pending");
-      byStatus[st] = (byStatus[st] ?? 0) + 1;
+      bumpCount(byStatus, st);
     }
     return {
       sha256: sha256Hex(canonicalizeJcs(rows)),
@@ -630,14 +752,14 @@ function readQuestionsStore(Database, dataDir, repoRoot) {
 }
 
 /**
- * Canonical Build Spec store: `.github/skills/uwf-cbs/uwf-cbs.db` (or `<data-dir>/uwf-cbs.db`).
+ * Canonical Build Spec store: `<data-dir>/uwf-cbs.db` or `.github/skills/uwf-cbs/uwf-cbs.db`.
  * Returns `null` when `blueprint` did not run or the DB does not exist.
  */
 function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
   if (!blueprintRan) return null;
   const candidates = [
-    join(repoRoot, ".github", "skills", "uwf-cbs", "uwf-cbs.db"),
     join(dataDir, "uwf-cbs.db"),
+    join(repoRoot, ".github", "skills", "uwf-cbs", "uwf-cbs.db"),
   ];
   const dbPath = candidates.find((p) => existsSync(p)) ?? null;
   const db = openReadOnly(Database, dbPath);
@@ -664,8 +786,8 @@ function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
     for (const c of constraints) {
       const sev = String(c.severity ?? "medium");
       const st = String(c.status ?? "open");
-      constraintsBySeverity[sev] = (constraintsBySeverity[sev] ?? 0) + 1;
-      constraintsByStatus[st] = (constraintsByStatus[st] ?? 0) + 1;
+      bumpCount(constraintsBySeverity, sev);
+      bumpCount(constraintsByStatus, st);
     }
 
     const canonicalPayload = { components, interfaces, dependencies, sequencing, constraints };
@@ -760,11 +882,16 @@ function readArchitectureStrata({ outputPath, repoRoot, artifactPrefix }) {
       const srcStrata = parsed.strata && typeof parsed.strata === "object" ? parsed.strata : {};
       for (const key of Object.keys(srcStrata).sort(compareUtf16)) {
         const s = srcStrata[key] ?? {};
-        strataOut[key] = {
-          label: s.label ?? null,
-          entry_count: Array.isArray(s.entries) ? s.entries.length : 0,
-          closed_at: s.closed_at ?? null,
-        };
+        Object.defineProperty(strataOut, key, {
+          value: {
+            label: s.label ?? null,
+            entry_count: Array.isArray(s.entries) ? s.entries.length : 0,
+            closed_at: s.closed_at ?? null,
+          },
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
       }
       br = {
         path: normalizeArtifactPath(brAbs, repoRoot),
@@ -965,6 +1092,12 @@ function upsertRunManifest(Database, dataDir, { runId, workflow, phase, manifest
         sink_status = excluded.sink_status,
         finalized_at = excluded.finalized_at
     `).run(runId, workflow, phase, manifestSha256, deliverableKey, manifestJson, sinkStatus, finalizedAt);
+    if (tableExists(db, "workflow_state")) {
+      const cols = db.prepare("PRAGMA table_info(workflow_state)").all().map((c) => c.name);
+      if (cols.includes("run_id")) {
+        db.prepare("UPDATE workflow_state SET run_id = ? WHERE id = 1 AND (run_id IS NULL OR run_id = '')").run(runId);
+      }
+    }
   } finally {
     db.close();
   }
@@ -985,7 +1118,8 @@ function extractGateVerdict(status, gateResultJson) {
   return status === "passed" ? "passed" : null;
 }
 
-function collectTranscriptTelemetry(dataDir) {
+function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
+  const skip = new Set(Array.isArray(priorTranscripts) ? priorTranscripts : []);
   const perStage = new Map();
   const costSummary = {
     turns: 0,
@@ -996,6 +1130,7 @@ function collectTranscriptTelemetry(dataDir) {
     cost_usd: 0,
   };
   for (const f of listTranscripts(dataDir).sort(compareUtf16)) {
+    if (skip.has(basename(f))) continue;
     let raw;
     try { raw = readFileSync(f); } catch { continue; }
     const digest = sha256Hex(raw);
@@ -1052,6 +1187,7 @@ export function buildManifest({
   const meta = ensureRunMeta(absDataDir, {
     workflow,
     outputPath: resolvedOutputPath,
+    repoRoot: absRepoRoot,
     baseCommitSha: deliverableOverrides.base_commit_sha ?? null,
   });
   const runId = meta.run_id;
@@ -1084,7 +1220,7 @@ export function buildManifest({
   const stages = [];
   const auditStages = [];
   const roundTrips = readRoundTrips(absDataDir);
-  const { perStage: transcriptDigests, costSummary } = collectTranscriptTelemetry(absDataDir);
+  const { perStage: transcriptDigests, costSummary } = collectTranscriptTelemetry(absDataDir, meta.prior_transcripts);
   let blueprintRan = false;
 
   const stagesDb = openReadOnly(Database, join(absDataDir, "uwf-stages.db"));
@@ -1250,12 +1386,19 @@ export async function materializeManifest({
 
   let sinkResult = { ok: true, status: deferSeal ? "deferred" : "disabled", exitCode: 0 };
   if (dispatchSink && !deferSeal) {
+    const isStageEvent = phase === "snapshot";
+    const snapStage = isStageEvent
+      ? (built.manifest.stages ?? []).find((s) => s.stage === "snapshot")
+      : null;
+    const eventSha256 = isStageEvent
+      ? sha256Hex(canonicalizeJcs(snapStage?.outputs ?? []))
+      : built.manifestSha256;
     const envelope = buildSinkEnvelope({
-      event: phase === "snapshot" ? "stage.completed" : "run.finalized",
+      event: isStageEvent ? "stage.completed" : "run.finalized",
       runId: built.runId,
       workflow,
-      stage: phase === "snapshot" ? "snapshot" : phase === "sealed" ? "seal" : "retro",
-      sha256: built.manifestSha256,
+      stage: isStageEvent ? "snapshot" : phase === "sealed" ? "seal" : "retro",
+      sha256: eventSha256,
       deliverableKey: built.deliverableKey,
       payload: built.manifest,
     });
@@ -1327,13 +1470,39 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
     }
   }
 
+  const meta = (() => {
+    try { return JSON.parse(readFileSync(join(absDataDir, RUN_META_FILE), "utf8")); } catch { return null; }
+  })();
+  const realRepo = existsSync(absRepoRoot) ? realpathSync(absRepoRoot) : absRepoRoot;
+  const realData = existsSync(absDataDir) ? realpathSync(absDataDir) : absDataDir;
+  const metaOut = meta?.output_path
+    ? (isAbsolute(meta.output_path) ? resolve(meta.output_path) : resolve(absRepoRoot, meta.output_path))
+    : null;
+  const realMetaOut = metaOut && existsSync(metaOut) ? realpathSync(metaOut) : metaOut;
+
   for (const [relPath, expected] of latestByPath.entries()) {
-    const abs = isAbsolute(relPath) ? relPath : resolve(absRepoRoot, relPath);
-    if (!existsSync(abs)) {
+    const abs = isAbsolute(relPath) ? resolve(relPath) : resolve(absRepoRoot, relPath);
+    if (!isInsideOrEqual(abs, absRepoRoot) && !isInsideOrEqual(abs, absDataDir) && !(metaOut && isInsideOrEqual(abs, metaOut))) {
+      errors.push(`Stage "${expected.stage}" output escapes allowed roots: ${relPath}`);
+      continue;
+    }
+    let lst;
+    try {
+      lst = lstatSync(abs);
+    } catch {
       errors.push(`Stage "${expected.stage}" output missing on disk: ${relPath}`);
       continue;
     }
-    const buf = readFileSync(abs);
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      errors.push(`Stage "${expected.stage}" output must be a regular file (not symlink): ${relPath}`);
+      continue;
+    }
+    const realAbs = realpathSync(abs);
+    if (!isInsideOrEqual(realAbs, realRepo) && !isInsideOrEqual(realAbs, realData) && !(realMetaOut && isInsideOrEqual(realAbs, realMetaOut))) {
+      errors.push(`Stage "${expected.stage}" output escapes allowed roots: ${relPath}`);
+      continue;
+    }
+    const buf = readFileSync(realAbs);
     const actualSha = sha256Hex(buf);
     if (actualSha !== expected.sha256 || buf.length !== expected.bytes) {
       errors.push(

@@ -36,7 +36,7 @@
 
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { readFileSync, existsSync, statSync, readdirSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, lstatSync, statSync, readdirSync, unlinkSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -569,20 +569,79 @@ function compareUtf16(a, b) {
   return a.length - b.length;
 }
 
-function globToRegex(globPattern) {
-  let re = "^";
-  for (let i = 0; i < globPattern.length; i++) {
-    const ch = globPattern[i];
-    if (ch === "*") re += "[^/]*";
-    else if (ch === "?") re += "[^/]";
-    else if (ch === "[") {
-      const end = globPattern.indexOf("]", i + 1);
-      if (end !== -1) { re += globPattern.slice(i, end + 1); i = end; }
-      else re += "\\[";
-    } else if (".+^${}()|\\".includes(ch)) re += "\\" + ch;
-    else re += ch;
+function compileGlobSegment(pattern) {
+  const tokens = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      tokens.push({ type: "star" });
+    } else if (ch === "?") {
+      tokens.push({ type: "any" });
+    } else if (ch === "[") {
+      const close = pattern.indexOf("]", i + 1);
+      if (close === -1) {
+        tokens.push({ type: "lit", ch: "[" });
+      } else {
+        let body = pattern.slice(i + 1, close);
+        let negate = false;
+        if (body.startsWith("!") || body.startsWith("^")) {
+          negate = true;
+          body = body.slice(1);
+        }
+        const ranges = [];
+        for (let k = 0; k < body.length; k++) {
+          if (k + 2 < body.length && body[k + 1] === "-") {
+            const a = body.charCodeAt(k);
+            const b = body.charCodeAt(k + 2);
+            ranges.push([Math.min(a, b), Math.max(a, b)]);
+            k += 2;
+          } else {
+            const c = body.charCodeAt(k);
+            ranges.push([c, c]);
+          }
+        }
+        tokens.push({ type: "class", negate, ranges });
+        i = close;
+      }
+    } else {
+      tokens.push({ type: "lit", ch });
+    }
   }
-  return new RegExp(re + "$");
+  return tokens;
+}
+
+function matchGlobSegment(pattern, name) {
+  const tokens = compileGlobSegment(pattern);
+  const n = name.length;
+  let dp = new Uint8Array(n + 1);
+  dp[0] = 1;
+  for (const tok of tokens) {
+    const next = new Uint8Array(n + 1);
+    if (tok.type === "star") {
+      let matched = false;
+      for (let j = 0; j <= n; j++) {
+        if (dp[j]) matched = true;
+        if (matched) next[j] = 1;
+        if (j < n && name.charCodeAt(j) === 47) matched = false;
+      }
+    } else {
+      for (let j = 0; j < n; j++) {
+        if (!dp[j]) continue;
+        const code = name.charCodeAt(j);
+        if (code === 47) continue;
+        if (tok.type === "any") {
+          next[j + 1] = 1;
+        } else if (tok.type === "lit") {
+          if (name[j] === tok.ch) next[j + 1] = 1;
+        } else if (tok.type === "class") {
+          const inRange = tok.ranges.some(([lo, hi]) => code >= lo && code <= hi);
+          if (tok.negate ? !inRange : inRange) next[j + 1] = 1;
+        }
+      }
+    }
+    dp = next;
+  }
+  return dp[n] === 1;
 }
 
 function captureStageOutputsJson(stageDef) {
@@ -594,10 +653,12 @@ function captureStageOutputsJson(stageDef) {
     let paths = [];
     if (/[*?[\]]/.test(absPattern)) {
       const dir = dirname(absPattern);
+      const basePattern = basename(absPattern);
       if (existsSync(dir)) {
-        const rx = globToRegex(basename(absPattern));
         for (const e of readdirSync(dir, { withFileTypes: true })) {
-          if (e.isFile() && rx.test(e.name)) paths.push(join(dir, e.name));
+          if (e.isFile() && !e.isSymbolicLink() && matchGlobSegment(basePattern, e.name)) {
+            paths.push(join(dir, e.name));
+          }
         }
       }
     } else if (existsSync(absPattern)) {
@@ -605,7 +666,7 @@ function captureStageOutputsJson(stageDef) {
     }
     for (const abs of paths) {
       try {
-        if (!statSync(abs).isFile()) continue;
+        if (!lstatSync(abs).isFile()) continue;
         const buf = readFileSync(abs);
         const rel = relative(cwd, abs);
         const normPath = (rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : abs).split(sep).join("/");

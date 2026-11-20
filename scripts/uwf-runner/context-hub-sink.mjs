@@ -91,7 +91,12 @@ export function scrubDeep(value) {
   if (value !== null && typeof value === "object") {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = scrubDeep(v);
+      Object.defineProperty(out, k, {
+        value: scrubDeep(v),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
     return out;
   }
@@ -106,12 +111,11 @@ export function readSinkConfig(env = process.env) {
   const rawSink = String(env.UAW_CONTEXT_HUB_SINK ?? "none").trim().toLowerCase() || "none";
   const sink = VALID_SINKS.has(rawSink) ? rawSink : rawSink;
   const rawMode = String(env.UAW_CONTEXT_HUB_MODE ?? "best_effort").trim().toLowerCase() || "best_effort";
-  const mode = VALID_MODES.has(rawMode) ? rawMode : "best_effort";
   return {
     sink,
     url: String(env.UAW_CONTEXT_HUB_URL ?? "").trim(),
     token: String(env.UAW_CONTEXT_HUB_TOKEN ?? ""),
-    mode,
+    mode: rawMode,
   };
 }
 
@@ -189,6 +193,78 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function validateMcpPayload(parsed, token, { requireJsonRpcResult = false } = {}) {
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("MCP sink returned non-object JSON payload");
+  }
+  if (parsed.error) {
+    const code = parsed.error.code ?? "unknown";
+    const msg = parsed.error.message ?? JSON.stringify(parsed.error);
+    const err = new Error(sanitizeError(`MCP JSON-RPC error (${code}): ${msg}`, token));
+    if (typeof code === "number" && code >= -32602 && code <= -32600) err.noRetry = true;
+    throw err;
+  }
+  if (requireJsonRpcResult && (!Object.hasOwn(parsed, "result") || parsed.result === null || typeof parsed.result !== "object")) {
+    throw new Error("MCP JSON-RPC response missing result object");
+  }
+  const toolResult = parsed.result !== undefined ? parsed.result : parsed;
+  if (toolResult && typeof toolResult === "object") {
+    if (toolResult.error) {
+      const msg = toolResult.error.message ?? JSON.stringify(toolResult.error);
+      throw new Error(sanitizeError(`MCP tool error: ${msg}`, token));
+    }
+    if (toolResult.isError === true) {
+      const textPart = Array.isArray(toolResult.content)
+        ? toolResult.content.map((c) => c?.text ?? "").filter(Boolean).join(" ")
+        : "";
+      const err = new Error(sanitizeError(`MCP tool returned isError=true${textPart ? `: ${textPart}` : ""}`, token));
+      err.noRetry = true;
+      throw err;
+    }
+    if (toolResult.ok === false) {
+      throw new Error(sanitizeError(`MCP sink reported ok=false: ${toolResult.error ?? "rejected"}`, token));
+    }
+  }
+  return toolResult;
+}
+
+async function parseMcpHttpResponse(res, token) {
+  const contentType = String(res.headers?.get?.("content-type") ?? "").toLowerCase();
+  let parsed;
+  if (typeof res.text === "function") {
+    const rawText = (await res.text()).trim();
+    if (!rawText) {
+      throw new Error("Empty response body from MCP sink");
+    }
+    if (contentType.includes("text/event-stream") || /^(?:event:|data:)/m.test(rawText)) {
+      const dataLines = rawText
+        .split(/\r?\n/)
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trim())
+        .filter(Boolean);
+      if (dataLines.length === 0) {
+        throw new Error("Empty SSE stream response from MCP sink");
+      }
+      try {
+        parsed = JSON.parse(dataLines[dataLines.length - 1]);
+      } catch {
+        throw new Error("Invalid JSON in MCP SSE response");
+      }
+    } else {
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        throw new Error("Invalid JSON response from MCP sink");
+      }
+    }
+  } else if (typeof res.json === "function") {
+    parsed = await res.json();
+  } else {
+    throw new Error("Unreadable response object from MCP sink");
+  }
+  return validateMcpPayload(parsed, token, { requireJsonRpcResult: true });
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -207,12 +283,28 @@ export async function dispatchToContextHub(
     mcpClient = null,
     maxAttempts = 3,
     baseDelayMs = 150,
+    timeoutMs = 15_000,
     log = (msg) => process.stderr.write(msg + "\n"),
   } = {}
 ) {
   const cfg = readSinkConfig(env);
-  const strict = cfg.mode === "strict";
   const idempotencyKey = envelope.idempotency_key;
+
+  if (!VALID_MODES.has(cfg.mode)) {
+    const error = `Unknown UAW_CONTEXT_HUB_MODE "${cfg.mode}" (expected best_effort|strict)`;
+    log(`[context-hub-sink] ${error}`);
+    return {
+      ok: false,
+      status: "failed",
+      idempotency_key: idempotencyKey,
+      attempts: 0,
+      strict: true,
+      exitCode: 1,
+      error,
+    };
+  }
+
+  const strict = cfg.mode === "strict";
 
   // Zero-overhead no-op default: make zero network calls when unset or "none".
   if (cfg.sink === "none") {
@@ -250,9 +342,13 @@ export async function dispatchToContextHub(
   try {
     if (cfg.sink === "mcp" && mcpClient && typeof mcpClient.callTool === "function") {
       // Direct injectable MCP client (local or in-process transport).
-      for (attempts = 1; attempts <= maxAttempts; attempts++) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        attempts = attempt;
         try {
           const result = await mcpClient.callTool("context_hub.ingest_manifest", scrubbedEnvelope);
+          if (result !== undefined && result !== null) {
+            validateMcpPayload(result, cfg.token);
+          }
           return {
             ok: true,
             status: "delivered",
@@ -264,7 +360,8 @@ export async function dispatchToContextHub(
           };
         } catch (err) {
           lastError = sanitizeError(err, cfg.token);
-          if (attempts < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempts - 1));
+          if (err?.noRetry) break;
+          if (attempt < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempt - 1));
         }
       }
     } else {
@@ -280,9 +377,10 @@ export async function dispatchToContextHub(
 
       let bodyToSend = canonicalBody;
       if (cfg.sink === "webhook") {
-        if (cfg.token) {
-          headers["X-UAW-Signature-256"] = signWebhookPayload(canonicalBody, cfg.token);
+        if (!cfg.token || !cfg.token.trim()) {
+          throw new Error("UAW_CONTEXT_HUB_TOKEN is required when UAW_CONTEXT_HUB_SINK=webhook");
         }
+        headers["X-UAW-Signature-256"] = signWebhookPayload(canonicalBody, cfg.token);
       } else if (cfg.sink === "mcp") {
         if (cfg.token) {
           headers["Authorization"] = `Bearer ${cfg.token}`;
@@ -298,14 +396,21 @@ export async function dispatchToContextHub(
         });
       }
 
-      for (attempts = 1; attempts <= maxAttempts; attempts++) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        attempts = attempt;
         try {
           const res = await fetchImpl(targetUrl, {
             method: "POST",
             headers,
             body: bodyToSend,
+            redirect: "error",
+            ...(typeof AbortSignal?.timeout === "function" ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
           });
           if (res.ok) {
+            let responsePayload = null;
+            if (cfg.sink === "mcp") {
+              responsePayload = await parseMcpHttpResponse(res, cfg.token);
+            }
             return {
               ok: true,
               status: "delivered",
@@ -314,6 +419,7 @@ export async function dispatchToContextHub(
               strict,
               exitCode: 0,
               http_status: res.status,
+              ...(responsePayload !== null ? { response: responsePayload } : {}),
             };
           }
           const respText = typeof res.text === "function" ? (await res.text()).slice(0, 200) : "";
@@ -322,8 +428,9 @@ export async function dispatchToContextHub(
           if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
         } catch (err) {
           lastError = sanitizeError(err, cfg.token);
+          if (err?.noRetry) break;
         }
-        if (attempts < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempts - 1));
+        if (attempt < maxAttempts) await sleep(baseDelayMs * Math.pow(2, attempt - 1));
       }
     }
   } catch (err) {

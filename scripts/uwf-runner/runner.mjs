@@ -280,7 +280,6 @@ async function main(argv) {
   else goal = readFileSync(goalPath, "utf8").trim();
 
   const releaseLock = scratch ? () => {} : acquireRunLock(dataDir, flags.workflow, { unlock: flags.unlock === true });
-  if (!dryRun) ensureRunMeta(dataDir, { workflow, outputPath });
 
   const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
@@ -362,6 +361,7 @@ async function main(argv) {
         process.stdout.write(formatTable(tableRows(tracked)));
         return EXIT.OK;
       }
+      ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
       const status = tracked.find((x) => x.stage === stages[start].name)?.status;
       const reason = status === "active" || status === "failed" ? status : "pending";
       // A failed stage restarts with retries reset (resume is an explicit human action).
@@ -378,17 +378,25 @@ async function main(argv) {
       const n = note(`runner resume: from=${stages[start].name} reason=${reason}`);
       if (!n.ok) log(`[runner] note not recorded: ${n.error}`);
     } else {
+      const priorTracked = readTracker();
       if (!flags["from-stage"] && flags.force !== true) {
-        const tracked = readTracker();
-        if (tracked.length && stages.every((st) => isDone(tracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
+        if (priorTracked.length && stages.every((st) => isDone(priorTracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
           log("[runner] workflow already complete; nothing to do (use --force to start over)");
-          process.stdout.write(formatTable(tableRows(tracked)));
+          process.stdout.write(formatTable(tableRows(priorTracked)));
           return EXIT.OK;
         }
       }
       if (!flags["from-stage"]) {
+        const hadPriorRun = priorTracked.length > 0 || existsSync(join(dataDir, "uaw-manifest.json"));
+        const meta = ensureRunMeta(dataDir, {
+          workflow,
+          outputPath,
+          repoRoot,
+          forceNew: flags.force === true || hadPriorRun,
+        });
         rmSync(join(dataDir, ROUTING_FILE), { force: true });
-        for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init"]]]) {
+        rmSync(join(dataDir, "uaw-manifest.json"), { force: true });
+        for (const [script, args] of [[TRACKER, ["init", "--workflow", workflow]], [STATE, ["init", "--run-id", meta.run_id]]]) {
           const r = cli(script, args, withOut);
           if (!r.ok) throw new UsageError(`Store init failed (${args[0]}): ${r.error}`);
         }
@@ -396,6 +404,7 @@ async function main(argv) {
         const qr = cli(QUESTIONS, ["reset"]);
         if (!qr.ok) log(`[runner] questions reset not applied: ${qr.error}`);
       } else {
+        ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
         resetFrom(start);
         rollbackPhase(start);
       }
@@ -619,7 +628,8 @@ async function stageLoop(ctx) {
               const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal });
               if (!m.ok) return finish(EXIT.GATE, rows, `${tag}: context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
             } catch (err) {
-              log(`[runner] provenance manifest at snapshot not written: ${err.message}`);
+              log(`[runner] provenance manifest at snapshot failed: ${err.message}`);
+              return finish(EXIT.GATE, rows, `${tag}: provenance manifest generation failed (${err.message})`, note);
             }
           }
           if (over) return capStop(`${st.name} passed`);
@@ -716,7 +726,8 @@ async function stageLoop(ctx) {
     });
     if (!m.ok) return finish(EXIT.GATE, rows, `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`, note);
   } catch (err) {
-    log(`[runner] provenance manifest not written: ${err.message}`);
+    log(`[runner] provenance manifest failed: ${err.message}`);
+    return finish(EXIT.GATE, rows, `provenance manifest generation failed (${err.message})`, note);
   }
   return finish(EXIT.OK, rows, "workflow complete", note);
 
