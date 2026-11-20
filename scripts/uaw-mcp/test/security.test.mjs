@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1768,6 +1769,111 @@ setTimeout(() => {}, 30000);
     });
     assert.deepEqual(bracketPrompt.inputsMissing, []);
     assert.match(bracketPrompt.prompt, /Works inside \[1\] path/);
+
+    // uaw_question_resolve list/check must remain pure read-only (no WAL creation or CREATE TABLE on existing empty DB)
+    const roQData = join(regWs.repoRoot, "ro-question-data");
+    mkdirSync(roQData, { recursive: true });
+    writeRunMeta(roQData, {
+      run_id: "ro-q-run",
+      workflow: "mcp_fixture",
+      data_dir: roQData,
+      output_path: stageOut,
+      repo_root: regWs.repoRoot,
+    });
+    const Database = createRequire(join(REPO_ROOT, ".github", "skills", "uwf-question-protocol", "package.json"))("better-sqlite3");
+    const emptyQDbPath = join(roQData, "uwf-questions.db");
+    {
+      const qdb = new Database(emptyQDbPath);
+      qdb.close();
+    }
+    const roQHold = claimDataDirLock({ dataDir: roQData, runId: "active-runner", stateDir: regWs.stateDir });
+    try {
+      const roList = await regHandler.callTool("uaw_question_resolve", { data_dir: roQData, action: "list" });
+      assert.equal(roList.isError, false, roList.structuredContent?.error ?? "");
+      assert.equal(roList.structuredContent.exit_code, 0);
+      assert.deepEqual(roList.structuredContent.result.questions, []);
+
+      const roCheck = await regHandler.callTool("uaw_question_resolve", {
+        data_dir: roQData,
+        action: "check",
+        stage: "plan",
+      });
+      assert.equal(roCheck.isError, false, roCheck.structuredContent?.error ?? "");
+      assert.equal(roCheck.structuredContent.exit_code, 0);
+      assert.equal(roCheck.structuredContent.result.gate, "pass");
+
+      for (const emptyIds of ["", []]) {
+        const roCheckEmptyIds = await regHandler.callTool("uaw_question_resolve", {
+          data_dir: roQData,
+          action: "check",
+          stage: "plan",
+          ids: emptyIds,
+        });
+        assert.equal(roCheckEmptyIds.isError, false, roCheckEmptyIds.structuredContent?.error ?? "");
+        assert.equal(roCheckEmptyIds.structuredContent.exit_code, 0);
+        assert.equal(roCheckEmptyIds.structuredContent.result.gate, "pass");
+      }
+
+      assert.equal(existsSync(`${emptyQDbPath}-wal`), false, "read-only question list/check must not create WAL sidecar");
+      const verifyDb = new Database(emptyQDbPath, { readonly: true });
+      try {
+        const tbls = verifyDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+        assert.deepEqual(tbls, [], "read-only question list/check must not create tables");
+      } finally {
+        verifyDb.close();
+      }
+    } finally {
+      roQHold.release();
+    }
+
+    // uaw_stage_transition target=state action=init (no workflow) followed by target=stage action=init (with workflow)
+    // must backfill run-meta.json & run-index so uaw_gates/uaw_resume work by run_id without repeating workflow
+    const thinData = join(regWs.repoRoot, "thin-backfill-data");
+    const thinOut = join(regWs.repoRoot, "thin-backfill-out");
+    const thinFx = regWs.writeFixturesForOutput(thinOut);
+    const stInit = await regHandler.callTool("uaw_stage_transition", {
+      target: "state",
+      action: "init",
+      data_dir: thinData,
+      output_path: thinOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(stInit.isError, false, stInit.structuredContent?.error ?? "");
+    const thinRunId = stInit.structuredContent.run_id;
+    assert.equal(readRunMeta(thinData)?.workflow, null);
+
+    const sgInit = await regHandler.callTool("uaw_stage_transition", {
+      target: "stage",
+      action: "init",
+      workflow: "mcp_fixture",
+      run_id: thinRunId,
+      data_dir: thinData,
+      output_path: thinOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(sgInit.isError, false, sgInit.structuredContent?.error ?? "");
+    assert.equal(readRunMeta(thinData)?.workflow, "mcp_fixture");
+    assert.equal(lookupRunById(regWs.stateDir, thinRunId)?.workflow, "mcp_fixture");
+
+    const gatesViaRunId = await regHandler.callTool("uaw_gates", {
+      run_id: thinRunId,
+      mode: "check",
+      stage: "plan",
+      repo_root: regWs.repoRoot,
+    });
+    assert.equal(gatesViaRunId.isError, false, gatesViaRunId.structuredContent?.error ?? "");
+
+    writeFileSync(join(thinData, "runner-goal.md"), "Thin orchestrator goal\n");
+    const resumeViaRunId = await regHandler.callTool("uaw_resume", {
+      run_id: thinRunId,
+      adapter: "fake",
+      fake_fixture_dir: thinFx,
+      repo_root: regWs.repoRoot,
+    });
+    assert.equal(resumeViaRunId.isError, false, resumeViaRunId.structuredContent?.stderr ?? resumeViaRunId.structuredContent?.error ?? "");
+    assert.equal(resumeViaRunId.structuredContent.exit_code, 3);
   } finally {
     rmSync(regWs.root, { recursive: true, force: true });
   }

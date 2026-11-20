@@ -483,6 +483,94 @@ export function readQuestions(dataDir, { stage, status } = {}) {
   }).value;
 }
 
+/**
+ * Pure read-only execution of `uaw_question_resolve` query actions (`list` and `check`).
+ * Never executes WAL writes or `CREATE TABLE` against `uwf-questions.db`.
+ */
+export function queryQuestionsAction(dataDir, { action, stage, status, ids } = {}) {
+  assertOptionalFilter(stage, "stage");
+  assertOptionalFilter(status, "status");
+  const absDir = resolve(dataDir);
+
+  if (action === "check" && !stage) {
+    throw new UsageError('Command "check" requires --stage.');
+  }
+
+  const rawIds = Array.isArray(ids)
+    ? ids.map((v) => String(v).trim()).filter(Boolean).join(",")
+    : ids == null ? "" : String(ids).trim();
+  let parsedIds = null;
+  if (action === "check" && rawIds) {
+    parsedIds = rawIds
+      .split(",")
+      .map((v) => Number(v.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
+    if (parsedIds.length === 0) {
+      return {
+        ok: false,
+        exitCode: 1,
+        result: { ok: false, error: "--ids must be a comma-separated list of integers." },
+        error: "--ids must be a comma-separated list of integers.",
+      };
+    }
+  }
+
+  const dbPath = join(absDir, "uwf-questions.db");
+  assertRegularFileInDir(absDir, "uwf-questions.db", "uwf-questions.db");
+  assertRegularFileInDir(absDir, "uwf-questions.db-wal", "uwf-questions.db-wal");
+  assertRegularFileInDir(absDir, "uwf-questions.db-shm", "uwf-questions.db-shm");
+  assertRegularFileInDir(absDir, "uwf-questions.db-journal", "uwf-questions.db-journal");
+
+  if (action === "list") {
+    const rows = withReadOnlyDb(dbPath, (db) => {
+      if (!tableExists(db, "questions")) return [];
+      let sql = "SELECT * FROM questions WHERE 1=1";
+      const params = [];
+      if (stage) { sql += " AND stage = ?"; params.push(stage); }
+      if (status) { sql += " AND status = ?"; params.push(status); }
+      sql += " ORDER BY id ASC";
+      return db.prepare(sql).all(...params);
+    });
+    const questions = rows ?? [];
+    return {
+      ok: true,
+      exitCode: 0,
+      result: { ok: true, procedure: "list", count: questions.length, questions },
+      error: null,
+    };
+  }
+
+  const pending = withReadOnlyDb(dbPath, (db) => {
+    if (!tableExists(db, "questions")) return [];
+    if (parsedIds) {
+      const placeholders = parsedIds.map(() => "?").join(", ");
+      return db
+        .prepare(
+          `SELECT * FROM questions WHERE id IN (${placeholders}) AND required = 1 AND status = 'pending'`,
+        )
+        .all(...parsedIds);
+    }
+    return db
+      .prepare("SELECT * FROM questions WHERE stage = ? AND required = 1 AND status = 'pending'")
+      .all(stage);
+  }) ?? [];
+
+  if (pending.length === 0) {
+    return {
+      ok: true,
+      exitCode: 0,
+      result: { ok: true, procedure: "check", gate: "pass", pending_count: 0, pending: [] },
+      error: null,
+    };
+  }
+  return {
+    ok: false,
+    exitCode: 1,
+    result: { ok: false, procedure: "check", gate: "fail", pending_count: pending.length, pending },
+    error: null,
+  };
+}
+
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
 const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 

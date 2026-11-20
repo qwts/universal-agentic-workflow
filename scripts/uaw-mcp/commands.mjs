@@ -41,7 +41,7 @@ import {
   UsageError,
   writeRunMeta,
 } from "./paths.mjs";
-import { redactDeep, readQuestions, readStages, readState } from "./store.mjs";
+import { queryQuestionsAction, redactDeep, readQuestions, readStages, readState } from "./store.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_REPO_ROOT = resolve(HERE, "..", "..");
@@ -1326,6 +1326,30 @@ export async function cmdCost(params = {}, ctx = {}) {
  * uaw_stage_transition — Execute explicit state.mjs or stage-tracker.mjs transitions,
  * refusing mutation with exit code 2 if an active `run.lock` is held.
  */
+function backfillExistingRunMeta(stateDir, dataDir, meta, { workflow, skillsRoot }) {
+  if (!meta) return null;
+  const needsWorkflow = !meta.workflow && workflow;
+  const needsSkills = !meta.skills_root && skillsRoot;
+  if (!needsWorkflow && !needsSkills) return null;
+  const nextMeta = {
+    ...meta,
+    workflow: meta.workflow ?? workflow ?? null,
+    skills_root: meta.skills_root ?? skillsRoot ?? null,
+    updated_at: new Date().toISOString(),
+  };
+  let metaWrite = null;
+  try {
+    metaWrite = writeRunMeta(dataDir, nextMeta);
+    registerRunIndex(stateDir, nextMeta, { pruneSuperseded: true });
+    return null;
+  } catch (err) {
+    try {
+      metaWrite?.rollback();
+    } catch { /* best-effort rollback */ }
+    return `run-meta backfill warning: ${err.message}`;
+  }
+}
+
 export async function cmdStageTransition(params = {}, ctx = {}) {
   const allowedRoots = ctx.allowedRoots ?? [];
   const stateDir = resolveUawStateDir(ctx.stateDir);
@@ -1411,6 +1435,7 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
     let transMetaWrite = null;
     let createdMetaForPrune = null;
     let res;
+    let stageBackfillWarning = null;
     try {
       if (!meta) {
         const createdMeta = {
@@ -1471,12 +1496,14 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
           timeoutMs: DEFAULT_METADATA_CLI_TIMEOUT_MS,
         });
         const stateFailed = res.spawnError || res.code !== 0 || res.json?.ok === false;
+        let backfillWarning = null;
         if (stateFailed && (transIdxReg || transMetaWrite)) {
           if (action === "init" && !hadDbBefore) cleanupFailedInitDb(dataDir, scope);
           rollbackClaimAndIndex(claim, transIdxReg, transMetaWrite);
           claim = null;
-        } else if (createdMetaForPrune) {
-          pruneSupersededRunIndices(stateDir, createdMetaForPrune);
+        } else {
+          if (!stateFailed) backfillWarning = backfillExistingRunMeta(stateDir, dataDir, meta, { workflow, skillsRoot });
+          if (createdMetaForPrune) pruneSupersededRunIndices(stateDir, createdMetaForPrune);
         }
         return redactDeep({
           ok: res.code === 0 && res.json?.ok !== false,
@@ -1487,6 +1514,7 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
           action,
           result: res.json,
           error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || `exit ${res.code}`,
+          ...(backfillWarning ? { warning: backfillWarning } : {}),
         }).value;
       }
 
@@ -1512,8 +1540,9 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
         if (action === "init" && !hadDbBefore) cleanupFailedInitDb(dataDir, scope);
         rollbackClaimAndIndex(claim, transIdxReg, transMetaWrite);
         claim = null;
-      } else if (createdMetaForPrune) {
-        pruneSupersededRunIndices(stateDir, createdMetaForPrune);
+      } else {
+        if (!stageFailed) stageBackfillWarning = backfillExistingRunMeta(stateDir, dataDir, meta, { workflow, skillsRoot });
+        if (createdMetaForPrune) pruneSupersededRunIndices(stateDir, createdMetaForPrune);
       }
     } catch (err) {
       if (transIdxReg || transMetaWrite) {
@@ -1532,6 +1561,7 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       action,
       result: res.json,
       error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || `exit ${res.code}`,
+      ...(stageBackfillWarning ? { warning: stageBackfillWarning } : {}),
     }).value;
     } finally {
       claim?.release();
@@ -1587,37 +1617,21 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
   if (params.answer !== undefined) args.push("--answer", assertNoLeadingDash(params.answer, "answer"));
 
   if (action !== "answer" && action !== "skip") {
-    const realQDb = assertRegularFileInDir(dataDir, "uwf-questions.db", "uwf-questions.db");
-    assertRegularFileInDir(dataDir, "uwf-questions.db-wal", "uwf-questions.db-wal");
-    assertRegularFileInDir(dataDir, "uwf-questions.db-shm", "uwf-questions.db-shm");
-    assertRegularFileInDir(dataDir, "uwf-questions.db-journal", "uwf-questions.db-journal");
-    if (!realQDb) {
-      return redactDeep({
-        ok: true,
-        exit_code: EXIT.OK,
-        run_id: target.runId,
-        data_dir: dataDir,
-        action,
-        result: action === "list"
-          ? { ok: true, procedure: "list", count: 0, questions: [] }
-          : { ok: true, procedure: "check", gate: "pass", pending_count: 0, pending: [] },
-        error: null,
-      }).value;
-    }
-    assertSafeDataDir(dataDir);
-    const res = await execNodeAsync(QUESTIONS_CLI, args, {
-      cwd: OWN_REPO_ROOT,
-      env: { UWF_DATA_DIR: dataDir },
-      timeoutMs: DEFAULT_METADATA_CLI_TIMEOUT_MS,
+    assertSafeDataDir(dataDir, { strictTranscripts: false });
+    const qRes = queryQuestionsAction(dataDir, {
+      action,
+      stage: params.stage,
+      status: params.status,
+      ids: params.ids,
     });
     return redactDeep({
-      ok: res.code === 0 && res.json?.ok !== false,
-      exit_code: res.code,
+      ok: qRes.ok,
+      exit_code: qRes.exitCode,
       run_id: target.runId,
       data_dir: dataDir,
       action,
-      result: res.json,
-      error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || null,
+      result: qRes.result,
+      error: qRes.error,
     }).value;
   }
 
