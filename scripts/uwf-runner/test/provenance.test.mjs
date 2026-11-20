@@ -15,6 +15,7 @@ import {
   ensureRunMeta,
   materializeManifest,
   resolveDeliverableKey,
+  scrubProvenanceOutputs,
   sealManifest,
   sha256Hex,
   validateManifest,
@@ -413,6 +414,7 @@ try {
   const verifyOk = verifyManifest({ dataDir, repoRoot: root });
   assert.equal(verifyOk.ok, true, JSON.stringify(verifyOk.errors));
 
+  const savedRetroBytes = readFileSync(retroPath);
   writeFileSync(retroPath, "# Retro\nTAMPERED!\n");
   const verifyBad = verifyManifest({ dataDir, repoRoot: root });
   assert.equal(verifyBad.ok, false);
@@ -426,8 +428,32 @@ try {
   }
   assert.equal(cliExit, 1, "provenance.mjs verify must exit 1 on unexpected post-stage artifact mutation");
 
-  // Step G: stage.completed (phase=snapshot) uses snapshot outputs[] digest for dedup_tuple.sha256
+  // Step G: stage.completed (phase=snapshot) verifies un-superseded outputs before dispatch and uses snapshot outputs[] digest for dedup_tuple.sha256
   const sentEnvelopes = [];
+  await assert.rejects(
+    () =>
+      materializeManifest({
+        dataDir,
+        workflow: "sw_dev",
+        repoRoot: root,
+        outputPath,
+        phase: "snapshot",
+        deferSeal: false,
+        dispatchSink: true,
+        sinkOptions: {
+          env: { UAW_CONTEXT_HUB_SINK: "mcp", UAW_CONTEXT_HUB_MODE: "strict" },
+          mcpClient: {
+            callTool: async (_name, args) => {
+              sentEnvelopes.push(args);
+              return { result: { content: [{ type: "text", text: "ok" }] } };
+            },
+          },
+        },
+      }),
+    /Stage output integrity verification failed/,
+  );
+  assert.equal(sentEnvelopes.length, 0, "tampered stage output must block snapshot checkpoint before Context Hub dispatch");
+  writeFileSync(retroPath, savedRetroBytes);
   const snapRes = await materializeManifest({
     dataDir,
     workflow: "sw_dev",
@@ -1607,6 +1633,188 @@ try {
       const vr = verifyManifest({ dataDir: schemaTestData, repoRoot: replayRepo });
       assert.equal(vr.ok, false, "verifyManifest must fail on schema-invalid nested payload");
     }
+
+    // Step S1: Cross-workflow data-dir reuse recovers active run_id & workflow without colliding with prior run_manifests
+    const stateCliPath = join(REPO_ROOT, ".github", "skills", "uwf-state-manager", "state.mjs");
+    const trackerCliPath = join(REPO_ROOT, ".github", "skills", "uwf-orchestration-engine", "stage-tracker.mjs");
+    const reuseData = join(runRoot, "reuse-cross-workflow-data");
+    cpSync(replayData, reuseData, { recursive: true });
+    execFileSync(
+      process.execPath,
+      [trackerCliPath, "init", "--workflow", "project_manager", "--data-dir", reuseData, "--repo-root", replayRepo],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+    execFileSync(
+      process.execPath,
+      [stateCliPath, "init", "--run-id", "run-b-pm", "--data-dir", reuseData],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+    // Deliberately delete run-meta.json while sw_dev row in run_manifests AND stale sw_dev uaw-manifest.json still exist
+    rmSync(join(reuseData, "run-meta.json"), { force: true });
+    const pmRecoveredMeta = ensureRunMeta(reuseData, { workflow: "project_manager", repoRoot: replayRepo });
+    assert.equal(pmRecoveredMeta.run_id, "run-b-pm");
+    assert.equal(pmRecoveredMeta.workflow, "project_manager");
+
+    for (const badMetaText of [null, "{corrupt", "{}"]) {
+      if (badMetaText === null) rmSync(join(reuseData, "run-meta.json"), { force: true });
+      else writeFileSync(join(reuseData, "run-meta.json"), badMetaText);
+      const pmBuilt = buildManifest({
+        dataDir: reuseData,
+        workflow: "project_manager",
+        repoRoot: replayRepo,
+        phase: "snapshot",
+      });
+      assert.equal(pmBuilt.manifest.run_id, "run-b-pm");
+      assert.equal(pmBuilt.manifest.workflow, "project_manager");
+    }
+
+    rmSync(join(reuseData, "run-meta.json"), { force: true });
+    assert.throws(
+      () => ensureRunMeta(reuseData, { workflow: "sw_dev", repoRoot: replayRepo }),
+      /Workflow mismatch/i,
+    );
+    await assert.rejects(
+      () => scrubProvenanceOutputs({ dataDir: reuseData, workflow: "sw_dev", repoRoot: replayRepo }),
+      /Workflow mismatch/i,
+    );
+
+    // Resuming an older workflow in uwf-stages.db (stage-start without runner-start history or workflow_state.run_id) must track stage_history recency, not highest stage_runs.id
+    const resumeOlderData = join(runRoot, "resume-older-wf-data");
+    cpSync(reuseData, resumeOlderData, { recursive: true });
+    execFileSync(
+      process.execPath,
+      [trackerCliPath, "stage-start", "--workflow", "sw_dev", "--stage", "retro", "--data-dir", resumeOlderData, "--repo-root", replayRepo],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+    {
+      const sdbLegacy = new Database(join(resumeOlderData, "uwf-state.db"));
+      sdbLegacy.exec("UPDATE workflow_state SET run_id = NULL WHERE id = 1; DELETE FROM workflow_history;");
+      sdbLegacy.close();
+    }
+    const swResumedMeta = ensureRunMeta(resumeOlderData, { workflow: "sw_dev", repoRoot: replayRepo });
+    assert.equal(swResumedMeta.run_id, sealedRunId);
+    assert.equal(swResumedMeta.workflow, "sw_dev");
+
+    // Stale run_manifests + uaw-manifest.json with no active workflow or run_id must NOT be adopted into an unrelated workflow
+    const staleOnlyData = join(runRoot, "stale-manifest-only-data");
+    cpSync(replayData, staleOnlyData, { recursive: true });
+    rmSync(join(staleOnlyData, "run-meta.json"), { force: true });
+    rmSync(join(staleOnlyData, "uwf-stages.db"), { force: true });
+    {
+      const staleStateDb = new Database(join(staleOnlyData, "uwf-state.db"));
+      staleStateDb.exec("UPDATE workflow_state SET run_id = NULL WHERE id = 1; DELETE FROM workflow_history;");
+      staleStateDb.close();
+    }
+    const freshUnrelatedMeta = ensureRunMeta(staleOnlyData, { workflow: "project_manager", repoRoot: replayRepo, persist: false });
+    assert.notEqual(freshUnrelatedMeta.run_id, sealedRunId, "stale run_manifests/uaw-manifest.json without active workflow or run_id must not leak prior run_id");
+    assert.equal(freshUnrelatedMeta.workflow, "project_manager");
+
+    // Step S2: Corrupted outputs_json on passed stages must fail closed across build, materialize, scrub, and seal
+    const corruptCases = [
+      "{corrupt",
+      "",
+      null,
+      "{}",
+      JSON.stringify([
+        { path: "tmp/workflow-artifacts/issues-intake.md", sha256: "a".repeat(64), bytes: 10 },
+        { path: "bad", sha256: "not-hex", bytes: 1 },
+      ]),
+    ];
+    for (let idx = 0; idx < corruptCases.length; idx++) {
+      const badOutData = join(runRoot, `corrupt-outputs-${idx}`);
+      cpSync(replayData, badOutData, { recursive: true });
+      const sdb = new Database(join(badOutData, "uwf-stages.db"));
+      sdb.prepare("UPDATE stage_runs SET outputs_json = ? WHERE workflow = 'sw_dev' AND stage = 'intake'").run(corruptCases[idx]);
+      sdb.close();
+
+      assert.throws(
+        () => buildManifest({ dataDir: badOutData, workflow: "sw_dev", repoRoot: replayRepo, phase: "closed" }),
+        /Corrupt outputs_json/i,
+      );
+      await assert.rejects(
+        () => materializeManifest({ dataDir: badOutData, workflow: "sw_dev", repoRoot: replayRepo, phase: "snapshot", deferSeal: false, dispatchSink: false }),
+        /Corrupt outputs_json/i,
+      );
+      await assert.rejects(
+        () => materializeManifest({ dataDir: badOutData, workflow: "sw_dev", repoRoot: replayRepo, phase: "closed", deferSeal: true, dispatchSink: false }),
+        /Corrupt outputs_json/i,
+      );
+      await assert.rejects(
+        () => scrubProvenanceOutputs({ dataDir: badOutData, workflow: "sw_dev", repoRoot: replayRepo }),
+        /Corrupt outputs_json/i,
+      );
+      const sealBadOut = await sealManifest({ dataDir: badOutData, workflow: "sw_dev", repoRoot: replayRepo });
+      assert.equal(sealBadOut.ok, false);
+      assert.equal(sealBadOut.exitCode, 1);
+      assert.match(sealBadOut.error ?? "", /Corrupt outputs_json/i);
+    }
+
+    // Step S3: runner.mjs must abort snapshot checkpoint dispatch and roll snapshot back if snapshot mutates an earlier stage output
+    const snapTamperFx = join(runRoot, "fx-snap-tamper");
+    const snapTamperRoot = join(runRoot, "root-snap-tamper");
+    const snapTamperData = join(runRoot, "data-snap-tamper");
+    cpSync(fxDir, snapTamperFx, { recursive: true });
+    mkdirSync(snapTamperRoot, { recursive: true });
+    writeFileSync(join(snapTamperRoot, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const snapFx = JSON.parse(readFileSync(join(snapTamperFx, "snapshot.json"), "utf8"));
+    snapFx.files["tmp/workflow-artifacts/issues-intake.md"] = "# Intake\nTAMPERED_DURING_SNAPSHOT\n";
+    writeFileSync(join(snapTamperFx, "snapshot.json"), JSON.stringify(snapFx, null, 2));
+
+    const snapTamperEvents = [];
+    const snapTamperServer = createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        snapTamperEvents.push(Buffer.concat(chunks).toString("utf8"));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise((resolveListen) => snapTamperServer.listen(0, "127.0.0.1", resolveListen));
+    let snapTamperExit = 0;
+    let snapTamperStderr = "";
+    try {
+      const { port } = snapTamperServer.address();
+      await new Promise((resolveSpawn, rejectSpawn) => {
+        const child = spawn(
+          process.execPath,
+          [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Snapshot tamper test", "--adapter", "fake", "--repo-root", snapTamperRoot, "--data-dir", snapTamperData, "--defer-seal"],
+          {
+            env: {
+              ...process.env,
+              UWF_FAKE_FIXTURE_DIR: snapTamperFx,
+              UWF_DATA_DIR: "",
+              UAW_CONTEXT_HUB_SINK: "webhook",
+              UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook`,
+              UAW_CONTEXT_HUB_TOKEN: "tok",
+              UAW_CONTEXT_HUB_MODE: "strict",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        child.stderr.on("data", (d) => { snapTamperStderr += d; });
+        child.on("error", rejectSpawn);
+        child.on("close", (code) => {
+          snapTamperExit = code ?? 1;
+          resolveSpawn();
+        });
+      });
+    } finally {
+      await new Promise((resolveClose) => snapTamperServer.close(resolveClose));
+    }
+    assert.equal(snapTamperExit, 1, "runner.mjs must exit 1 when snapshot mutates an earlier stage output");
+    assert.match(snapTamperStderr, /Stage output integrity verification failed|Unexpected post-stage mutation/);
+    assert.equal(snapTamperEvents.length, 0, "tampered snapshot must not dispatch to Context Hub");
+    assert.equal(existsSync(join(snapTamperData, "uaw-manifest.json")), false, "tampered snapshot must not persist uaw-manifest.json");
+    const snapTamperStateDb = new Database(join(snapTamperData, "uwf-state.db"), { readonly: true });
+    const hasManifestTbl = snapTamperStateDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_manifests'").get();
+    const manifestCnt = hasManifestTbl ? snapTamperStateDb.prepare("SELECT COUNT(*) AS n FROM run_manifests").get().n : 0;
+    snapTamperStateDb.close();
+    assert.equal(manifestCnt, 0, "tampered snapshot must not upsert into run_manifests");
+    const snapTamperStagesDb = new Database(join(snapTamperData, "uwf-stages.db"), { readonly: true });
+    const snapTamperRow = snapTamperStagesDb.prepare("SELECT status FROM stage_runs WHERE workflow = 'sw_dev' AND stage = 'snapshot'").get();
+    snapTamperStagesDb.close();
+    assert.equal(snapTamperRow?.status, "pending", "tampered snapshot must roll snapshot stage back to pending");
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

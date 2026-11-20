@@ -136,6 +136,35 @@ function recoverPersistedRunIdentity(absDataDir) {
     Database = null;
   }
 
+  let stageLedgerWorkflow = null;
+  if (Database) {
+    const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
+    const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
+    if (stagesDb) {
+      try {
+        if (tableExists(stagesDb, "stage_history")) {
+          const sh = stagesDb.prepare("SELECT workflow FROM stage_history ORDER BY id DESC LIMIT 1").get();
+          if (sh && typeof sh.workflow === "string" && sh.workflow.trim()) {
+            stageLedgerWorkflow = sh.workflow.trim();
+          }
+        }
+        if (!stageLedgerWorkflow && tableExists(stagesDb, "stage_runs")) {
+          const sr = stagesDb
+            .prepare(
+              "SELECT workflow FROM stage_runs ORDER BY CASE WHEN completed_at IS NOT NULL OR started_at IS NOT NULL THEN 1 ELSE 0 END DESC, COALESCE(completed_at, started_at) DESC, id DESC LIMIT 1",
+            )
+            .get();
+          if (sr && typeof sr.workflow === "string" && sr.workflow.trim()) {
+            stageLedgerWorkflow = sr.workflow.trim();
+          }
+        }
+      } finally {
+        stagesDb.close();
+      }
+    }
+  }
+
+  let historyWorkflow = null;
   if (Database) {
     const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
     const stateDb = stateChecked.exists ? openReadOnly(Database, stateChecked.path) : null;
@@ -149,10 +178,33 @@ function recoverPersistedRunIdentity(absDataDir) {
             if (typeof ws.artifact_path === "string" && ws.artifact_path.trim()) out.outputPath = ws.artifact_path.trim();
           }
         }
-        if (tableExists(stateDb, "run_manifests")) {
-          const rm = stateDb
-            .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
+        if (tableExists(stateDb, "workflow_history")) {
+          out.hasRunnerHistory = Boolean(
+            stateDb
+              .prepare("SELECT 1 FROM workflow_history WHERE note LIKE 'runner start:%' OR note LIKE 'runner resume:%' LIMIT 1")
+              .get()
+          );
+          const startHist = stateDb
+            .prepare("SELECT note FROM workflow_history WHERE note LIKE 'runner start: workflow=%' ORDER BY id DESC LIMIT 1")
             .get();
+          const wfMatch =
+            typeof startHist?.note === "string" ? startHist.note.match(/^runner start:\s+workflow=(\S+)/) : null;
+          if (wfMatch && wfMatch[1]) {
+            historyWorkflow = wfMatch[1].trim();
+          }
+        }
+        if (tableExists(stateDb, "run_manifests")) {
+          const ledgerWf = historyWorkflow ?? stageLedgerWorkflow;
+          let rm = null;
+          if (out.runId) {
+            rm = stateDb
+              .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests WHERE run_id = ?")
+              .get(out.runId);
+          } else if (ledgerWf) {
+            rm = stateDb
+              .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests WHERE workflow = ? ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
+              .get(ledgerWf);
+          }
           if (rm) {
             if (!out.runId && typeof rm.run_id === "string" && rm.run_id.trim()) out.runId = rm.run_id.trim();
             if (!out.workflow && typeof rm.workflow === "string" && rm.workflow.trim()) out.workflow = rm.workflow.trim();
@@ -165,34 +217,13 @@ function recoverPersistedRunIdentity(absDataDir) {
             }
           }
         }
-        if (tableExists(stateDb, "workflow_history")) {
-          out.hasRunnerHistory = Boolean(
-            stateDb
-              .prepare("SELECT 1 FROM workflow_history WHERE note LIKE 'runner start:%' OR note LIKE 'runner resume:%' LIMIT 1")
-              .get()
-          );
-        }
       } finally {
         stateDb.close();
       }
     }
-
-    if (!out.workflow) {
-      const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
-      const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
-      if (stagesDb) {
-        try {
-          if (tableExists(stagesDb, "stage_runs")) {
-            const sr = stagesDb.prepare("SELECT workflow FROM stage_runs ORDER BY id DESC LIMIT 1").get();
-            if (sr && typeof sr.workflow === "string" && sr.workflow.trim()) {
-              out.workflow = sr.workflow.trim();
-            }
-          }
-        } finally {
-          stagesDb.close();
-        }
-      }
-    }
+  }
+  if (!out.workflow) {
+    out.workflow = historyWorkflow ?? stageLedgerWorkflow ?? null;
   }
 
   const manifestPath = join(absDataDir, MANIFEST_FILE);
@@ -201,15 +232,24 @@ function recoverPersistedRunIdentity(absDataDir) {
     if (!manLst.isSymbolicLink() && manLst.isFile() && isInsideOrEqual(realpathSync(manifestPath), realDataDir)) {
       const parsedMan = JSON.parse(readFileSync(manifestPath, "utf8"));
       if (parsedMan && typeof parsedMan === "object" && !Array.isArray(parsedMan)) {
-        if (!out.runId && typeof parsedMan.run_id === "string" && parsedMan.run_id.trim()) {
-          out.runId = parsedMan.run_id.trim();
-        }
-        if (!out.workflow && typeof parsedMan.workflow === "string" && parsedMan.workflow.trim()) {
-          out.workflow = parsedMan.workflow.trim();
-        }
-        const base = parsedMan.deliverable?.base_commit_sha;
-        if (!out.baseCommitSha && typeof base === "string" && base.trim()) {
-          out.baseCommitSha = base.trim();
+        const manRunId =
+          typeof parsedMan.run_id === "string" && parsedMan.run_id.trim() ? parsedMan.run_id.trim() : null;
+        const manWorkflow =
+          typeof parsedMan.workflow === "string" && parsedMan.workflow.trim() ? parsedMan.workflow.trim() : null;
+        const targetWorkflow = out.workflow ?? historyWorkflow ?? stageLedgerWorkflow;
+        const runMatches = Boolean(out.runId && manRunId === out.runId && (!targetWorkflow || !manWorkflow || manWorkflow === targetWorkflow));
+        const workflowMatches = Boolean(!out.runId && targetWorkflow && manWorkflow === targetWorkflow);
+        if (runMatches || workflowMatches) {
+          if (!out.runId && manRunId) {
+            out.runId = manRunId;
+          }
+          if (!out.workflow && manWorkflow) {
+            out.workflow = manWorkflow;
+          }
+          const base = parsedMan.deliverable?.base_commit_sha;
+          if (!out.baseCommitSha && typeof base === "string" && base.trim()) {
+            out.baseCommitSha = base.trim();
+          }
         }
       }
     }
@@ -1682,10 +1722,58 @@ function readExistingRunMeta(absDataDir) {
     const st = lstatSync(metaPath);
     if (st.isSymbolicLink() || !st.isFile()) return null;
     const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : null;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.run_id === "string" && parsed.run_id.trim().length > 0
+      ? parsed
+      : null;
   } catch {
     return null;
   }
+}
+
+function parseStageOutputsJson(rawOutputsJson, stageName, status) {
+  if (rawOutputsJson === undefined) return [];
+  if (rawOutputsJson === null) {
+    if (status === "passed") {
+      throw new Error(`Corrupt outputs_json for passed stage "${stageName}": expected JSON array, got null`);
+    }
+    return [];
+  }
+  if (typeof rawOutputsJson !== "string") {
+    throw new Error(`Corrupt outputs_json for stage "${stageName}": expected JSON string`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(rawOutputsJson);
+  } catch (err) {
+    throw new Error(`Corrupt outputs_json for stage "${stageName}": invalid JSON (${err.message})`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Corrupt outputs_json for stage "${stageName}": expected JSON array`);
+  }
+  if (status === "skipped") {
+    if (parsed.length > 0) {
+      throw new Error(`Corrupt outputs_json for skipped stage "${stageName}": expected empty array`);
+    }
+    return [];
+  }
+  const outputs = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const o = parsed[i];
+    if (
+      !isPlainObject(o) ||
+      !Object.keys(o).every((k) => k === "path" || k === "sha256" || k === "bytes") ||
+      typeof o.path !== "string" ||
+      o.path.length === 0 ||
+      typeof o.sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(o.sha256) ||
+      !Number.isInteger(o.bytes) ||
+      o.bytes < 0
+    ) {
+      throw new Error(`Corrupt outputs_json entry for stage "${stageName}" at index ${i}`);
+    }
+    outputs.push({ path: o.path, sha256: o.sha256, bytes: o.bytes });
+  }
+  return outputs.sort((a, b) => compareUtf16(a.path, b.path));
 }
 
 /**
@@ -1710,7 +1798,7 @@ export function buildManifest({
   let modelProfile = null;
   let modelName = null;
   let stateModeHint = null;
-  let persistedManifestWorkflow = null;
+  let stateRunId = null;
   let stateArtifactPath = null;
   let firstHistTs = null;
   const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
@@ -1723,15 +1811,8 @@ export function buildManifest({
           modelProfile = ws.model_profile ?? null;
           modelName = ws.model_name ?? null;
           stateModeHint = typeof ws.mode === "string" && ws.mode.trim() ? ws.mode.trim() : null;
+          stateRunId = typeof ws.run_id === "string" && ws.run_id.trim() ? ws.run_id.trim() : null;
           stateArtifactPath = ws.artifact_path ?? null;
-        }
-      }
-      if (tableExists(stateDb, "run_manifests")) {
-        const rm = stateDb
-          .prepare("SELECT workflow FROM run_manifests ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
-          .get();
-        if (rm && typeof rm.workflow === "string" && rm.workflow.trim()) {
-          persistedManifestWorkflow = rm.workflow.trim();
         }
       }
       if (tableExists(stateDb, "workflow_history")) {
@@ -1743,7 +1824,16 @@ export function buildManifest({
     }
   }
 
-  const authoritativeWorkflow = existingMeta?.workflow ?? persistedManifestWorkflow;
+  let persistedManifestWorkflow = null;
+  const targetRunId = existingMeta?.run_id ?? stateRunId ?? null;
+  if (targetRunId) {
+    const persistedForRun = readPersistedManifestRow(Database, absDataDir, targetRunId);
+    if (persistedForRun && typeof persistedForRun.workflow === "string" && persistedForRun.workflow.trim()) {
+      persistedManifestWorkflow = persistedForRun.workflow.trim();
+    }
+  }
+  const recovered = !existingMeta ? recoverPersistedRunIdentity(absDataDir) : null;
+  const authoritativeWorkflow = existingMeta?.workflow ?? persistedManifestWorkflow ?? recovered?.workflow ?? null;
   if (workflow && authoritativeWorkflow && workflow !== authoritativeWorkflow) {
     throw new Error(
       `Workflow mismatch for ${absDataDir}: persisted state records "${authoritativeWorkflow}", requested "${workflow}"`,
@@ -1782,19 +1872,7 @@ export function buildManifest({
         const rows = queryAll(stagesDb, "SELECT * FROM stage_runs WHERE workflow = ? ORDER BY id ASC", resolvedWorkflow);
         for (const row of rows) {
           if (row.stage === "blueprint" && row.status === "passed") blueprintRan = true;
-          const isSkipped = row.status === "skipped";
-          let outputs = [];
-          if (!isSkipped && row.outputs_json) {
-            try {
-              const parsed = JSON.parse(row.outputs_json);
-              if (Array.isArray(parsed)) {
-                outputs = parsed
-                  .filter((o) => o && typeof o.path === "string" && typeof o.sha256 === "string" && Number.isInteger(o.bytes))
-                  .map((o) => ({ path: o.path, sha256: o.sha256, bytes: o.bytes }))
-                  .sort((a, b) => compareUtf16(a.path, b.path));
-              }
-            } catch { outputs = []; }
-          }
+          const outputs = parseStageOutputsJson(row.outputs_json, row.stage, row.status);
           stages.push({
             stage: row.stage,
             status: row.status,
@@ -1953,15 +2031,13 @@ export async function materializeManifest({
     throw new Error(`Generated manifest failed schema validation: ${validationErrors.join("; ")}`);
   }
 
-  if (phase !== "snapshot") {
-    const outCheck = verifyManifestStageOutputs(built.manifest, {
-      dataDir: absDataDir,
-      repoRoot: resolve(repoRoot),
-      outputPath,
-    });
-    if (!outCheck.ok) {
-      throw new Error(`Stage output integrity verification failed: ${outCheck.errors.join("; ")}`);
-    }
+  const outCheck = verifyManifestStageOutputs(built.manifest, {
+    dataDir: absDataDir,
+    repoRoot: resolve(repoRoot),
+    outputPath: outputPath ?? built.outputPath ?? null,
+  });
+  if (!outCheck.ok) {
+    throw new Error(`Stage output integrity verification failed: ${outCheck.errors.join("; ")}`);
   }
 
   mkdirSync(absDataDir, { recursive: true });
@@ -2399,12 +2475,14 @@ export async function scrubProvenanceOutputs({
     }
   }
 
-  if (workflow && existingMeta?.workflow && workflow !== existingMeta.workflow) {
+  const recovered = !existingMeta ? recoverPersistedRunIdentity(absDataDir) : null;
+  const authoritativeWorkflow = existingMeta?.workflow ?? recovered?.workflow ?? null;
+  if (workflow && authoritativeWorkflow && workflow !== authoritativeWorkflow) {
     throw new Error(
-      `Workflow mismatch for ${absDataDir}: run-meta.json records "${existingMeta.workflow}", requested "${workflow}"`,
+      `Workflow mismatch for ${absDataDir}: ${existingMeta?.workflow ? "run-meta.json" : "persisted state"} records "${authoritativeWorkflow}", requested "${workflow}"`,
     );
   }
-  const effectiveWorkflow = workflow ?? existingMeta?.workflow ?? "sw_dev";
+  const effectiveWorkflow = workflow ?? authoritativeWorkflow ?? "sw_dev";
   const rawOut = outputPath ?? existingMeta?.output_path ?? stateArtifactPath ?? join(absDataDir, "workflow-artifacts");
   const absOut = rawOut ? (isAbsolute(rawOut) ? resolve(rawOut) : resolve(absRepoRoot, rawOut)) : null;
 
@@ -2451,20 +2529,12 @@ export async function scrubProvenanceOutputs({
         const latestByPath = new Map();
 
         for (const row of rows) {
-          if (row.status === "skipped" || !row.outputs_json) continue;
-          let arr;
-          try {
-            arr = JSON.parse(row.outputs_json);
-          } catch {
-            continue;
-          }
-          if (!Array.isArray(arr)) continue;
+          const arr = parseStageOutputsJson(row.outputs_json, row.stage, row.status);
+          if (row.status === "skipped" || arr.length === 0) continue;
           const info = { row, arr, changed: false };
           parsedRows.set(row.id, info);
           for (const item of arr) {
-            if (item && typeof item.path === "string" && typeof item.sha256 === "string" && Number.isInteger(item.bytes)) {
-              latestByPath.set(item.path, { rowId: row.id, item });
-            }
+            latestByPath.set(item.path, { rowId: row.id, item });
           }
         }
 
