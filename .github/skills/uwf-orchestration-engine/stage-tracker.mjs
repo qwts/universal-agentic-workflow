@@ -36,7 +36,7 @@
 
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { readFileSync, existsSync, lstatSync, statSync, readdirSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, lstatSync, realpathSync, statSync, readdirSync, unlinkSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -291,7 +291,6 @@ const flags = parseFlags(rest);
 
 const workflow   = flags["workflow"];
 if (flags["repo-root"] === true) usageError("--repo-root requires a path.");
-const repoRoot   = flags["repo-root"] ? resolve(String(flags["repo-root"])) : process.cwd();
 const dataDirFlag = resolveDataDir(flags, undefined);
 const outputPath = flags["output-path"] ?? (dataDirFlag ? join(dataDirFlag, "workflow-artifacts") : "./tmp/workflow-artifacts");
 const DB_PATH = resolveDbPath(flags, "uwf-stages.db", __dirname);
@@ -358,8 +357,8 @@ function resolveTemplates(str) {
   if (typeof str !== "string") return str;
   return str
     .replace(/\{\{output_path\}\}/g, outputPath)
-    .replace(/\{\{cwd\}\}/g,         repoRoot)
-    .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? repoRoot);
+    .replace(/\{\{cwd\}\}/g,         process.cwd())
+    .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? process.cwd());
 }
 
 /**
@@ -647,10 +646,18 @@ function matchGlobSegment(pattern, name) {
 }
 
 function captureStageOutputsJson(stageDef) {
+  const captureRoot = flags["repo-root"] ? resolve(String(flags["repo-root"])) : process.cwd();
+  const resolveCaptureTemplate = (str) => {
+    if (typeof str !== "string") return str;
+    return str
+      .replace(/\{\{output_path\}\}/g, outputPath)
+      .replace(/\{\{cwd\}\}/g,         captureRoot)
+      .replace(/\{\{skills_root\}\}/g, SKILLS_ROOT ?? captureRoot);
+  };
   const seen = new Map();
   for (const tmpl of stageDef?.outputs ?? []) {
-    const resolved = resolveTemplates(tmpl);
-    const absPattern = isAbsolute(resolved) ? resolved : resolve(repoRoot, resolved);
+    const resolved = resolveCaptureTemplate(tmpl);
+    const absPattern = isAbsolute(resolved) ? resolved : resolve(captureRoot, resolved);
     let paths = [];
     if (/[*?[\]]/.test(basename(absPattern))) {
       const dir = dirname(absPattern);
@@ -669,7 +676,15 @@ function captureStageOutputsJson(stageDef) {
       try {
         if (!lstatSync(abs).isFile()) continue;
         const buf = readFileSync(abs);
-        const rel = relative(repoRoot, abs);
+        let rel = relative(captureRoot, abs);
+        if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+          try {
+            const realRel = relative(realpathSync(captureRoot), realpathSync(abs));
+            if (realRel && !realRel.startsWith("..") && !isAbsolute(realRel)) {
+              rel = realRel;
+            }
+          } catch { /* keep raw abs if realpath fails */ }
+        }
         const normPath = (rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : abs).split(sep).join("/");
         seen.set(normPath, {
           path: normPath,

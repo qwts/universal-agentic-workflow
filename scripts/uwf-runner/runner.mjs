@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -124,6 +124,32 @@ async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, ou
   rmSync(join(dataDir, FINALIZE_PENDING_FILE), { force: true });
   rmSync(join(dataDir, ROUTING_FILE), { force: true });
   return finish(EXIT.OK, rows, "workflow complete", note);
+}
+
+function readRecordedOutputPath(dataDir, cliCommon) {
+  const metaPath = join(dataDir, "run-meta.json");
+  try {
+    const st = lstatSync(metaPath);
+    if (!st.isSymbolicLink() && st.isFile()) {
+      const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+      if (typeof parsed?.output_path === "string" && parsed.output_path.length > 0) {
+        return parsed.output_path;
+      }
+    }
+  } catch {
+    /* ignore unreadable or absent run-meta.json */
+  }
+  if (cliCommon && existsSync(join(dataDir, "uwf-state.db"))) {
+    try {
+      const artifactPath = cliCommon(STATE, ["read"])?.data?.state?.artifact_path;
+      if (typeof artifactPath === "string" && artifactPath.length > 0) {
+        return artifactPath;
+      }
+    } catch {
+      /* ignore unreadable state db */
+    }
+  }
+  return null;
 }
 // Mirrors VALID_PHASES in uwf-state-manager/state.mjs (canonical order; each workflow visits a subsequence of it).
 const PHASES = ["idea", "intake", "discovery", "planning", "execution", "acceptance", "snapshot", "closed"];
@@ -340,7 +366,6 @@ async function main(argv) {
   const dryRun = flags["dry-run"] === true;
   const nonInteractive = flags["non-interactive"] === true;
   const deferSeal = flags["defer-seal"] === true;
-  const outputPath = flags["output-path"] ?? "./tmp/workflow-artifacts";
 
   // Dry run must write nothing: point every store at a throwaway dir.
   const scratch = dryRun ? mkdtempSync(join(tmpdir(), "uwf-dry-")) : null;
@@ -358,11 +383,18 @@ async function main(argv) {
 
   const cliEnv = { UWF_DATA_DIR: dataDir, UWF_SKILLS_ROOT: skillsRoot };
   const common = ["--data-dir", dataDir];
-  const withOut = ["--output-path", outputPath, ...common];
   const cli = (script, args, extra = common) => runCli(script, [...args, ...extra], { cwd: repoRoot, env: cliEnv });
-  const note = (text) => cli(STATE, ["note", "--agent", AGENT_ID, "--note", text], withOut);
 
   try {
+    const outputPath =
+      flags["output-path"] ??
+      (!scratch && (command === "resume" || (Boolean(flags["from-stage"]) && flags.force !== true))
+        ? readRecordedOutputPath(dataDir, cli)
+        : null) ??
+      "./tmp/workflow-artifacts";
+    const withOut = ["--output-path", outputPath, ...common];
+    const note = (text) => cli(STATE, ["note", "--agent", AGENT_ID, "--note", text], withOut);
+
     const listed = cli(runScript, ["--list-stages"], withOut);
     if (!listed.ok || !Array.isArray(listed.data)) throw new UsageError(`Cannot list stages: ${listed.error}`);
     const stages = listed.data;
@@ -463,9 +495,10 @@ async function main(argv) {
       if (!flags["from-stage"] && flags.force !== true) {
         if (priorTracked.length && stages.every((st) => isDone(priorTracked.find((x) => x.stage === st.name)?.status)) && readPhase() === "closed") {
           if (needsFinalization(dataDir)) {
-            ensureRunMeta(dataDir, { workflow, outputPath, repoRoot });
+            const finalOutputPath = flags["output-path"] ?? readRecordedOutputPath(dataDir, cli) ?? outputPath;
+            ensureRunMeta(dataDir, { workflow, outputPath: finalOutputPath, repoRoot });
             log("[runner] all stages complete; retrying pending provenance finalization");
-            return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows: tableRows(priorTracked), note, log });
+            return await finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath: finalOutputPath, deferSeal, rows: tableRows(priorTracked), note, log });
           }
           log("[runner] workflow already complete; nothing to do (use --force to start over)");
           process.stdout.write(formatTable(tableRows(priorTracked)));
@@ -723,7 +756,7 @@ async function stageLoop(ctx) {
           if (st.name === "snapshot") {
             let snapErr = null;
             try {
-              const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal });
+              const m = await materializeManifest({ dataDir, workflow, repoRoot, skillsRoot, outputPath, phase: "snapshot", deferSeal: false });
               if (!m.ok) snapErr = `context hub sink failed in strict mode (${m.sink?.error ?? "unknown"})`;
             } catch (err) {
               log(`[runner] provenance manifest at snapshot failed: ${err.message}`);

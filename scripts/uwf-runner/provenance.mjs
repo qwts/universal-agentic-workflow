@@ -1697,9 +1697,10 @@ export async function materializeManifest({
   }
   writeFileSync(manifestPath, built.canonicalJson, "utf8");
 
-  let sinkResult = { ok: true, status: deferSeal ? "deferred" : "disabled", exitCode: 0 };
-  if (dispatchSink && !deferSeal) {
-    const isStageEvent = phase === "snapshot";
+  const isStageEvent = phase === "snapshot";
+  const suppressForDefer = Boolean(deferSeal && !isStageEvent);
+  let sinkResult = { ok: true, status: suppressForDefer ? "deferred" : "disabled", exitCode: 0 };
+  if (dispatchSink && !suppressForDefer) {
     const snapStage = isStageEvent
       ? (built.manifest.stages ?? []).find((s) => s.stage === "snapshot")
       : null;

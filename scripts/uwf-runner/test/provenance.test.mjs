@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -543,12 +544,12 @@ try {
     const healedManifest = JSON.parse(readFileSync(join(runData, "uaw-manifest.json"), "utf8"));
     assert.equal(healedManifest.phase, "closed", "resume after deferred finalization failure preserves deferSeal phase=closed");
 
-    // Step K: snapshot strict sink failure leaves snapshot stage pending so resume replays it
+    // Step K: snapshot strict sink failure with --defer-seal leaves snapshot pending so resume replays it
     let snapFailExit = 0;
     try {
       execFileSync(
         process.execPath,
-        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--from-stage", "snapshot", "--goal", "Fail snapshot sink", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData],
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--from-stage", "snapshot", "--goal", "Fail snapshot sink", "--adapter", "fake", "--repo-root", runRoot, "--data-dir", runData, "--defer-seal"],
         {
           encoding: "utf8",
           env: {
@@ -1157,6 +1158,117 @@ try {
     );
     const bracketVerify = verifyManifest({ dataDir: bracketData, repoRoot: bracketRepo });
     assert.equal(bracketVerify.ok, true, JSON.stringify(bracketVerify.errors));
+
+    // Step N: --defer-seal delivers snapshot stage.completed to strict sink while deferring run.finalized
+    const snapDeferRoot = join(runRoot, "snap-defer-root");
+    const snapDeferData = join(runRoot, "snap-defer-data");
+    mkdirSync(snapDeferRoot, { recursive: true });
+    writeFileSync(join(snapDeferRoot, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const receivedEvents = [];
+    const snapServer = createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        receivedEvents.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise((resolveListen) => snapServer.listen(0, "127.0.0.1", resolveListen));
+    try {
+      const { port } = snapServer.address();
+      await new Promise((resolveSpawn, rejectSpawn) => {
+        const child = spawn(
+          process.execPath,
+          [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Defer seal snapshot delivery", "--adapter", "fake", "--repo-root", snapDeferRoot, "--data-dir", snapDeferData, "--defer-seal"],
+          {
+            env: {
+              ...env,
+              UAW_CONTEXT_HUB_SINK: "webhook",
+              UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook`,
+              UAW_CONTEXT_HUB_TOKEN: "tok",
+              UAW_CONTEXT_HUB_MODE: "strict",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        let stderr = "";
+        child.stderr.on("data", (d) => { stderr += d; });
+        child.on("error", rejectSpawn);
+        child.on("close", (code) => {
+          if (code === 0) resolveSpawn();
+          else rejectSpawn(new Error(`runner exited ${code}: ${stderr}`));
+        });
+      });
+    } finally {
+      await new Promise((resolveClose) => snapServer.close(resolveClose));
+    }
+    assert.equal(receivedEvents.length, 1, "exactly snapshot stage.completed must be dispatched under --defer-seal");
+    assert.equal(receivedEvents[0].event, "stage.completed");
+    assert.equal(receivedEvents[0].stage, "snapshot");
+    const snapDeferManifest = JSON.parse(readFileSync(join(snapDeferData, "uaw-manifest.json"), "utf8"));
+    assert.equal(snapDeferManifest.phase, "closed");
+    const snapDeferDb = new Database(join(snapDeferData, "uwf-state.db"), { readonly: true });
+    const snapDeferRow = snapDeferDb.prepare("SELECT phase, sink_status FROM run_manifests LIMIT 1").get();
+    snapDeferDb.close();
+    assert.equal(snapDeferRow?.phase, "closed");
+    assert.equal(snapDeferRow?.sink_status, "deferred");
+
+    // Step O: runner.mjs resume restores custom output_path when --output-path flag is omitted
+    const customRoot = join(runRoot, "custom-out-root");
+    const customData = join(runRoot, "custom-out-data");
+    const customOutAbs = join(customRoot, "custom-out");
+    const fxCustom = join(runRoot, "fx-custom-out");
+    cpSync(fxDir, fxCustom, { recursive: true });
+    const rewriteFilesMap = (filesObj) => {
+      if (!filesObj || typeof filesObj !== "object") return filesObj;
+      return Object.fromEntries(
+        Object.entries(filesObj).map(([k, v]) => [k.replace(/^tmp\/workflow-artifacts\//, "custom-out/"), v]),
+      );
+    };
+    for (const entry of readdirSync(fxCustom)) {
+      if (!entry.endsWith(".json")) continue;
+      const p = join(fxCustom, entry);
+      const parsed = JSON.parse(readFileSync(p, "utf8"));
+      if (parsed.files) parsed.files = rewriteFilesMap(parsed.files);
+      if (Array.isArray(parsed.attempts)) {
+        parsed.attempts = parsed.attempts.map((a) => ({ ...a, files: rewriteFilesMap(a.files) }));
+      }
+      writeFileSync(p, JSON.stringify(parsed, null, 2));
+    }
+    mkdirSync(customRoot, { recursive: true });
+    writeFileSync(join(customRoot, ".uwf.json"), JSON.stringify({ verify: [] }));
+    const savedDiscovery = readFileSync(join(fxCustom, "discovery.json"), "utf8");
+    writeFileSync(join(fxCustom, "discovery.json"), JSON.stringify({ files: {}, transcript: "empty", sessionId: "sess-fail-disc" }));
+    let customFailExit = 0;
+    try {
+      execFileSync(
+        process.execPath,
+        [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Custom output path resume", "--adapter", "fake", "--repo-root", customRoot, "--data-dir", customData, "--output-path", customOutAbs, "--defer-seal"],
+        { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxCustom, UWF_DATA_DIR: "" }, stdio: "pipe" },
+      );
+    } catch (err) {
+      customFailExit = err.status;
+    }
+    assert.equal(customFailExit, 1, "initial custom output-path run must fail on broken discovery fixture");
+    writeFileSync(join(fxCustom, "discovery.json"), savedDiscovery);
+    execFileSync(
+      process.execPath,
+      [RUNNER_CLI, "resume", "--workflow", "sw_dev", "--adapter", "fake", "--repo-root", customRoot, "--data-dir", customData, "--defer-seal"],
+      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxCustom, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    assert.equal(existsSync(join(customRoot, "tmp", "workflow-artifacts")), false, "resume must not fall back to ./tmp/workflow-artifacts");
+    const customVerify = verifyManifest({ dataDir: customData, repoRoot: customRoot });
+    assert.equal(customVerify.ok, true, JSON.stringify(customVerify.errors));
+    const customManifest = JSON.parse(readFileSync(join(customData, "uaw-manifest.json"), "utf8"));
+    assert.ok(
+      customManifest.stages.find((s) => s.stage === "intake")?.outputs.some((o) => o.path === "custom-out/issues-intake.md"),
+      "resumed custom output-path manifest must retain custom-out intake output",
+    );
+    assert.ok(
+      customManifest.stages.find((s) => s.stage === "discovery")?.outputs.some((o) => o.path === "custom-out/issues-discovery.md"),
+      "resumed custom output-path manifest must record custom-out discovery output",
+    );
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }
