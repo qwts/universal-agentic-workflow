@@ -15,7 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SECRET_PATTERNS } from "../../hooks/secret-patterns.mjs";
-import { assertAllowedPath, lookupRunById, registerRunIndex, writeRunMeta } from "../paths.mjs";
+import { claimDataDirLock } from "../ownership.mjs";
+import { assertAllowedPath, lookupRunById, readRunMeta, registerRunIndex, writeRunMeta } from "../paths.mjs";
 import { createMcpHandler, MCP_PROTOCOL_VERSION } from "../protocol.mjs";
 import { isOriginAllowed, startHttpServer } from "../server.mjs";
 
@@ -424,6 +425,56 @@ try {
     repo_root: safeRepo,
   });
   assert.equal(goalFileDryRun.structuredContent.exit_code, 0, goalFileDryRun.structuredContent?.stderr ?? "");
+
+  // 10. uaw_gates validates persisted meta.output_path against allowedRoots
+  const escapedMetaDir = join(safeRepo, "escaped-gates-meta");
+  writeRunMeta(escapedMetaDir, {
+    run_id: "uaw-escaped-gates",
+    workflow: "sw_dev",
+    data_dir: escapedMetaDir,
+    output_path: "/etc",
+    repo_root: safeRepo,
+  });
+  const escapedGates = await handler.callTool("uaw_gates", {
+    workflow: "sw_dev",
+    mode: "check",
+    stage: "intake",
+    data_dir: escapedMetaDir,
+    repo_root: safeRepo,
+  });
+  assert.equal(escapedGates.isError, true);
+  assert.equal(escapedGates.structuredContent.exit_code, 2);
+
+  // 11. uaw_resume rejects mismatched output_path overrides against persisted run-meta.json
+  const mismatchResume = await handler.callTool("uaw_resume", {
+    data_dir: transDataA,
+    output_path: join(safeRepo, "different-out"),
+    adapter: "fake",
+    fake_fixture_dir: fxDir,
+    repo_root: safeRepo,
+  });
+  assert.equal(mismatchResume.isError, true);
+  assert.equal(mismatchResume.structuredContent.exit_code, 2);
+  assert.equal(readRunMeta(transDataA)?.output_path, transOutA);
+
+  // 12. uaw_question_resolve mutating actions (answer/skip) respect active dataDir serialization lock
+  const heldDataLock = claimDataDirLock({ dataDir: transDataA, runId: "holder", stateDir });
+  try {
+    const blockedSkip = await handler.callTool("uaw_question_resolve", {
+      action: "skip",
+      id: 1,
+      data_dir: transDataA,
+    });
+    assert.equal(blockedSkip.isError, true);
+    assert.equal(blockedSkip.structuredContent.exit_code, 2);
+  } finally {
+    heldDataLock.release();
+  }
+  const allowedList = await handler.callTool("uaw_question_resolve", {
+    action: "list",
+    data_dir: transDataA,
+  });
+  assert.equal(allowedList.isError, false, allowedList.structuredContent?.error ?? "");
 
   const srv = await startHttpServer({
     host: "127.0.0.1",

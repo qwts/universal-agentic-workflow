@@ -21,9 +21,10 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import { costReport, transcriptRow } from "../uwf-runner/cost.mjs";
-import { assertNoActiveRunLock, claimOutputPath } from "./ownership.mjs";
+import { assertNoActiveRunLock, claimDataDirLock, claimOutputPath } from "./ownership.mjs";
 import {
   assertAllowedPath,
+  canonicalizePath,
   defaultOutputPath,
   generateRunId,
   readRunMeta,
@@ -372,8 +373,16 @@ export async function cmdRun(params = {}, ctx = {}) {
   const force = params.force === true;
 
   const workflow = assertSafeWorkflow(params.workflow, "workflow");
+  if (params.adapter) assertSafeIdentifier(params.adapter, "adapter");
+  if (params.model) assertNoLeadingDash(params.model, "model");
+  if (params.from_stage) assertSafeIdentifier(params.from_stage, "from_stage");
+  if (params.timeout_ms !== undefined) assertNoLeadingDash(params.timeout_ms, "timeout_ms");
+  if (params.max_cost_usd !== undefined) assertNoLeadingDash(params.max_cost_usd, "max_cost_usd");
+  if (params.resume_max_context !== undefined) {
+    assertNoLeadingDash(params.resume_max_context, "resume_max_context");
+  }
 
-  const target = resolveRunTarget({
+  const initialTarget = resolveRunTarget({
     run_id: params.run_id,
     data_dir: params.data_dir,
     stateDir,
@@ -381,52 +390,129 @@ export async function cmdRun(params = {}, ctx = {}) {
     requireExisting: false,
   });
 
-  const dataDir = target.dataDir;
-  const existingMeta = target.meta;
-  const runId = force && !params.run_id && !params.from_stage
-    ? generateRunId(workflow)
-    : (existingMeta?.run_id ?? params.run_id ?? generateRunId(workflow));
-  const rawOutputPath = params.output_path ?? existingMeta?.output_path ?? defaultOutputPath(dataDir);
-  const outputPath = assertAllowedPath(rawOutputPath, allowedRoots, "output_path");
-  const repoRoot = resolveRepoRoot(params.repo_root, existingMeta?.repo_root, allowedRoots);
-  const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
-  const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
-  const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
+  const dataDir = initialTarget.dataDir;
 
-  const args = [
-    "run",
-    "--workflow",
-    workflow,
-    "--goal",
-    goalArg,
-    "--data-dir",
+  if (dryRun) {
+    const existingMeta = initialTarget.meta;
+    const runId = force && !params.run_id && !params.from_stage
+      ? generateRunId(workflow)
+      : (existingMeta?.run_id ?? params.run_id ?? generateRunId(workflow));
+    const rawOutputPath = params.output_path ?? existingMeta?.output_path ?? defaultOutputPath(dataDir);
+    const outputPath = assertAllowedPath(rawOutputPath, allowedRoots, "output_path");
+    const repoRoot = resolveRepoRoot(params.repo_root, existingMeta?.repo_root, allowedRoots);
+    const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
+    const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+    const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
+
+    const args = [
+      "run",
+      "--workflow",
+      workflow,
+      "--goal",
+      goalArg,
+      "--data-dir",
+      dataDir,
+      "--output-path",
+      outputPath,
+      "--dry-run",
+    ];
+    if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
+    if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
+    if (params.from_stage) args.push("--from-stage", assertSafeIdentifier(params.from_stage, "from_stage"));
+    if (force) args.push("--force");
+    if (params.unlock === true) args.push("--unlock");
+    if (params.non_interactive === true) args.push("--non-interactive");
+    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+    if (params.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
+      args.push("--repo-root", repoRoot);
+    }
+    if (skillsRoot) args.push("--skills-root", skillsRoot);
+    if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
+    if (params.resume_max_context !== undefined) {
+      args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
+    }
+
+    const env = { UAW_RUN_ID: runId };
+    if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
+    const res = await execNodeAsync(RUNNER_CLI, args, { cwd: repoRoot, env });
+    return buildRunEnvelope({
+      runId,
+      dataDir,
+      outputPath,
+      workflow,
+      exitCode: res.code,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      dryRun: true,
+    });
+  }
+
+  // Acquire atomic out-of-tree data_dir lock BEFORE reading/mutating metadata or claiming output_path.
+  const dataLock = claimDataDirLock({
     dataDir,
-    "--output-path",
-    outputPath,
-  ];
-  if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
-  if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
-  if (params.from_stage) args.push("--from-stage", assertSafeIdentifier(params.from_stage, "from_stage"));
-  if (force) args.push("--force");
-  if (params.unlock === true) args.push("--unlock");
-  if (params.non_interactive === true) args.push("--non-interactive");
-  if (dryRun) args.push("--dry-run");
-  if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
-  if (params.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
-    args.push("--repo-root", repoRoot);
-  }
-  if (skillsRoot) args.push("--skills-root", skillsRoot);
-  if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
-  if (params.resume_max_context !== undefined) {
-    args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
-  }
-
-  const env = { UAW_RUN_ID: runId };
-  if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
-
+    runId: params.run_id ?? initialTarget.runId ?? "run",
+    stateDir,
+    unlock: params.unlock === true,
+  });
   let claim = null;
-  if (!dryRun) {
+  try {
     assertNoActiveRunLock(dataDir);
+    const lockedTarget = resolveRunTarget({
+      run_id: params.run_id,
+      data_dir: dataDir,
+      stateDir,
+      allowedRoots,
+      requireExisting: false,
+    });
+    const existingMeta = lockedTarget.meta;
+    const runId = force && !params.run_id && !params.from_stage
+      ? generateRunId(workflow)
+      : (existingMeta?.run_id ?? params.run_id ?? generateRunId(workflow));
+    const rawOutputPath = params.output_path ?? existingMeta?.output_path ?? defaultOutputPath(dataDir);
+    const outputPath = assertAllowedPath(rawOutputPath, allowedRoots, "output_path");
+    if (!force && existingMeta?.output_path) {
+      const persistedOut = assertAllowedPath(existingMeta.output_path, allowedRoots, "output_path");
+      if (canonicalizePath(persistedOut) !== canonicalizePath(outputPath)) {
+        throw new UsageError(
+          `Cannot change output_path from "${persistedOut}" to "${outputPath}" on existing data_dir without force=true`,
+        );
+      }
+    }
+    const repoRoot = resolveRepoRoot(params.repo_root, existingMeta?.repo_root, allowedRoots);
+    const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
+    const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+    const goalArg = resolveGoalArg(params, repoRoot, allowedRoots);
+
+    const args = [
+      "run",
+      "--workflow",
+      workflow,
+      "--goal",
+      goalArg,
+      "--data-dir",
+      dataDir,
+      "--output-path",
+      outputPath,
+    ];
+    if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
+    if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
+    if (params.from_stage) args.push("--from-stage", assertSafeIdentifier(params.from_stage, "from_stage"));
+    if (force) args.push("--force");
+    if (params.unlock === true) args.push("--unlock");
+    if (params.non_interactive === true) args.push("--non-interactive");
+    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+    if (params.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
+      args.push("--repo-root", repoRoot);
+    }
+    if (skillsRoot) args.push("--skills-root", skillsRoot);
+    if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
+    if (params.resume_max_context !== undefined) {
+      args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
+    }
+
+    const env = { UAW_RUN_ID: runId };
+    if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
+
     claim = claimOutputPath({
       outputPath,
       runId,
@@ -435,25 +521,21 @@ export async function cmdRun(params = {}, ctx = {}) {
       unlock: params.unlock === true,
       force,
     });
-  }
 
-  try {
-    if (!dryRun) {
-      const preserved = existingMeta && !force ? existingMeta : {};
-      const meta = {
-        ...preserved,
-        run_id: runId,
-        workflow,
-        data_dir: dataDir,
-        output_path: outputPath,
-        repo_root: repoRoot,
-        skills_root: skillsRoot ?? preserved.skills_root ?? null,
-        created_at: !force && existingMeta?.created_at ? existingMeta.created_at : new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-      writeRunMeta(dataDir, meta);
-      registerRunIndex(stateDir, meta);
-    }
+    const preserved = existingMeta && !force ? existingMeta : {};
+    const meta = {
+      ...preserved,
+      run_id: runId,
+      workflow,
+      data_dir: dataDir,
+      output_path: outputPath,
+      repo_root: repoRoot,
+      skills_root: skillsRoot ?? preserved.skills_root ?? null,
+      created_at: !force && existingMeta?.created_at ? existingMeta.created_at : new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    writeRunMeta(dataDir, meta);
+    registerRunIndex(stateDir, meta);
 
     const res = await execNodeAsync(RUNNER_CLI, args, {
       cwd: repoRoot,
@@ -468,10 +550,11 @@ export async function cmdRun(params = {}, ctx = {}) {
       exitCode: res.code,
       stdout: res.stdout,
       stderr: res.stderr,
-      dryRun,
+      dryRun: false,
     });
   } finally {
     claim?.release();
+    dataLock.release();
   }
 }
 
@@ -483,7 +566,15 @@ export async function cmdResume(params = {}, ctx = {}) {
   const allowedRoots = ctx.allowedRoots ?? [];
   const stateDir = resolveUawStateDir(ctx.stateDir);
 
-  const target = resolveRunTarget({
+  if (params.adapter) assertSafeIdentifier(params.adapter, "adapter");
+  if (params.model) assertNoLeadingDash(params.model, "model");
+  if (params.timeout_ms !== undefined) assertNoLeadingDash(params.timeout_ms, "timeout_ms");
+  if (params.max_cost_usd !== undefined) assertNoLeadingDash(params.max_cost_usd, "max_cost_usd");
+  if (params.resume_max_context !== undefined) {
+    assertNoLeadingDash(params.resume_max_context, "resume_max_context");
+  }
+
+  const initialTarget = resolveRunTarget({
     run_id: params.run_id,
     data_dir: params.data_dir,
     stateDir,
@@ -491,68 +582,108 @@ export async function cmdResume(params = {}, ctx = {}) {
     requireExisting: true,
   });
 
-  const dataDir = target.dataDir;
-  const meta = target.meta ?? readRunMeta(dataDir);
-  let stateFallback = null;
-  try {
-    stateFallback = readState(dataDir);
-  } catch {
-    /* ignore */
-  }
-
-  const rawWorkflow = params.workflow ?? meta?.workflow;
-  const workflow = assertSafeWorkflow(rawWorkflow, "workflow");
-
-  const runId = meta?.run_id ?? params.run_id ?? generateRunId(workflow);
-  const persistedOutput =
-    params.output_path ??
-    meta?.output_path ??
-    stateFallback?.state?.artifact_path ??
-    defaultOutputPath(dataDir);
-  const outputPath = assertAllowedPath(persistedOutput, allowedRoots, "output_path");
-  const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
-  const skillsRoot = resolveOptionalPath(
-    params.skills_root ?? meta?.skills_root,
-    allowedRoots,
-    "skills_root",
-  );
-  const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
-
-  const args = [
-    "resume",
-    "--workflow",
-    workflow,
-    "--data-dir",
+  const dataDir = initialTarget.dataDir;
+  const dataLock = claimDataDirLock({
     dataDir,
-    "--output-path",
-    outputPath,
-  ];
-  if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
-  if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
-  if (params.unlock === true) args.push("--unlock");
-  if (params.non_interactive === true) args.push("--non-interactive");
-  if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
-  if (params.repo_root || meta?.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
-    args.push("--repo-root", repoRoot);
-  }
-  if (skillsRoot) args.push("--skills-root", skillsRoot);
-  if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
-  if (params.resume_max_context !== undefined) {
-    args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
-  }
-
-  const env = { UAW_RUN_ID: runId };
-  if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
-
-  const claim = claimOutputPath({
-    outputPath,
-    runId,
-    dataDir,
+    runId: params.run_id ?? initialTarget.runId ?? "resume",
     stateDir,
     unlock: params.unlock === true,
   });
+  let claim = null;
 
   try {
+    assertNoActiveRunLock(dataDir);
+    const meta = readRunMeta(dataDir) ?? initialTarget.meta;
+    let stateFallback = null;
+    try {
+      stateFallback = readState(dataDir);
+    } catch {
+      /* ignore */
+    }
+
+    const rawWorkflow = params.workflow ?? meta?.workflow;
+    const workflow = assertSafeWorkflow(rawWorkflow, "workflow");
+
+    const runId = meta?.run_id ?? params.run_id ?? generateRunId(workflow);
+    const persistedRaw = meta?.output_path ?? stateFallback?.state?.artifact_path ?? null;
+    let outputPath;
+    if (persistedRaw) {
+      const persistedOutput = assertAllowedPath(persistedRaw, allowedRoots, "output_path");
+      if (params.output_path !== undefined) {
+        const requestedOutput = assertAllowedPath(params.output_path, allowedRoots, "output_path");
+        if (canonicalizePath(requestedOutput) !== canonicalizePath(persistedOutput)) {
+          throw new UsageError(
+            `uaw_resume output_path "${requestedOutput}" does not match persisted output_path "${persistedOutput}"`,
+          );
+        }
+      }
+      outputPath = persistedOutput;
+    } else {
+      outputPath = assertAllowedPath(
+        params.output_path ?? defaultOutputPath(dataDir),
+        allowedRoots,
+        "output_path",
+      );
+    }
+
+    const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
+    const skillsRoot = resolveOptionalPath(
+      params.skills_root ?? meta?.skills_root,
+      allowedRoots,
+      "skills_root",
+    );
+    const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
+
+    const args = [
+      "resume",
+      "--workflow",
+      workflow,
+      "--data-dir",
+      dataDir,
+      "--output-path",
+      outputPath,
+    ];
+    if (params.adapter) args.push("--adapter", assertSafeIdentifier(params.adapter, "adapter"));
+    if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
+    if (params.unlock === true) args.push("--unlock");
+    if (params.non_interactive === true) args.push("--non-interactive");
+    if (params.timeout_ms !== undefined) args.push("--timeout-ms", assertNoLeadingDash(params.timeout_ms, "timeout_ms"));
+    if (params.repo_root || meta?.repo_root || (Array.isArray(allowedRoots) && allowedRoots.length > 0)) {
+      args.push("--repo-root", repoRoot);
+    }
+    if (skillsRoot) args.push("--skills-root", skillsRoot);
+    if (params.max_cost_usd !== undefined) args.push("--max-cost-usd", assertNoLeadingDash(params.max_cost_usd, "max_cost_usd"));
+    if (params.resume_max_context !== undefined) {
+      args.push("--resume-max-context", assertNoLeadingDash(params.resume_max_context, "resume_max_context"));
+    }
+
+    const env = { UAW_RUN_ID: runId };
+    if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
+
+    claim = claimOutputPath({
+      outputPath,
+      runId,
+      dataDir,
+      stateDir,
+      unlock: params.unlock === true,
+    });
+
+    if (!meta || !meta.output_path) {
+      const updatedMeta = {
+        ...(meta ?? {}),
+        run_id: runId,
+        workflow,
+        data_dir: dataDir,
+        output_path: outputPath,
+        repo_root: repoRoot,
+        skills_root: skillsRoot ?? meta?.skills_root ?? null,
+        created_at: meta?.created_at ?? new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      writeRunMeta(dataDir, updatedMeta);
+      registerRunIndex(stateDir, updatedMeta);
+    }
+
     const res = await execNodeAsync(RUNNER_CLI, args, {
       cwd: repoRoot,
       env,
@@ -567,7 +698,8 @@ export async function cmdResume(params = {}, ctx = {}) {
       stderr: res.stderr,
     });
   } finally {
-    claim.release();
+    claim?.release();
+    dataLock.release();
   }
 }
 
@@ -602,9 +734,8 @@ export async function cmdGates(params = {}, ctx = {}) {
     allowedRoots,
     "skills_root",
   );
-  const outputPath = params.output_path
-    ? assertAllowedPath(params.output_path, allowedRoots, "output_path")
-    : meta?.output_path ?? (dataDir ? defaultOutputPath(dataDir) : undefined);
+  const rawOutput = params.output_path ?? meta?.output_path ?? (dataDir ? defaultOutputPath(dataDir) : undefined);
+  const outputPath = rawOutput ? assertAllowedPath(rawOutput, allowedRoots, "output_path") : undefined;
 
   const mode = params.mode ?? (params.stage ? "check" : "prescriptions");
   const env = {};
@@ -721,9 +852,11 @@ export async function cmdCost(params = {}, ctx = {}) {
     allowedRoots,
     "skills_root",
   );
-  const outputPath = params.output_path
-    ? assertAllowedPath(params.output_path, allowedRoots, "output_path")
-    : meta?.output_path ?? defaultOutputPath(dataDir);
+  const outputPath = assertAllowedPath(
+    params.output_path ?? meta?.output_path ?? defaultOutputPath(dataDir),
+    allowedRoots,
+    "output_path",
+  );
 
   const summary = computeCostSummary(dataDir);
   let report = null;
@@ -784,37 +917,50 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
   });
 
   const dataDir = target.dataDir;
-  const meta = target.meta;
-  const workflow = scope === "stage"
-    ? assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow")
-    : (params.workflow ? assertSafeWorkflow(params.workflow, "workflow") : meta?.workflow ?? null);
-  const runId = target.runId ?? generateRunId(workflow ?? "uaw");
-  const outputPath = assertAllowedPath(
-    params.output_path ?? meta?.output_path ?? defaultOutputPath(dataDir),
-    allowedRoots,
-    "output_path",
-  );
-  const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
-  const skillsRoot = resolveOptionalPath(
-    params.skills_root ?? meta?.skills_root,
-    allowedRoots,
-    "skills_root",
-  );
 
-  // Enforce single-writer lock & cross-run output ownership invariants (ADR-0008).
-  assertNoActiveRunLock(dataDir);
-  const claim = claimOutputPath({
-    outputPath,
-    runId,
+  const dataLock = claimDataDirLock({
     dataDir,
+    runId: target.runId ?? "stage-transition",
     stateDir,
     unlock: params.unlock === true,
   });
-
-  const common = ["--data-dir", dataDir, "--output-path", outputPath];
-  const env = { UWF_DATA_DIR: dataDir, ...(skillsRoot ? { UWF_SKILLS_ROOT: skillsRoot } : {}) };
+  let claim = null;
 
   try {
+    assertNoActiveRunLock(dataDir);
+    const meta = readRunMeta(dataDir) ?? target.meta;
+    const workflow = scope === "stage"
+      ? assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow")
+      : (params.workflow ? assertSafeWorkflow(params.workflow, "workflow") : meta?.workflow ?? null);
+    const runId = meta?.run_id ?? target.runId ?? generateRunId(workflow ?? "uaw");
+    const rawOutput = params.output_path ?? meta?.output_path ?? defaultOutputPath(dataDir);
+    const outputPath = assertAllowedPath(rawOutput, allowedRoots, "output_path");
+    if (meta?.output_path && params.output_path) {
+      const persistedOut = assertAllowedPath(meta.output_path, allowedRoots, "output_path");
+      if (canonicalizePath(persistedOut) !== canonicalizePath(outputPath)) {
+        throw new UsageError(
+          `uaw_stage_transition output_path "${outputPath}" does not match persisted output_path "${persistedOut}"`,
+        );
+      }
+    }
+    const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
+    const skillsRoot = resolveOptionalPath(
+      params.skills_root ?? meta?.skills_root,
+      allowedRoots,
+      "skills_root",
+    );
+
+    claim = claimOutputPath({
+      outputPath,
+      runId,
+      dataDir,
+      stateDir,
+      unlock: params.unlock === true,
+    });
+
+    const common = ["--data-dir", dataDir, "--output-path", outputPath];
+    const env = { UWF_DATA_DIR: dataDir, ...(skillsRoot ? { UWF_SKILLS_ROOT: skillsRoot } : {}) };
+
     if (!meta) {
       const createdMeta = {
         run_id: runId,
@@ -879,7 +1025,8 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || `exit ${res.code}`,
     }).value;
   } finally {
-    claim.release();
+    claim?.release();
+    dataLock.release();
   }
 }
 
@@ -907,10 +1054,6 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
   });
   const dataDir = target.dataDir;
 
-  if (action === "answer" || action === "skip") {
-    assertNoActiveRunLock(dataDir);
-  }
-
   const args = [action, "--data-dir", dataDir];
   if (params.stage) args.push("--stage", assertSafeIdentifier(params.stage, "stage"));
   if (params.status) args.push("--status", assertSafeIdentifier(params.status, "status"));
@@ -921,18 +1064,61 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
   }
   if (params.answer !== undefined) args.push("--answer", assertNoLeadingDash(params.answer, "answer"));
 
-  const res = await execNodeAsync(QUESTIONS_CLI, args, {
-    cwd: OWN_REPO_ROOT,
-    env: { UWF_DATA_DIR: dataDir },
-  });
+  if (action !== "answer" && action !== "skip") {
+    const res = await execNodeAsync(QUESTIONS_CLI, args, {
+      cwd: OWN_REPO_ROOT,
+      env: { UWF_DATA_DIR: dataDir },
+    });
+    return redactDeep({
+      ok: res.code === 0 && res.json?.ok !== false,
+      exit_code: res.code,
+      run_id: target.runId,
+      data_dir: dataDir,
+      action,
+      result: res.json,
+      error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || null,
+    }).value;
+  }
 
-  return redactDeep({
-    ok: res.code === 0 && res.json?.ok !== false,
-    exit_code: res.code,
-    run_id: target.runId,
-    data_dir: dataDir,
-    action,
-    result: res.json,
-    error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || null,
-  }).value;
+  const dataLock = claimDataDirLock({
+    dataDir,
+    runId: target.runId ?? "question-resolve",
+    stateDir,
+    unlock: params.unlock === true,
+  });
+  let claim = null;
+
+  try {
+    assertNoActiveRunLock(dataDir);
+    const meta = readRunMeta(dataDir) ?? target.meta;
+    const lockRunId = meta?.run_id ?? target.runId ?? null;
+    if (meta?.output_path && lockRunId) {
+      const outPath = assertAllowedPath(meta.output_path, allowedRoots, "output_path");
+      claim = claimOutputPath({
+        outputPath: outPath,
+        runId: lockRunId,
+        dataDir,
+        stateDir,
+        unlock: params.unlock === true,
+      });
+    }
+
+    const res = await execNodeAsync(QUESTIONS_CLI, args, {
+      cwd: OWN_REPO_ROOT,
+      env: { UWF_DATA_DIR: dataDir },
+    });
+
+    return redactDeep({
+      ok: res.code === 0 && res.json?.ok !== false,
+      exit_code: res.code,
+      run_id: lockRunId,
+      data_dir: dataDir,
+      action,
+      result: res.json,
+      error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || null,
+    }).value;
+  } finally {
+    claim?.release();
+    dataLock.release();
+  }
 }

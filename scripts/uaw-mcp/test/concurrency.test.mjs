@@ -221,6 +221,44 @@ try {
     assert.equal(run1Done.phase, "closed");
   }
 
+  // 4. Two concurrent uaw_run calls sharing ONE data_dir with DIFFERENT explicit output_paths serialize cleanly
+  {
+    const sharedDataDir = join(ws.repoRoot, ".runs", "shared-data-dir-race");
+    const raceOut1 = join(ws.repoRoot, "deliverables", "race-out-1");
+    const raceOut2 = join(ws.repoRoot, "deliverables", "race-out-2");
+    const fx1 = ws.writeFixturesForOutput(raceOut1);
+    const fx2 = ws.writeFixturesForOutput(raceOut2);
+    const [r1, r2] = await Promise.all([
+      callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Race 1 on shared data_dir",
+        adapter: "fake",
+        data_dir: sharedDataDir,
+        output_path: raceOut1,
+        repo_root: ws.repoRoot,
+        skills_root: ws.skillsRoot,
+        fake_fixture_dir: fx1,
+      }),
+      callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Race 2 on shared data_dir",
+        adapter: "fake",
+        data_dir: sharedDataDir,
+        output_path: raceOut2,
+        repo_root: ws.repoRoot,
+        skills_root: ws.skillsRoot,
+        fake_fixture_dir: fx2,
+      }),
+    ]);
+    const winner = [r1, r2].find((r) => r.exit_code !== 2);
+    const loser = [r1, r2].find((r) => r.exit_code === 2);
+    assert.ok(winner, `exactly one shared data_dir contender should proceed; got ${JSON.stringify([r1, r2])}`);
+    assert.ok(loser, "second shared data_dir contender must be rejected with exit_code 2");
+    assert.equal(winner.exit_code, 0);
+    assert.equal(readRunMeta(sharedDataDir)?.output_path, winner.output_path);
+    assert.equal(readRunMeta(sharedDataDir)?.run_id, winner.run_id);
+  }
+
   console.log("uaw-mcp concurrency & out-of-tree output ownership tests passed");
 } finally {
   await srv.close();

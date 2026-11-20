@@ -64,6 +64,115 @@ function readJsonQuiet(filePath) {
   }
 }
 
+function acquireFileLock({
+  lockPath,
+  lockPayload,
+  lockToken,
+  heldMessage,
+  waitMessage,
+  stalePrefix,
+  unlock = false,
+  beforeReturn = null,
+}) {
+  const lockTmp = `${lockPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let allowUnlock = unlock === true;
+
+  try {
+    writeFileSync(lockTmp, JSON.stringify(lockPayload, null, 2) + "\n", "utf8");
+    while (true) {
+      try {
+        linkSync(lockTmp, lockPath);
+        if (beforeReturn) beforeReturn();
+        const release = () => {
+          try {
+            if (readJsonQuiet(lockPath)?.token === lockToken) {
+              rmSync(lockPath, { force: true });
+            }
+          } catch {
+            /* already removed */
+          }
+        };
+        return { lockPath, release };
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+
+      let st;
+      try {
+        st = statSync(lockPath);
+      } catch {
+        continue; // released between link and stat
+      }
+      const other = readJsonQuiet(lockPath);
+      if (other && Number.isInteger(other.pid) && pidAlive(other.pid)) {
+        throw new UsageError(heldMessage(other));
+      }
+      const isStale = Date.now() - st.mtimeMs > LOCK_UNREADABLE_STALE_MS;
+      if (!other && !isStale) {
+        if (Date.now() >= deadline) {
+          throw new UsageError(waitMessage);
+        }
+        sleepMs(50);
+        continue;
+      }
+      if (!allowUnlock) {
+        const left = other
+          ? `left by run "${other.run_id}" (pid ${other.pid}, not running)`
+          : "unreadable and older than 10s";
+        throw new UsageError(
+          `${stalePrefix} ${left}: ${lockPath}. Retry with unlock=true to clear it.`,
+        );
+      }
+      rmSync(lockPath, { force: true });
+      allowUnlock = false;
+    }
+  } finally {
+    rmSync(lockTmp, { force: true });
+  }
+}
+
+export function dataDirLockPath(dataDir, stateDir) {
+  const locksDir = join(resolveUawStateDir(stateDir), "data-locks");
+  const key = createHash("sha256").update(canonicalizePath(dataDir)).digest("hex");
+  return {
+    key,
+    locksDir,
+    lockPath: join(locksDir, `${key}.lock`),
+  };
+}
+
+/**
+ * Acquire an atomic out-of-tree serialization lock for a `data_dir` before reading/updating
+ * durable metadata or spawning child runners/CLIs.
+ */
+export function claimDataDirLock({ dataDir, runId = "mcp", stateDir, unlock = false }) {
+  if (!dataDir) throw new UsageError("dataDir is required for data_dir lock");
+  const canonicalDataDir = canonicalizePath(dataDir);
+  const { locksDir, lockPath } = dataDirLockPath(canonicalDataDir, stateDir);
+  mkdirSync(locksDir, { recursive: true });
+
+  const lockToken = `data-${runId}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const lockPayload = {
+    run_id: runId,
+    data_dir: canonicalDataDir,
+    token: lockToken,
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+  };
+
+  return acquireFileLock({
+    lockPath,
+    lockPayload,
+    lockToken,
+    heldMessage: (other) =>
+      `Data dir "${canonicalDataDir}" execution lock is held by run "${other.run_id}" (pid ${other.pid}).`,
+    waitMessage: `Could not acquire execution lock for data_dir "${canonicalDataDir}"; another process is starting.`,
+    stalePrefix: `Data dir "${canonicalDataDir}" has a stale execution lock`,
+    unlock,
+  });
+}
+
 /**
  * Claim durable out-of-tree ownership of `outputPath` for `(runId, dataDir)` and
  * acquire the paired atomic execution lock for the duration of a mutating operation.
@@ -98,9 +207,6 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
     pid: process.pid,
     started_at: new Date().toISOString(),
   };
-  const lockTmp = `${lockPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  let allowUnlock = unlock === true;
   let needsOwnershipUpdate = false;
 
   try {
@@ -123,63 +229,24 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
       if (!sameRun && force) needsOwnershipUpdate = true;
     }
 
-    writeFileSync(lockTmp, JSON.stringify(lockPayload, null, 2) + "\n", "utf8");
-    while (true) {
-      try {
-        linkSync(lockTmp, lockPath);
+    const acquired = acquireFileLock({
+      lockPath,
+      lockPayload,
+      lockToken,
+      heldMessage: (other) =>
+        `Output path "${canonicalOutput}" execution lock is held by run "${other.run_id}" (pid ${other.pid}).`,
+      waitMessage: `Could not acquire execution lock for "${canonicalOutput}"; another process is starting.`,
+      stalePrefix: `Output path "${canonicalOutput}" has a stale execution lock`,
+      unlock,
+      beforeReturn: () => {
         if (needsOwnershipUpdate) {
           renameSync(recordTmp, recordPath);
         }
-        const release = () => {
-          try {
-            if (readJsonQuiet(lockPath)?.token === lockToken) {
-              rmSync(lockPath, { force: true });
-            }
-          } catch {
-            /* already removed */
-          }
-        };
-        return { recordPath, lockPath, release };
-      } catch (e) {
-        if (e.code !== "EEXIST") throw e;
-      }
-
-      let st;
-      try {
-        st = statSync(lockPath);
-      } catch {
-        continue; // released between link and stat
-      }
-      const other = readJsonQuiet(lockPath);
-      if (other && Number.isInteger(other.pid) && pidAlive(other.pid)) {
-        throw new UsageError(
-          `Output path "${canonicalOutput}" execution lock is held by run "${other.run_id}" (pid ${other.pid}).`,
-        );
-      }
-      const isStale = Date.now() - st.mtimeMs > LOCK_UNREADABLE_STALE_MS;
-      if (!other && !isStale) {
-        if (Date.now() >= deadline) {
-          throw new UsageError(
-            `Could not acquire execution lock for "${canonicalOutput}"; another process is starting.`,
-          );
-        }
-        sleepMs(50);
-        continue;
-      }
-      if (!allowUnlock) {
-        const left = other
-          ? `left by run "${other.run_id}" (pid ${other.pid}, not running)`
-          : "unreadable and older than 10s";
-        throw new UsageError(
-          `Output path "${canonicalOutput}" has a stale execution lock ${left}: ${lockPath}. Retry with unlock=true to clear it.`,
-        );
-      }
-      rmSync(lockPath, { force: true });
-      allowUnlock = false;
-    }
+      },
+    });
+    return { recordPath, lockPath: acquired.lockPath, release: acquired.release };
   } finally {
     rmSync(recordTmp, { force: true });
-    rmSync(lockTmp, { force: true });
   }
 }
 
