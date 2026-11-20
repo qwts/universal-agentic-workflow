@@ -37,6 +37,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -70,6 +71,8 @@ const RUN_META_FILE = "run-meta.json";
 const GOAL_FILE = "runner-goal.md";
 const ROUTING_FILE = "runner-routing.json";
 const SCHEMA_VERSION = "1.0.0";
+const MAX_DATA_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_STAGE_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /**
  * Write UTF-8 text or Buffer atomically via a unique sibling temp file, fsync, mode preservation, and `renameSync`.
@@ -279,11 +282,15 @@ function recoverPersistedRunIdentity(absDataDir) {
     out.workflow = historyWorkflow ?? stageLedgerWorkflow ?? null;
   }
 
-  const manifestPath = join(absDataDir, MANIFEST_FILE);
+  let rawMan = null;
   try {
-    const manLst = lstatSync(manifestPath);
-    if (!manLst.isSymbolicLink() && manLst.isFile() && isInsideOrEqual(realpathSync(manifestPath), realDataDir)) {
-      const parsedMan = JSON.parse(readFileSync(manifestPath, "utf8"));
+    rawMan = readContainedDataFile(absDataDir, MANIFEST_FILE, "Manifest").toString("utf8");
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  if (rawMan !== null) {
+    try {
+      const parsedMan = JSON.parse(rawMan);
       if (parsedMan && typeof parsedMan === "object" && !Array.isArray(parsedMan)) {
         const manRunId =
           typeof parsedMan.run_id === "string" && parsedMan.run_id.trim() ? parsedMan.run_id.trim() : null;
@@ -305,8 +312,8 @@ function recoverPersistedRunIdentity(absDataDir) {
           }
         }
       }
-    }
-  } catch { /* ignore unreadable manifest fallback */ }
+    } catch { /* ignore corrupt manifest fallback JSON */ }
+  }
 
   return out;
 }
@@ -345,8 +352,9 @@ export function ensureRunMeta(
   let existing = null;
   let metaFileCorrupt = false;
   if (metaFileExisted) {
+    const rawMeta = readContainedDataFile(absDataDir, RUN_META_FILE, "Run metadata").toString("utf8");
     try {
-      const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+      const parsed = JSON.parse(rawMeta);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.run_id === "string" && parsed.run_id.trim().length > 0) {
         existing = parsed;
       } else {
@@ -856,9 +864,9 @@ function isOutsideRel(rel) {
   return rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
 }
 
-function readRegularFileNoFollow(filePath, label = "Declared output") {
+function readRegularFileNoFollow(filePath, label = "Declared output", { maxBytes = MAX_STAGE_OUTPUT_BYTES, allowedRealRoots = null } = {}) {
   let fd;
-  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
   try {
     fd = openSync(filePath, openFlags);
   } catch (err) {
@@ -875,10 +883,130 @@ function readRegularFileNoFollow(filePath, label = "Declared output") {
       err.code = "EINVAL";
       throw err;
     }
-    return readFileSync(fd);
+    if (st.size > maxBytes) {
+      const err = new Error(`${label} "${filePath}" exceeds size limit (${st.size} > ${maxBytes})`);
+      err.code = "EFBIG";
+      throw err;
+    }
+    if (Array.isArray(allowedRealRoots)) {
+      let realAfterOpen;
+      let postSt;
+      try {
+        realAfterOpen = realpathSync(filePath);
+        postSt = lstatSync(realAfterOpen);
+      } catch (err) {
+        const wrapped = new Error(`Failed post-open verification for ${label.toLowerCase()} "${filePath}": ${err.message}`);
+        wrapped.code = "EINVAL";
+        throw wrapped;
+      }
+      if (!allowedRealRoots.some((r) => isInsideOrEqual(realAfterOpen, r))) {
+        const err = new Error(`Refusing ${label.toLowerCase()} escaping allowed roots: ${filePath}`);
+        err.code = "EACCES";
+        throw err;
+      }
+      if (postSt.dev !== st.dev || postSt.ino !== st.ino) {
+        const err = new Error(`Concurrent path swap detected on ${label.toLowerCase()} "${filePath}"`);
+        err.code = "EINVAL";
+        throw err;
+      }
+    }
+    const chunks = [];
+    let total = 0;
+    const chunkSize = 65536;
+    const scratch = Buffer.allocUnsafe(chunkSize);
+    while (true) {
+      const maxRead = Number.isFinite(maxBytes) ? Math.min(chunkSize, Math.max(1, maxBytes - total + 1)) : chunkSize;
+      let n;
+      while (true) {
+        try {
+          n = readSync(fd, scratch, 0, maxRead, null);
+          break;
+        } catch (err) {
+          if (err.code === "EINTR") continue;
+          throw err;
+        }
+      }
+      if (n === 0) break;
+      total += n;
+      if (total > maxBytes) {
+        const err = new Error(`${label} "${filePath}" exceeds size limit (${total} > ${maxBytes})`);
+        err.code = "EFBIG";
+        throw err;
+      }
+      chunks.push(Buffer.from(scratch.subarray(0, n)));
+    }
+    return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total);
   } finally {
     try { closeSync(fd); } catch { /* ignore close errors */ }
   }
+}
+
+function readContainedDataFile(dataDir, relName, label = "Data file", { maxBytes = MAX_DATA_FILE_BYTES } = {}) {
+  const absDataDir = resolve(dataDir);
+  const filePath = join(absDataDir, relName);
+  const rel = relative(absDataDir, filePath);
+  if (!rel || isOutsideRel(rel)) {
+    const err = new Error(`Refusing ${label.toLowerCase()} path escaping ${absDataDir}: ${filePath}`);
+    err.code = "EINVAL";
+    throw err;
+  }
+  let dirLst;
+  try {
+    dirLst = lstatSync(absDataDir);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      const notFound = new Error(`${label} not found at ${filePath}`);
+      notFound.code = "ENOENT";
+      throw notFound;
+    }
+    throw err;
+  }
+  if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+    const err = new Error(`Refusing unsafe or symlinked directory at ${absDataDir}`);
+    err.code = "ELOOP";
+    throw err;
+  }
+  const realDataDir = realpathSync(absDataDir);
+
+  let cur = absDataDir;
+  const parts = rel.split(sep);
+  for (let i = 0; i < parts.length; i++) {
+    cur = join(cur, parts[i]);
+    let lst;
+    try {
+      lst = lstatSync(cur);
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        const notFound = new Error(`${label} not found at ${filePath}`);
+        notFound.code = "ENOENT";
+        throw notFound;
+      }
+      throw err;
+    }
+    const isLeaf = i === parts.length - 1;
+    if (lst.isSymbolicLink() || (isLeaf ? !lst.isFile() : !lst.isDirectory())) {
+      const detail = lst.isSymbolicLink() ? " (must not be a symlink)" : "";
+      const err = new Error(`Refusing unsafe or symlinked ${label.toLowerCase()}${detail} at ${cur}`);
+      err.code = "ELOOP";
+      throw err;
+    }
+  }
+
+  const realFile = realpathSync(filePath);
+  if (!isInsideOrEqual(realFile, realDataDir)) {
+    const err = new Error(`Refusing ${label.toLowerCase()} escaping ${absDataDir}: ${filePath}`);
+    err.code = "EINVAL";
+    throw err;
+  }
+
+  return readRegularFileNoFollow(filePath, label, { maxBytes, allowedRealRoots: [realDataDir] });
+}
+
+/**
+ * Safely read `<data-dir>/uaw-manifest.json` after verifying regular/contained non-symlink paths.
+ */
+export function readManifestRaw(dataDir, { maxBytes = MAX_DATA_FILE_BYTES } = {}) {
+  return readContainedDataFile(dataDir, MANIFEST_FILE, "Manifest", { maxBytes }).toString("utf8");
 }
 
 function assertSafeOutputAncestors(targetPath, { outputPath, repoRoot, skillsRoot }) {
@@ -1815,7 +1943,7 @@ function extractGateVerdict(status, gateResultJson) {
   return status === "passed" ? "passed" : null;
 }
 
-function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
+function collectTranscriptTelemetry(dataDir, priorTranscripts = [], { maxTranscriptBytes = MAX_STAGE_OUTPUT_BYTES } = {}) {
   const skip = new Set(Array.isArray(priorTranscripts) ? priorTranscripts : []);
   const perStage = new Map();
   const costSummary = {
@@ -1828,10 +1956,21 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
   };
   const transcriptsDir = join(dataDir, "transcripts");
   let realTranscriptsDir = null;
-  if (existsSync(transcriptsDir)) {
-    const dirLst = lstatSync(transcriptsDir);
+  let dirLst = null;
+  try {
+    dirLst = lstatSync(transcriptsDir);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  if (dirLst) {
     if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
       throw new Error(`Refusing unsafe or symlinked transcripts directory at ${transcriptsDir}`);
+    }
+    if (existsSync(dataDir)) {
+      const dataLst = lstatSync(dataDir);
+      if (dataLst.isSymbolicLink() || !dataLst.isDirectory()) {
+        throw new Error(`Refusing unsafe or symlinked directory at ${dataDir}`);
+      }
     }
     const realData = existsSync(dataDir) ? realpathSync(dataDir) : null;
     realTranscriptsDir = realpathSync(transcriptsDir);
@@ -1839,26 +1978,20 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
       throw new Error(`Refusing escaping transcripts directory at ${transcriptsDir}`);
     }
   }
-  const openFlags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
   for (const f of listTranscripts(dataDir).sort(compareUtf16)) {
     if (skip.has(basename(f))) continue;
-    let raw;
-    let fd;
+    let lst;
     try {
-      const lst = lstatSync(f);
-      if (lst.isSymbolicLink() || !lst.isFile()) continue;
-      if (realTranscriptsDir && !isInsideOrEqual(realpathSync(f), realTranscriptsDir)) continue;
-      fd = openSync(f, openFlags);
-      const st = fstatSync(fd);
-      if (!st.isFile()) continue;
-      raw = readFileSync(fd);
-    } catch {
-      continue;
-    } finally {
-      if (fd !== undefined) {
-        try { closeSync(fd); } catch { /* ignore */ }
-      }
+      lst = lstatSync(f);
+    } catch (err) {
+      if (err.code === "ENOENT") continue;
+      throw err;
     }
+    if (lst.isSymbolicLink() || !lst.isFile()) continue;
+    const raw = readRegularFileNoFollow(f, "Transcript", {
+      maxBytes: maxTranscriptBytes,
+      allowedRealRoots: realTranscriptsDir ? [realTranscriptsDir] : null,
+    });
     const digest = sha256Hex(raw);
     let parsed;
     try { parsed = JSON.parse(raw.toString("utf8")); } catch { continue; }
@@ -1882,10 +2015,10 @@ function collectTranscriptTelemetry(dataDir, priorTranscripts = []) {
 }
 
 export function readRoutingState(dataDir) {
-  const routingPath = join(dataDir, ROUTING_FILE);
+  const routingPath = join(resolve(dataDir), ROUTING_FILE);
   let rawText;
   try {
-    rawText = readRegularFileNoFollow(routingPath, "Routing telemetry").toString("utf8");
+    rawText = readContainedDataFile(dataDir, ROUTING_FILE, "Routing telemetry", { maxBytes: MAX_DATA_FILE_BYTES }).toString("utf8");
   } catch (err) {
     if (err.code === "ENOENT") return { trips: {}, findings: {} };
     throw err;
@@ -1939,11 +2072,15 @@ function readRoundTrips(dataDir) {
 }
 
 function readExistingRunMeta(absDataDir) {
-  const metaPath = join(absDataDir, RUN_META_FILE);
+  let raw;
   try {
-    const st = lstatSync(metaPath);
-    if (st.isSymbolicLink() || !st.isFile()) return null;
-    const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+    raw = readContainedDataFile(absDataDir, RUN_META_FILE, "Run metadata").toString("utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(raw);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.run_id === "string" && parsed.run_id.trim().length > 0
       ? parsed
       : null;
@@ -2010,6 +2147,7 @@ export function buildManifest({
   phase = "closed",
   deliverableOverrides = {},
   persistMeta = true,
+  maxTranscriptBytes = MAX_STAGE_OUTPUT_BYTES,
   now = new Date().toISOString(),
 }) {
   const Database = loadDatabaseCtor();
@@ -2077,13 +2215,19 @@ export function buildManifest({
   const resolvedSkillsRoot = skillsRoot ?? meta.skills_root ?? null;
   const startedAt = firstHistTs ?? meta.created_at ?? null;
 
-  const goalPath = join(absDataDir, GOAL_FILE);
-  const goalSha256 = existsSync(goalPath) ? sha256Hex(readFileSync(goalPath)) : null;
+  let goalSha256 = null;
+  try {
+    goalSha256 = sha256Hex(readContainedDataFile(absDataDir, GOAL_FILE, "Runner goal"));
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
 
   const stages = [];
   const auditStages = [];
   const roundTrips = readRoundTrips(absDataDir);
-  const { perStage: transcriptDigests, costSummary } = collectTranscriptTelemetry(absDataDir, meta.prior_transcripts);
+  const { perStage: transcriptDigests, costSummary } = collectTranscriptTelemetry(absDataDir, meta.prior_transcripts, {
+    maxTranscriptBytes,
+  });
   let blueprintRan = false;
 
   const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
@@ -2333,7 +2477,16 @@ export function verifyManifestStageOutputs(manifest, { dataDir, repoRoot = OWN_R
     }
   }
 
-  const meta = readExistingRunMeta(absDataDir);
+  let meta = null;
+  try {
+    meta = readExistingRunMeta(absDataDir);
+  } catch (err) {
+    return {
+      ok: false,
+      errors: [err.message],
+      checkedOutputs: 0,
+    };
+  }
   const realRepo = existsSync(absRepoRoot) ? realpathSync(absRepoRoot) : absRepoRoot;
   const realData = existsSync(absDataDir) ? realpathSync(absDataDir) : absDataDir;
   const rawOut = outputPath ?? meta?.output_path ?? null;
@@ -2360,11 +2513,29 @@ export function verifyManifestStageOutputs(manifest, { dataDir, repoRoot = OWN_R
       continue;
     }
     const realAbs = realpathSync(abs);
-    if (!isInsideOrEqual(realAbs, realRepo) && !isInsideOrEqual(realAbs, realData) && !(realMetaOut && isInsideOrEqual(realAbs, realMetaOut))) {
+    const allowedOutRoots = [realRepo, realData, ...(realMetaOut ? [realMetaOut] : [])];
+    if (!allowedOutRoots.some((r) => isInsideOrEqual(realAbs, r))) {
       errors.push(`Stage "${expected.stage}" output escapes allowed roots: ${relPath}`);
       continue;
     }
-    const buf = readFileSync(realAbs);
+    let buf;
+    try {
+      buf = readRegularFileNoFollow(abs, `Stage "${expected.stage}" output`, {
+        maxBytes: MAX_STAGE_OUTPUT_BYTES,
+        allowedRealRoots: allowedOutRoots,
+      });
+    } catch (err) {
+      if (err.code === "EACCES") {
+        errors.push(`Stage "${expected.stage}" output escapes allowed roots: ${relPath}`);
+      } else if (err.code === "EFBIG") {
+        errors.push(`Stage "${expected.stage}" output exceeds size limit: ${relPath} (${err.message})`);
+      } else if (err.code === "ELOOP" || err.code === "EFTYPE") {
+        errors.push(`Stage "${expected.stage}" output must be a regular file (not symlink): ${relPath}`);
+      } else {
+        errors.push(`Stage "${expected.stage}" output failed safe read verification: ${relPath} (${err.message})`);
+      }
+      continue;
+    }
     const actualSha = sha256Hex(buf);
     if (actualSha !== expected.sha256 || buf.length !== expected.bytes) {
       errors.push(
@@ -2380,20 +2551,16 @@ export function verifyManifestStageOutputs(manifest, { dataDir, repoRoot = OWN_R
   };
 }
 
-function verifyManifestFileIntegrity(manifestPath) {
-  let lst;
+function verifyManifestFileIntegrity(manifestPath, absDataDir = dirname(manifestPath)) {
+  let rawText;
   try {
-    lst = lstatSync(manifestPath);
+    rawText = readContainedDataFile(absDataDir, basename(manifestPath), "Manifest").toString("utf8");
   } catch (err) {
-    if (err.code === "ENOENT") {
-      return { manifest: null, errors: [`Manifest not found at ${manifestPath}`] };
+    if (err.code === "ENOENT" || err.code === "ELOOP" || err.code === "EFTYPE" || err.code === "EINVAL" || err.code === "EFBIG" || err.code === "EACCES") {
+      return { manifest: null, errors: [err.message] };
     }
     return { manifest: null, errors: [`Cannot stat manifest at ${manifestPath}: ${err.message}`] };
   }
-  if (lst.isSymbolicLink() || !lst.isFile()) {
-    return { manifest: null, errors: [`Refusing unsafe or symlinked manifest at ${manifestPath}`] };
-  }
-  const rawText = readFileSync(manifestPath, "utf8");
   let manifest;
   try {
     manifest = JSON.parse(rawText);
@@ -2422,7 +2589,7 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
   const manifestPath = join(absDataDir, MANIFEST_FILE);
-  const { manifest, errors } = verifyManifestFileIntegrity(manifestPath);
+  const { manifest, errors } = verifyManifestFileIntegrity(manifestPath, absDataDir);
   if (!manifest) {
     return { ok: false, errors };
   }
@@ -2479,7 +2646,7 @@ export async function sealManifest({
   }
 
   if (hasManifestFile) {
-    const fileCheck = verifyManifestFileIntegrity(manifestPath);
+    const fileCheck = verifyManifestFileIntegrity(manifestPath, absDataDir);
     if (fileCheck.errors.length > 0) {
       return {
         ok: false,
@@ -2622,7 +2789,7 @@ export async function sealManifest({
   });
 }
 
-const MAX_SCRUB_BYTES = 64 * 1024 * 1024;
+const MAX_SCRUB_BYTES = MAX_STAGE_OUTPUT_BYTES;
 
 function scrubTextFileInRoots(absPath, allowedRealRoots) {
   let lst;
@@ -2632,17 +2799,34 @@ function scrubTextFileInRoots(absPath, allowedRealRoots) {
     return { scrubbed: false, redacted: 0, buf: null };
   }
   if (lst.isSymbolicLink() || !lst.isFile()) return { scrubbed: false, redacted: 0, buf: null };
-  const realFile = realpathSync(absPath);
-  if (!allowedRealRoots.some((r) => isInsideOrEqual(realFile, r))) {
+  let buf;
+  try {
+    const realFile = realpathSync(absPath);
+    if (!allowedRealRoots.some((r) => isInsideOrEqual(realFile, r))) {
+      return { scrubbed: false, redacted: 0, buf: null };
+    }
+    buf = readRegularFileNoFollow(absPath, "Scrub target", {
+      maxBytes: MAX_SCRUB_BYTES,
+      allowedRealRoots,
+    });
+  } catch {
     return { scrubbed: false, redacted: 0, buf: null };
   }
-  if (lst.size > MAX_SCRUB_BYTES) return { scrubbed: false, redacted: 0, buf: null };
-  const buf = readFileSync(realFile);
   if (buf.subarray(0, 8192).includes(0)) return { scrubbed: false, redacted: 0, buf };
   const { text, count } = redactSecrets(buf.toString("utf8"));
   if (count <= 0) return { scrubbed: false, redacted: 0, buf };
   const nextBuf = Buffer.from(text, "utf8");
-  writeFileAtomic(realFile, nextBuf);
+  let currentRealDir;
+  try {
+    currentRealDir = realpathSync(dirname(absPath));
+  } catch {
+    return { scrubbed: false, redacted: 0, buf: null };
+  }
+  if (!allowedRealRoots.some((r) => isInsideOrEqual(currentRealDir, r))) {
+    return { scrubbed: false, redacted: 0, buf: null };
+  }
+  // Note: Node fs lacks openat; writeFileAtomic guards leaf symlinks/FIFOs via O_EXCL|O_NOFOLLOW temp files, while concurrent parent-dir swaps in this window remain an OS/runtime limitation.
+  writeFileAtomic(join(currentRealDir, basename(absPath)), nextBuf);
   return { scrubbed: true, redacted: count, buf: nextBuf };
 }
 
@@ -2714,15 +2898,22 @@ export async function scrubProvenanceOutputs({
   let hadManifest = false;
   let preManifestValid = false;
   let prevManifest = null;
-  if (existsSync(manifestPath)) {
+  try {
+    const manLst = lstatSync(manifestPath);
+    if (manLst.isSymbolicLink() || !manLst.isFile()) {
+      throw new Error(`Refusing unsafe or symlinked manifest at ${manifestPath}`);
+    }
     hadManifest = true;
-    const preCheck = verifyManifest({ dataDir: absDataDir, repoRoot: absRepoRoot });
-    preManifestValid = preCheck.ok;
-    if (preManifestValid) {
-      try {
-        prevManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-      } catch {
-        preManifestValid = false;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  if (hadManifest) {
+    const fileCheck = verifyManifestFileIntegrity(manifestPath, absDataDir);
+    if (fileCheck.manifest && fileCheck.errors.length === 0) {
+      const outCheck = verifyManifestStageOutputs(fileCheck.manifest, { dataDir: absDataDir, repoRoot: absRepoRoot });
+      if (outCheck.ok) {
+        preManifestValid = true;
+        prevManifest = fileCheck.manifest;
       }
     }
   }
@@ -2764,11 +2955,17 @@ export async function scrubProvenanceOutputs({
             continue;
           }
           if (lst.isSymbolicLink() || !lst.isFile()) continue;
-          const realAbs = realpathSync(abs);
-          if (!scrubRealRoots.some((r) => isInsideOrEqual(realAbs, r))) continue;
-          if (lst.size > MAX_SCRUB_BYTES) continue;
-
-          const buf = readFileSync(realAbs);
+          let buf;
+          try {
+            const realAbs = realpathSync(abs);
+            if (!scrubRealRoots.some((r) => isInsideOrEqual(realAbs, r))) continue;
+            buf = readRegularFileNoFollow(abs, "Stage output", {
+              maxBytes: MAX_SCRUB_BYTES,
+              allowedRealRoots: scrubRealRoots,
+            });
+          } catch {
+            continue;
+          }
           // Fail closed: never re-sign outputs that were already mutated post-stage.
           if (sha256Hex(buf) !== latest.item.sha256 || buf.length !== latest.item.bytes) {
             continue;
@@ -2779,7 +2976,15 @@ export async function scrubProvenanceOutputs({
           if (count <= 0) continue;
 
           const nextBuf = Buffer.from(text, "utf8");
-          writeFileAtomic(realAbs, nextBuf);
+          let currentRealDir;
+          try {
+            currentRealDir = realpathSync(dirname(abs));
+          } catch {
+            continue;
+          }
+          if (!scrubRealRoots.some((r) => isInsideOrEqual(currentRealDir, r))) continue;
+          // Note: Node fs lacks openat; writeFileAtomic guards leaf symlinks/FIFOs via O_EXCL|O_NOFOLLOW temp files, while concurrent parent-dir swaps in this window remain an OS/runtime limitation.
+          writeFileAtomic(join(currentRealDir, basename(abs)), nextBuf);
           latest.item.sha256 = sha256Hex(nextBuf);
           latest.item.bytes = nextBuf.length;
           parsedRows.get(latest.rowId).changed = true;
@@ -2923,13 +3128,14 @@ async function runCliMain(argv) {
   const outputPath = flags["output-path"] ?? null;
 
   if (command === "read") {
-    const p = join(resolve(dataDir), MANIFEST_FILE);
-    if (!existsSync(p)) {
-      process.stdout.write(JSON.stringify({ ok: false, error: `Manifest not found at ${p}` }) + "\n");
+    try {
+      const raw = readManifestRaw(dataDir);
+      process.stdout.write(raw.endsWith("\n") ? raw : raw + "\n");
+      return 0;
+    } catch (err) {
+      process.stdout.write(JSON.stringify({ ok: false, error: err.message }) + "\n");
       return 1;
     }
-    process.stdout.write(readFileSync(p, "utf8") + "\n");
-    return 0;
   }
 
   if (command === "verify") {

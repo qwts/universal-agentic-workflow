@@ -16,6 +16,8 @@ import {
   inferTranscriptStage,
   matchPromptStage,
   materializeManifest,
+  readManifestRaw,
+  readRoutingState,
   resolveDeliverableKey,
   scrubProvenanceOutputs,
   sealManifest,
@@ -2470,6 +2472,253 @@ try {
     );
     assert.equal(legacyBuilt.manifest.execution_audit.cost_summary.turns, 3);
     assert.equal(legacyBuilt.manifest.execution_audit.cost_summary.cost_usd, 0.04);
+    }
+
+    // 5d. `provenance.mjs read` and contained <data-dir> readers must reject symlinked/non-regular/escaping files
+    {
+      const readData = join(runRoot, "read-valid-data");
+      const readRepo = join(runRoot, "read-valid-repo");
+      mkdirSync(readData, { recursive: true });
+      mkdirSync(readRepo, { recursive: true });
+      const validManifestJson = canonicalizeJcs({ schema_version: "1.0.0", run_id: "read-1" });
+      writeFileAtomic(join(readData, "uaw-manifest.json"), validManifestJson);
+
+      const okRead = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "read", "--data-dir", readData],
+        { encoding: "utf8" },
+      );
+      assert.equal(okRead.status, 0, okRead.stderr ?? "");
+      assert.equal(okRead.stdout.trimEnd(), validManifestJson);
+      assert.equal(readManifestRaw(readData), validManifestJson);
+
+      const missingReadData = join(runRoot, "read-missing-data");
+      const missingRead = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "read", "--data-dir", missingReadData],
+        { encoding: "utf8" },
+      );
+      assert.equal(missingRead.status, 1);
+      const missingParsed = JSON.parse(missingRead.stdout);
+      assert.equal(missingParsed.ok, false);
+      assert.match(missingParsed.error ?? "", /Manifest not found/i);
+
+      const outsideSecret = join(runRoot, "outside-secret-manifest.txt");
+      const secretMarker = "TOP_SECRET_MANIFEST_EXFIL_SENTINEL";
+      writeFileSync(outsideSecret, `${secretMarker}\n`);
+
+      const symData = join(runRoot, "read-sym-data");
+      mkdirSync(symData, { recursive: true });
+      symlinkSync(outsideSecret, join(symData, "uaw-manifest.json"));
+      const symRead = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "read", "--data-dir", symData],
+        { encoding: "utf8" },
+      );
+      assert.equal(symRead.status, 1, "read must reject symlinked uaw-manifest.json");
+      assert.ok(!symRead.stdout.includes(secretMarker) && !symRead.stderr.includes(secretMarker), "must never leak symlink target contents");
+      assert.equal(JSON.parse(symRead.stdout).ok, false);
+      assert.match(JSON.parse(symRead.stdout).error ?? "", /Refusing unsafe or symlinked manifest/i);
+      assert.throws(() => readManifestRaw(symData), /Refusing unsafe or symlinked manifest/i);
+
+      const danglingData = join(runRoot, "read-dangling-data");
+      mkdirSync(danglingData, { recursive: true });
+      symlinkSync(join(runRoot, "does-not-exist.json"), join(danglingData, "uaw-manifest.json"));
+      const danglingRead = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "read", "--data-dir", danglingData],
+        { encoding: "utf8" },
+      );
+      assert.equal(danglingRead.status, 1);
+      assert.equal(JSON.parse(danglingRead.stdout).ok, false);
+      assert.match(JSON.parse(danglingRead.stdout).error ?? "", /Refusing unsafe or symlinked manifest/i);
+
+      const dirManifestData = join(runRoot, "read-dir-manifest-data");
+      mkdirSync(join(dirManifestData, "uaw-manifest.json"), { recursive: true });
+      const dirRead = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "read", "--data-dir", dirManifestData],
+        { encoding: "utf8" },
+      );
+      assert.equal(dirRead.status, 1);
+      assert.equal(JSON.parse(dirRead.stdout).ok, false);
+      assert.match(JSON.parse(dirRead.stdout).error ?? "", /Refusing unsafe or symlinked manifest/i);
+
+      const symDataDir = join(runRoot, "read-sym-datadir-leaf");
+      symlinkSync(readData, symDataDir);
+      const symDirRead = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "read", "--data-dir", symDataDir],
+        { encoding: "utf8" },
+      );
+      assert.equal(symDirRead.status, 1);
+      assert.equal(JSON.parse(symDirRead.stdout).ok, false);
+      assert.match(JSON.parse(symDirRead.stdout).error ?? "", /Refusing unsafe or symlinked directory/i);
+
+      // runner-goal.md symlink and dangling transcripts symlink must fail closed in buildManifest
+      const symGoalData = join(runRoot, "sym-goal-data");
+      mkdirSync(symGoalData, { recursive: true });
+      {
+        const sdb = new Database(join(symGoalData, "uwf-stages.db"));
+        sdb.exec(`
+          CREATE TABLE stage_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
+          );
+        `);
+        sdb.close();
+      }
+      symlinkSync(outsideSecret, join(symGoalData, "runner-goal.md"));
+      assert.throws(
+        () => buildManifest({ dataDir: symGoalData, workflow: "sw_dev", repoRoot: readRepo, phase: "closed" }),
+        /Refusing unsafe or symlinked runner goal/i,
+      );
+      rmSync(join(symGoalData, "runner-goal.md"), { force: true });
+      symlinkSync(join(runRoot, "nonexistent-transcripts-target"), join(symGoalData, "transcripts"));
+      assert.throws(
+        () => buildManifest({ dataDir: symGoalData, workflow: "sw_dev", repoRoot: readRepo, phase: "closed" }),
+        /Refusing unsafe or symlinked transcripts directory/i,
+      );
+
+      // scrubProvenanceOutputs with live or dangling uaw-manifest.json symlinks must fail closed without reading or modifying outside files
+      await assert.rejects(
+        () => scrubProvenanceOutputs({ dataDir: symData, workflow: "sw_dev", repoRoot: readRepo }),
+        /Refusing unsafe or symlinked manifest/i,
+      );
+      writeFileAtomic(join(symData, "run-meta.json"), JSON.stringify({ run_id: "sym-m1", workflow: "sw_dev" }) + "\n");
+      await assert.rejects(
+        () => scrubProvenanceOutputs({ dataDir: symData, workflow: "sw_dev", repoRoot: readRepo }),
+        /Refusing unsafe or symlinked manifest/i,
+      );
+      assert.equal(readFileSync(outsideSecret, "utf8"), `${secretMarker}\n`);
+      await assert.rejects(
+        () => scrubProvenanceOutputs({ dataDir: danglingData, workflow: "sw_dev", repoRoot: readRepo }),
+        /Refusing unsafe or symlinked manifest/i,
+      );
+      assert.equal(readFileSync(outsideSecret, "utf8"), `${secretMarker}\n`);
+
+      // Oversized manifest must fail closed with EBIG
+      assert.throws(() => readManifestRaw(readData, { maxBytes: 16 }), /exceeds size limit/i);
+
+      // Symlinked run-meta.json must propagate security errors (never recover as corrupt JSON) across ensureRunMeta, buildManifest, scrubProvenanceOutputs, and verifyManifest
+      const symRunMetaData = join(runRoot, "sym-runmeta-data");
+      mkdirSync(symRunMetaData, { recursive: true });
+      {
+        const sdb = new Database(join(symRunMetaData, "uwf-stages.db"));
+        sdb.exec(`
+          CREATE TABLE stage_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
+          );
+          INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
+            ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]');
+        `);
+        sdb.close();
+      }
+      writeFileAtomic(join(symRunMetaData, "uaw-manifest.json"), canonicalizeJcs({ schema_version: "1.0.0", run_id: "r1" }));
+      symlinkSync(outsideSecret, join(symRunMetaData, "run-meta.json"));
+      assert.throws(
+        () => ensureRunMeta(symRunMetaData, { workflow: "sw_dev", repoRoot: readRepo }),
+        /Refusing unsafe or symlinked run metadata/i,
+      );
+      assert.throws(
+        () => buildManifest({ dataDir: symRunMetaData, workflow: "sw_dev", repoRoot: readRepo, phase: "closed" }),
+        /Refusing unsafe or symlinked run metadata/i,
+      );
+      await assert.rejects(
+        () => scrubProvenanceOutputs({ dataDir: symRunMetaData, workflow: "sw_dev", repoRoot: readRepo }),
+        /Refusing unsafe or symlinked run metadata/i,
+      );
+      const runMetaVerify = verifyManifest({ dataDir: symRunMetaData, repoRoot: readRepo });
+      assert.equal(runMetaVerify.ok, false);
+      assert.match(runMetaVerify.errors.join("\n"), /Refusing unsafe or symlinked run metadata/i);
+
+      if (process.platform !== "win32") {
+        // FIFO (named pipe) at uaw-manifest.json and run-meta.json must fail closed immediately without blocking
+        const fifoData = join(runRoot, "fifo-data");
+        mkdirSync(fifoData, { recursive: true });
+        const fifoManifest = join(fifoData, "uaw-manifest.json");
+        execFileSync("mkfifo", [fifoManifest]);
+        const fifoRead = spawnSync(
+          process.execPath,
+          [PROVENANCE_CLI, "read", "--data-dir", fifoData],
+          { encoding: "utf8", timeout: 5000 },
+        );
+        assert.equal(fifoRead.status, 1);
+        assert.equal(JSON.parse(fifoRead.stdout).ok, false);
+        assert.match(JSON.parse(fifoRead.stdout).error ?? "", /Refusing unsafe or symlinked manifest|must be a regular file/i);
+
+        const fifoMetaData = join(runRoot, "fifo-runmeta-data");
+        mkdirSync(fifoMetaData, { recursive: true });
+        execFileSync("mkfifo", [join(fifoMetaData, "run-meta.json")]);
+        assert.throws(
+          () => ensureRunMeta(fifoMetaData, { workflow: "sw_dev", repoRoot: readRepo }),
+          /Refusing unsafe or symlinked run metadata|must be a regular file/i,
+        );
+
+        // Symlinked and FIFO stage outputs must fail closed in verifyManifest and scrubProvenanceOutputs without blocking
+        const stageFifoRepo = join(runRoot, "stage-fifo-repo");
+        const stageFifoData = join(runRoot, "stage-fifo-data");
+        mkdirSync(stageFifoRepo, { recursive: true });
+        writeFileSync(join(stageFifoRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+        execFileSync(
+          process.execPath,
+          [RUNNER_CLI, "run", "--workflow", "sw_dev", "--goal", "Stage FIFO test", "--adapter", "fake", "--repo-root", stageFifoRepo, "--data-dir", stageFifoData, "--defer-seal"],
+          { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDir, UWF_DATA_DIR: "" }, stdio: "pipe" },
+        );
+        const intakeOutPath = join(stageFifoRepo, "tmp", "workflow-artifacts", "issues-intake.md");
+        rmSync(intakeOutPath, { force: true });
+        symlinkSync(outsideSecret, intakeOutPath);
+        const symStageVerify = verifyManifest({ dataDir: stageFifoData, repoRoot: stageFifoRepo });
+        assert.equal(symStageVerify.ok, false);
+        assert.match(symStageVerify.errors.join("\n"), /must be a regular file \(not symlink\)/i);
+        const scrubStageSymRes = await scrubProvenanceOutputs({ dataDir: stageFifoData, workflow: "sw_dev", repoRoot: stageFifoRepo });
+        assert.equal(scrubStageSymRes.ok, true);
+        assert.equal(readFileSync(outsideSecret, "utf8"), `${secretMarker}\n`);
+
+        rmSync(intakeOutPath, { force: true });
+        execFileSync("mkfifo", [intakeOutPath]);
+        const fifoStageVerify = verifyManifest({ dataDir: stageFifoData, repoRoot: stageFifoRepo });
+        assert.equal(fifoStageVerify.ok, false);
+        assert.match(fifoStageVerify.errors.join("\n"), /must be a regular file/i);
+        const scrubStageFifoRes = await scrubProvenanceOutputs({ dataDir: stageFifoData, workflow: "sw_dev", repoRoot: stageFifoRepo });
+        assert.equal(scrubStageFifoRes.ok, true);
+      }
+
+      // Oversized transcript must fail closed in buildManifest/collectTranscriptTelemetry instead of silently dropping cost/digest telemetry
+      const txCapRepo = join(runRoot, "tx-cap-repo");
+      const txCapData = join(runRoot, "tx-cap-data");
+      mkdirSync(txCapRepo, { recursive: true });
+      mkdirSync(join(txCapData, "transcripts"), { recursive: true });
+      {
+        const sdb = new Database(join(txCapData, "uwf-stages.db"));
+        sdb.exec(`
+          CREATE TABLE stage_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
+            status TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT, session_id TEXT, outputs_json TEXT
+          );
+          INSERT INTO stage_runs (workflow, stage, status, started_at, completed_at, outputs_json) VALUES
+            ('sw_dev', 'intake', 'passed', '2026-11-20T00:00:01Z', '2026-11-20T00:00:02Z', '[]');
+        `);
+        sdb.close();
+      }
+      writeFileSync(
+        join(txCapData, "transcripts", "2026-11-20T00-00-01-big.json"),
+        JSON.stringify({ adapter: "codex", stage: "intake", prompt: "big prompt", stdout: "x".repeat(64) }),
+      );
+      assert.throws(
+        () => buildManifest({ dataDir: txCapData, workflow: "sw_dev", repoRoot: txCapRepo, phase: "closed", maxTranscriptBytes: 16 }),
+        /Transcript .* exceeds size limit/i,
+      );
+
+      // readRoutingState must reject symlinked <data-dir> leaf via contained reader
+      assert.throws(
+        () => readRoutingState(symDataDir),
+        /Refusing unsafe or symlinked directory/i,
+      );
     }
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
