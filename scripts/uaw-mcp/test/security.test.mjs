@@ -491,6 +491,17 @@ try {
   assert.equal(escapedGates.isError, true);
   assert.equal(escapedGates.structuredContent.exit_code, 2);
 
+  const escapedGatesWithOverride = await handler.callTool("uaw_gates", {
+    workflow: "sw_dev",
+    mode: "check",
+    stage: "intake",
+    data_dir: escapedMetaDir,
+    output_path: transOutA,
+    repo_root: safeRepo,
+  });
+  assert.equal(escapedGatesWithOverride.isError, true);
+  assert.equal(escapedGatesWithOverride.structuredContent.exit_code, 2);
+
   // 11. uaw_resume rejects mismatched output_path overrides against persisted run-meta.json
   const mismatchResume = await handler.callTool("uaw_resume", {
     data_dir: transDataA,
@@ -2077,6 +2088,272 @@ setTimeout(() => {}, 30000);
     assert.ok(costRes.structuredContent.report, "uaw_cost must include formatted report");
     const mcpPlanLine = costRes.structuredContent.report.split("\n").find((l) => l.startsWith("plan "));
     assert.equal(Number(mcpPlanLine.trim().split(/\s+/).at(-1)), expectedAgentPlusRefs);
+
+    // P2: uaw_gates and uaw_cost reject mismatched output_path overrides against persisted meta.output_path, while accepting matching overrides
+    const matchingOut = join(partialRepo, "tmp", "workflow-artifacts");
+    const otherOut = join(partialRepo, "other-artifacts");
+    mkdirSync(otherOut, { recursive: true });
+    for (const gateMode of ["check", "list", "prescriptions"]) {
+      const badGateOut = await regHandler.callTool("uaw_gates", {
+        run_id: "partial-cost-run",
+        mode: gateMode,
+        ...(gateMode === "check" ? { stage: "plan" } : {}),
+        repo_root: partialRepo,
+        output_path: otherOut,
+      });
+      assert.equal(badGateOut.isError, true, `uaw_gates mode=${gateMode} must reject mismatched output_path`);
+      assert.equal(badGateOut.structuredContent.exit_code, 2);
+      assert.match(badGateOut.structuredContent.error, /output_path.*does not match persisted output_path/i);
+    }
+
+    const okGateMatchingOut = await regHandler.callTool("uaw_gates", {
+      run_id: "partial-cost-run",
+      mode: "list",
+      repo_root: partialRepo,
+      output_path: matchingOut,
+    });
+    assert.equal(okGateMatchingOut.isError, false, okGateMatchingOut.structuredContent?.error ?? "");
+
+    const badCostOut = await regHandler.callTool("uaw_cost", {
+      run_id: "partial-cost-run",
+      repo_root: partialRepo,
+      output_path: otherOut,
+    });
+    assert.equal(badCostOut.isError, true, "uaw_cost must reject mismatched output_path");
+    assert.equal(badCostOut.structuredContent.exit_code, 2);
+    assert.match(badCostOut.structuredContent.error, /output_path.*does not match persisted output_path/i);
+
+    const okCostMatchingOut = await regHandler.callTool("uaw_cost", {
+      run_id: "partial-cost-run",
+      repo_root: partialRepo,
+      output_path: matchingOut,
+    });
+    assert.equal(okCostMatchingOut.isError, false, okCostMatchingOut.structuredContent?.error ?? "");
+    const mcpPlanMatchedLine = okCostMatchingOut.structuredContent.report.split("\n").find((l) => l.startsWith("plan "));
+    assert.equal(Number(mcpPlanMatchedLine.trim().split(/\s+/).at(-1)), expectedAgentPlusRefs);
+
+    // Persisted uwf-state.db artifact_path fallback when run-meta.json is absent:
+    // enforces unredacted output_path across run/resume/gates/cost/stage_transition and fails closed on corrupt/symlinked DBs.
+    const dbFallbackData = join(regWs.repoRoot, "db-fallback-data");
+    const secretOut = join(regWs.repoRoot, `out-${SYNTHETIC_SECRETS[0].raw}`);
+    const secretFx = regWs.writeFixturesForOutput(secretOut);
+    const initDbFallback = await regHandler.callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      goal: "Initialize run for uwf-state.db fallback checks",
+      adapter: "fake",
+      fake_fixture_dir: secretFx,
+      data_dir: dbFallbackData,
+      output_path: secretOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+    });
+    assert.equal(initDbFallback.structuredContent.exit_code, 3, initDbFallback.structuredContent.stderr);
+    rmSync(join(dbFallbackData, "run-meta.json"));
+
+    const fallbackCases = [
+      ["uaw_run dry_run=true", () => regHandler.callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Reject mismatch without run-meta",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: dbFallbackData,
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+        dry_run: true,
+      })],
+      ["uaw_run dry_run=false", () => regHandler.callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Reject mismatch without run-meta",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: dbFallbackData,
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+        dry_run: false,
+      })],
+      ["uaw_resume", () => regHandler.callTool("uaw_resume", {
+        workflow: "mcp_fixture",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: dbFallbackData,
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_stage_transition", () => regHandler.callTool("uaw_stage_transition", {
+        data_dir: dbFallbackData,
+        target: "stage",
+        action: "init",
+        workflow: "mcp_fixture",
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_gates", () => regHandler.callTool("uaw_gates", {
+        data_dir: dbFallbackData,
+        workflow: "mcp_fixture",
+        mode: "list",
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_cost", () => regHandler.callTool("uaw_cost", {
+        data_dir: dbFallbackData,
+        workflow: "mcp_fixture",
+        output_path: otherOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+    ];
+    for (const [label, invoke] of fallbackCases) {
+      const badFallback = await invoke();
+      assert.equal(badFallback.isError, true, `${label} must reject mismatched output_path via uwf-state.db`);
+      assert.equal(badFallback.structuredContent.exit_code, 2, `${label} exit_code`);
+      assert.match(badFallback.structuredContent.error, /output_path.*does not match persisted output_path/i);
+    }
+
+    // Secret-shaped artifact_path must match verbatim (not mangled by redactDeep)
+    for (const [label, invoke] of [
+      ["uaw_run dry_run secretOut", () => regHandler.callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Match unredacted persisted output_path",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: dbFallbackData,
+        output_path: secretOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+        dry_run: true,
+      })],
+      ["uaw_gates list secretOut", () => regHandler.callTool("uaw_gates", {
+        data_dir: dbFallbackData,
+        workflow: "mcp_fixture",
+        mode: "list",
+        output_path: secretOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_cost secretOut", () => regHandler.callTool("uaw_cost", {
+        data_dir: dbFallbackData,
+        workflow: "mcp_fixture",
+        output_path: secretOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+    ]) {
+      const okSecret = await invoke();
+      assert.equal(okSecret.isError, false, `${label}: ${okSecret.structuredContent?.error ?? ""}`);
+    }
+
+    // Schema placeholder './tmp/workflow-artifacts' in uwf-state.db (when run-meta.json is absent) must not block explicit output_path
+    const placeholderData = join(regWs.repoRoot, "placeholder-db-data");
+    mkdirSync(placeholderData, { recursive: true });
+    {
+      const phDb = new Database(join(placeholderData, "uwf-state.db"));
+      phDb.exec("CREATE TABLE workflow_state (id INTEGER PRIMARY KEY, phase TEXT, mode TEXT, status TEXT, current_agent TEXT, artifact_path TEXT, ready_for_implementation INTEGER);");
+      phDb.exec("INSERT INTO workflow_state (id, phase, status, artifact_path, ready_for_implementation) VALUES (1, 'idea', 'idle', './tmp/workflow-artifacts', 0);");
+      phDb.close();
+    }
+    const okPlaceholderRun = await regHandler.callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      goal: "Schema placeholder in DB must be treated as unset",
+      adapter: "fake",
+      fake_fixture_dir: secretFx,
+      data_dir: placeholderData,
+      output_path: secretOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+      dry_run: true,
+    });
+    assert.equal(okPlaceholderRun.isError, false, okPlaceholderRun.structuredContent?.error ?? "");
+
+    // Corrupt and symlinked uwf-state.db must fail closed when run-meta.json is absent; force=true uaw_run skips corrupt DB read
+    for (const sidecar of ["", "-wal", "-shm", "-journal"]) {
+      rmSync(join(dbFallbackData, `uwf-state.db${sidecar}`), { force: true });
+    }
+    writeFileSync(join(dbFallbackData, "uwf-state.db"), "corrupt-sqlite-header\n");
+    const forcedCorruptDryRun = await regHandler.callTool("uaw_run", {
+      workflow: "mcp_fixture",
+      goal: "Force restart despite corrupt uwf-state.db",
+      adapter: "fake",
+      fake_fixture_dir: secretFx,
+      data_dir: dbFallbackData,
+      output_path: otherOut,
+      repo_root: regWs.repoRoot,
+      skills_root: regWs.skillsRoot,
+      force: true,
+      dry_run: true,
+    });
+    assert.equal(
+      forcedCorruptDryRun.isError,
+      false,
+      `uaw_run force=true must bypass corrupt DB read: ${forcedCorruptDryRun.structuredContent?.error ?? ""}`,
+    );
+
+    const failClosedCalls = [
+      ["uaw_run dry_run=true", () => regHandler.callTool("uaw_run", {
+        workflow: "mcp_fixture",
+        goal: "Fail on bad uwf-state.db",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: dbFallbackData,
+        output_path: secretOut,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+        dry_run: true,
+      })],
+      ["uaw_resume", () => regHandler.callTool("uaw_resume", {
+        workflow: "mcp_fixture",
+        adapter: "fake",
+        fake_fixture_dir: secretFx,
+        data_dir: dbFallbackData,
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_gates", () => regHandler.callTool("uaw_gates", {
+        data_dir: dbFallbackData,
+        workflow: "mcp_fixture",
+        mode: "list",
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_stage_transition", () => regHandler.callTool("uaw_stage_transition", {
+        data_dir: dbFallbackData,
+        target: "stage",
+        action: "init",
+        workflow: "mcp_fixture",
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+      ["uaw_cost", () => regHandler.callTool("uaw_cost", {
+        data_dir: dbFallbackData,
+        workflow: "mcp_fixture",
+        repo_root: regWs.repoRoot,
+        skills_root: regWs.skillsRoot,
+      })],
+    ];
+    for (const [label, invoke] of failClosedCalls) {
+      const corruptRes = await invoke();
+      assert.equal(corruptRes.isError, true, `${label} corrupt DB must fail closed`);
+      assert.equal(typeof corruptRes.structuredContent.error, "string");
+      assert.notEqual(corruptRes.structuredContent.error.length, 0);
+      assert.equal(
+        corruptRes.structuredContent.exit_code,
+        70,
+        `${label} corrupt DB unexpected exit_code=${corruptRes.structuredContent.exit_code}`,
+      );
+      assert.equal(corruptRes.structuredContent.status, "internal_error");
+    }
+    rmSync(join(dbFallbackData, "uwf-state.db"));
+    symlinkSync("/etc/hosts", join(dbFallbackData, "uwf-state.db"));
+    for (const [label, invoke] of failClosedCalls) {
+      const symFallbackRes = await invoke();
+      assert.equal(symFallbackRes.isError, true, `${label} must fail closed on symlinked uwf-state.db`);
+      assert.equal(symFallbackRes.structuredContent.exit_code, 2, `${label} symlink exit_code`);
+      assert.match(symFallbackRes.structuredContent.error, /symlink|regular file/i);
+    }
   } finally {
     rmSync(regWs.root, { recursive: true, force: true });
   }

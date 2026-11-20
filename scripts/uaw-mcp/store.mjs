@@ -140,6 +140,20 @@ function assertOptionalFilter(val, label) {
 }
 
 /**
+ * Read raw persisted `workflow_state.artifact_path` from `uwf-state.db` without redaction.
+ */
+export function readPersistedArtifactPath(dataDir) {
+  if (!dataDir) return null;
+  const dbPath = join(resolve(dataDir), "uwf-state.db");
+  return withReadOnlyDb(dbPath, (db) => {
+    if (!tableExists(db, "workflow_state")) return null;
+    const row = db.prepare("SELECT artifact_path FROM workflow_state WHERE id = 1").get();
+    const raw = row?.artifact_path;
+    return typeof raw === "string" && raw.trim() ? raw : null;
+  });
+}
+
+/**
  * Read `uwf-state.db` (`workflow_state` + `workflow_history`) + `run-meta.json`.
  */
 export function readState(dataDir) {

@@ -41,7 +41,14 @@ import {
   UsageError,
   writeRunMeta,
 } from "./paths.mjs";
-import { queryQuestionsAction, redactDeep, readQuestions, readStages, readState } from "./store.mjs";
+import {
+  queryQuestionsAction,
+  redactDeep,
+  readPersistedArtifactPath,
+  readQuestions,
+  readStages,
+  readState,
+} from "./store.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_REPO_ROOT = resolve(HERE, "..", "..");
@@ -524,6 +531,45 @@ function assertWorkflowMatchesMeta(requestedWorkflow, persistedWorkflow, toolNam
   }
 }
 
+const STATE_DEFAULT_ARTIFACT_PATH = "./tmp/workflow-artifacts";
+
+function resolveStateArtifactPath(raw, repoRoot) {
+  // Treat state.mjs schema placeholder as unset so raw CLI init defaults don't hijack per-run isolation.
+  if (typeof raw !== "string" || !raw.trim() || raw === STATE_DEFAULT_ARTIFACT_PATH) return null;
+  return isAbsolute(raw) ? raw : resolve(repoRoot, raw);
+}
+
+function readPersistedStateOutputPath(dataDir, repoRoot) {
+  if (!dataDir) return null;
+  return resolveStateArtifactPath(readPersistedArtifactPath(dataDir), repoRoot);
+}
+
+function resolveOutputPathWithMeta({
+  requestedOutputPath,
+  persistedOutputPath,
+  fallbackOutputPath,
+  allowedRoots,
+  toolName,
+  force = false,
+}) {
+  if (!force && persistedOutputPath) {
+    const persistedOutput = assertAllowedPath(persistedOutputPath, allowedRoots, "output_path");
+    if (requestedOutputPath !== undefined && requestedOutputPath !== null) {
+      const requestedOutput = assertAllowedPath(requestedOutputPath, allowedRoots, "output_path");
+      if (canonicalPathKey(requestedOutput) !== canonicalPathKey(persistedOutput)) {
+        const suffix = toolName === "uaw_run" ? " without force=true" : "";
+        throw new UsageError(
+          `${toolName} output_path "${requestedOutput}" does not match persisted output_path "${persistedOutput}"${suffix}`,
+        );
+      }
+    }
+    return persistedOutput;
+  }
+  const raw = requestedOutputPath ?? persistedOutputPath ?? fallbackOutputPath;
+  if (raw === undefined || raw === null) return undefined;
+  return assertAllowedPath(raw, allowedRoots, "output_path");
+}
+
 function assertExistingRunDir(dataDir, toolName) {
   let lst;
   try {
@@ -693,9 +739,17 @@ export async function cmdRun(params = {}, ctx = {}) {
     const runId = force && !params.run_id && !params.from_stage
       ? generateRunId(workflow)
       : (existingMeta?.run_id ?? params.run_id ?? generateRunId(workflow));
-    const rawOutputPath = params.output_path ?? existingMeta?.output_path ?? defaultOutputPath(dataDir);
-    const outputPath = assertAllowedPath(rawOutputPath, allowedRoots, "output_path");
     const repoRoot = resolveRepoRoot(params.repo_root, existingMeta?.repo_root, allowedRoots);
+    const outputPath = resolveOutputPathWithMeta({
+      requestedOutputPath: params.output_path,
+      persistedOutputPath: force
+        ? existingMeta?.output_path
+        : (existingMeta?.output_path ?? readPersistedStateOutputPath(dataDir, repoRoot)),
+      fallbackOutputPath: defaultOutputPath(dataDir),
+      allowedRoots,
+      toolName: "uaw_run",
+      force,
+    });
     const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
@@ -777,17 +831,17 @@ export async function cmdRun(params = {}, ctx = {}) {
     const runId = force && !params.run_id && !params.from_stage
       ? generateRunId(workflow)
       : (existingMeta?.run_id ?? params.run_id ?? generateRunId(workflow));
-    const rawOutputPath = params.output_path ?? existingMeta?.output_path ?? defaultOutputPath(dataDir);
-    const outputPath = assertAllowedPath(rawOutputPath, allowedRoots, "output_path");
-    if (!force && existingMeta?.output_path) {
-      const persistedOut = assertAllowedPath(existingMeta.output_path, allowedRoots, "output_path");
-      if (canonicalPathKey(persistedOut) !== canonicalPathKey(outputPath)) {
-        throw new UsageError(
-          `Cannot change output_path from "${persistedOut}" to "${outputPath}" on existing data_dir without force=true`,
-        );
-      }
-    }
     const repoRoot = resolveRepoRoot(params.repo_root, existingMeta?.repo_root, allowedRoots);
+    const outputPath = resolveOutputPathWithMeta({
+      requestedOutputPath: params.output_path,
+      persistedOutputPath: force
+        ? existingMeta?.output_path
+        : (existingMeta?.output_path ?? readPersistedStateOutputPath(dataDir, repoRoot)),
+      fallbackOutputPath: defaultOutputPath(dataDir),
+      allowedRoots,
+      toolName: "uaw_run",
+      force,
+    });
     const skillsRoot = resolveOptionalPath(params.skills_root ?? existingMeta?.skills_root, allowedRoots, "skills_root");
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
@@ -944,12 +998,6 @@ export async function cmdResume(params = {}, ctx = {}) {
     assertExistingRunDir(dataDir, "uaw_resume");
     assertNoActiveRunLock(dataDir);
     const meta = readRunMeta(dataDir) ?? initialTarget.meta;
-    let stateFallback = null;
-    try {
-      stateFallback = readState(dataDir);
-    } catch {
-      /* ignore */
-    }
     if (!meta && !existsSync(join(dataDir, "uwf-state.db")) && !existsSync(join(dataDir, "uwf-stages.db"))) {
       throw new UsageError(`No initialized run found in "${dataDir}" (uaw_resume)`);
     }
@@ -959,33 +1007,20 @@ export async function cmdResume(params = {}, ctx = {}) {
     const workflow = assertSafeWorkflow(rawWorkflow, "workflow");
 
     const runId = meta?.run_id ?? params.run_id ?? generateRunId(workflow);
-    const persistedRaw = meta?.output_path ?? stateFallback?.state?.artifact_path ?? null;
-    let outputPath;
-    if (persistedRaw) {
-      const persistedOutput = assertAllowedPath(persistedRaw, allowedRoots, "output_path");
-      if (params.output_path !== undefined) {
-        const requestedOutput = assertAllowedPath(params.output_path, allowedRoots, "output_path");
-        if (canonicalPathKey(requestedOutput) !== canonicalPathKey(persistedOutput)) {
-          throw new UsageError(
-            `uaw_resume output_path "${requestedOutput}" does not match persisted output_path "${persistedOutput}"`,
-          );
-        }
-      }
-      outputPath = persistedOutput;
-    } else {
-      outputPath = assertAllowedPath(
-        params.output_path ?? defaultOutputPath(dataDir),
-        allowedRoots,
-        "output_path",
-      );
-    }
-
     const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
     const skillsRoot = resolveOptionalPath(
       params.skills_root ?? meta?.skills_root,
       allowedRoots,
       "skills_root",
     );
+    const persistedRaw = meta?.output_path ?? readPersistedStateOutputPath(dataDir, repoRoot);
+    const outputPath = resolveOutputPathWithMeta({
+      requestedOutputPath: params.output_path,
+      persistedOutputPath: persistedRaw,
+      fallbackOutputPath: defaultOutputPath(dataDir),
+      allowedRoots,
+      toolName: "uaw_resume",
+    });
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
     const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
@@ -1134,6 +1169,11 @@ export async function cmdGates(params = {}, ctx = {}) {
     meta = target.meta;
   }
 
+  if (dataDir) {
+    assertSafeDataDir(dataDir);
+    meta = readRunMeta(dataDir) ?? meta;
+  }
+
   if (params.workflow !== undefined) assertSafeWorkflow(params.workflow, "workflow");
   assertWorkflowMatchesMeta(params.workflow, meta?.workflow, "uaw_gates");
   const workflow = assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow");
@@ -1144,10 +1184,15 @@ export async function cmdGates(params = {}, ctx = {}) {
     allowedRoots,
     "skills_root",
   );
-  const rawOutput = params.output_path ?? meta?.output_path ?? (dataDir ? defaultOutputPath(dataDir) : undefined);
-  const outputPath = rawOutput ? assertAllowedPath(rawOutput, allowedRoots, "output_path") : undefined;
+  const persistedOutRaw = meta?.output_path ?? readPersistedStateOutputPath(dataDir, repoRoot);
+  const outputPath = resolveOutputPathWithMeta({
+    requestedOutputPath: params.output_path,
+    persistedOutputPath: persistedOutRaw,
+    fallbackOutputPath: dataDir ? defaultOutputPath(dataDir) : undefined,
+    allowedRoots,
+    toolName: "uaw_gates",
+  });
 
-  if (dataDir) assertSafeDataDir(dataDir);
   assertSafeSkillDbs(repoRoot, "repo_root");
   if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
   const env = {};
@@ -1274,26 +1319,27 @@ export async function cmdCost(params = {}, ctx = {}) {
   });
 
   const dataDir = target.dataDir;
-  const meta = target.meta;
+  assertSafeDataDir(dataDir, { strictTranscripts: false });
+  const meta = readRunMeta(dataDir) ?? target.meta;
   if (params.workflow !== undefined) assertSafeWorkflow(params.workflow, "workflow");
   assertWorkflowMatchesMeta(params.workflow, meta?.workflow, "uaw_cost");
   const workflow = params.workflow ?? meta?.workflow;
   if (workflow) assertSafeWorkflow(workflow, "workflow");
-  const repoRoot = params.repo_root || meta?.repo_root
-    ? resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots)
-    : OWN_REPO_ROOT;
+  const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
   const skillsRoot = resolveOptionalPath(
     params.skills_root ?? meta?.skills_root,
     allowedRoots,
     "skills_root",
   );
-  const outputPath = assertAllowedPath(
-    params.output_path ?? meta?.output_path ?? defaultOutputPath(dataDir),
+  const persistedOutRaw = meta?.output_path ?? readPersistedStateOutputPath(dataDir, repoRoot);
+  const outputPath = resolveOutputPathWithMeta({
+    requestedOutputPath: params.output_path,
+    persistedOutputPath: persistedOutRaw,
+    fallbackOutputPath: defaultOutputPath(dataDir),
     allowedRoots,
-    "output_path",
-  );
+    toolName: "uaw_cost",
+  });
 
-  assertSafeDataDir(dataDir, { strictTranscripts: false });
   assertSafeSkillDbs(repoRoot, "repo_root");
   if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
 
@@ -1409,22 +1455,19 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
       ? assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow")
       : (params.workflow ? assertSafeWorkflow(params.workflow, "workflow") : meta?.workflow ?? null);
     const runId = meta?.run_id ?? target.runId ?? generateRunId(workflow ?? "uaw");
-    const rawOutput = params.output_path ?? meta?.output_path ?? defaultOutputPath(dataDir);
-    const outputPath = assertAllowedPath(rawOutput, allowedRoots, "output_path");
-    if (meta?.output_path && params.output_path) {
-      const persistedOut = assertAllowedPath(meta.output_path, allowedRoots, "output_path");
-      if (canonicalPathKey(persistedOut) !== canonicalPathKey(outputPath)) {
-        throw new UsageError(
-          `uaw_stage_transition output_path "${outputPath}" does not match persisted output_path "${persistedOut}"`,
-        );
-      }
-    }
     const repoRoot = resolveRepoRoot(params.repo_root, meta?.repo_root, allowedRoots);
     const skillsRoot = resolveOptionalPath(
       params.skills_root ?? meta?.skills_root,
       allowedRoots,
       "skills_root",
     );
+    const outputPath = resolveOutputPathWithMeta({
+      requestedOutputPath: params.output_path,
+      persistedOutputPath: meta?.output_path ?? readPersistedStateOutputPath(dataDir, repoRoot),
+      fallbackOutputPath: defaultOutputPath(dataDir),
+      allowedRoots,
+      toolName: "uaw_stage_transition",
+    });
     assertSafeSkillDbs(repoRoot, "repo_root");
     if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
 
