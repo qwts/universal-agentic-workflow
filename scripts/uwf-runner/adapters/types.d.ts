@@ -23,6 +23,8 @@ export interface InvokeStageOptions {
   skillsRoot?: string;
   /** Transcripts go to <dataDir>/transcripts/. Default: UWF_DATA_DIR ?? ./tmp/uwf */
   dataDir?: string;
+  /** Additional host directories writable by sandboxed adapters (e.g., sibling dataDir/outputPath). */
+  writableRoots?: string[];
 }
 
 export interface Usage {

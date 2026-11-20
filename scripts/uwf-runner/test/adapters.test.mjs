@@ -153,6 +153,77 @@ process.stdout.write(JSON.stringify({ result: "OK", session_id: "argv-sess", is_
   }
 }
 
+// --- codex adapter (argv contract check with fake binary; offline) ---
+{
+  const root = mkdtempSync(join(tmpdir(), "uwf-codex-argv-"));
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const argvFile = join(root, "argv.json");
+  const fakeCodex = join(bin, "codex");
+  writeFileSync(fakeCodex, `#!${process.execPath}
+const { writeFileSync } = require("node:fs");
+writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-argv-sess" }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "OK" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n");
+`);
+  chmodSync(fakeCodex, 0o755);
+  try {
+    const adapter = await loadAdapter("codex");
+    const cwd = join(root, "work");
+    const dataDir = join(root, "sibling-data");
+    const outDir = join(root, "sibling-out");
+    mkdirSync(cwd);
+    const codexEnv = { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` };
+
+    const rEdit = await adapter.invokeStage({
+      prompt: "argv check",
+      cwd,
+      dataDir,
+      writableRoots: [dataDir, outDir],
+      permissions: "edit",
+      timeoutMs: 20000,
+      env: codexEnv,
+    });
+    check("codex argv edit run ok", rEdit.ok === true, rEdit.error ?? "");
+    const argvEdit = JSON.parse(readFileSync(argvFile, "utf8"));
+    const wrIdx = argvEdit.findIndex((a) => String(a).startsWith("sandbox_workspace_write.writable_roots="));
+    check("codex edit passes sandbox_workspace_write.writable_roots", wrIdx >= 0, JSON.stringify(argvEdit));
+    const wrParsed = JSON.parse(argvEdit[wrIdx].split("=", 2)[1]);
+    check("codex writable_roots contains sibling dataDir and outDir", wrParsed.includes(dataDir) && wrParsed.includes(outDir), JSON.stringify(wrParsed));
+
+    const rResume = await adapter.invokeStage({
+      prompt: "resume check",
+      cwd,
+      dataDir,
+      sessionId: "codex-argv-sess",
+      permissions: "edit+exec",
+      timeoutMs: 20000,
+      env: codexEnv,
+    });
+    check("codex argv resume run ok", rResume.ok === true, rResume.error ?? "");
+    const argvResume = JSON.parse(readFileSync(argvFile, "utf8"));
+    check("codex resume includes writable_roots for sibling dataDir",
+      argvResume.some((a) => a === `sandbox_workspace_write.writable_roots=${JSON.stringify([dataDir])}`),
+      JSON.stringify(argvResume));
+
+    const rRo = await adapter.invokeStage({
+      prompt: "ro check",
+      cwd,
+      dataDir,
+      writableRoots: [outDir],
+      permissions: "read-only",
+      timeoutMs: 20000,
+      env: codexEnv,
+    });
+    check("codex argv read-only run ok", rRo.ok === true, rRo.error ?? "");
+    const argvRo = JSON.parse(readFileSync(argvFile, "utf8"));
+    check("codex read-only omits writable_roots", !argvRo.some((a) => String(a).includes("writable_roots")), JSON.stringify(argvRo));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 // --- claude-code adapter (opt-in live) ---
 if (!process.env.UWF_TEST_LIVE || !cliAvailable("claude")) {
   console.log("# adapter: claude-code\nSKIP (needs `claude` on PATH and UWF_TEST_LIVE=1)");

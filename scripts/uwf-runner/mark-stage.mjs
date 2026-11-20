@@ -128,7 +128,11 @@ function withMarkLock(absDataDir, fn) {
   }
 }
 
-function copyNodeModulesIsolated(srcNm, destNm) {
+function copyNodeModulesIsolated(
+  srcNm,
+  destNm,
+  { realBoundaryRoot = null, absDestBoundaryRoot = null, excludedRealPaths = [] } = {},
+) {
   let rootLst;
   try {
     rootLst = lstatSync(srcNm);
@@ -139,6 +143,8 @@ function copyNodeModulesIsolated(srcNm, destNm) {
 
   const realSrcNm = realpathSync(srcNm);
   const absDestNm = resolve(destNm);
+  const realBoundary = realBoundaryRoot ?? realSrcNm;
+  const absDestBoundary = absDestBoundaryRoot ?? absDestNm;
 
   function walkNm(curSrc, curDest) {
     mkdirSync(curDest, { recursive: true });
@@ -156,8 +162,9 @@ function copyNodeModulesIsolated(srcNm, destNm) {
           const linkTarget = readlinkSync(src);
           if (isAbsolute(linkTarget)) continue;
           const realTarget = realpathSync(src);
-          if (!isInsideOrEqual(realTarget, realSrcNm)) continue;
-          if (!isInsideOrEqual(resolve(dirname(dest), linkTarget), absDestNm)) continue;
+          if (!isInsideOrEqual(realTarget, realBoundary)) continue;
+          if (excludedRealPaths.some((ex) => ex && isInsideOrEqual(realTarget, ex))) continue;
+          if (!isInsideOrEqual(resolve(dirname(dest), linkTarget), absDestBoundary)) continue;
           symlinkSync(linkTarget, dest);
         } catch {
           /* skip dangling or escaping symlink */
@@ -244,11 +251,27 @@ function copyArtifactsDir(resolvedOutput, artifactsDir, { snapshotsRoot, absData
   walkArtifacts(resolvedOutput, artifactsDir);
 }
 
+function safeRealPath(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
 function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
   const absRepo = resolve(repoRoot);
+  const realRepo = safeRealPath(absRepo);
   const absDataDir = resolve(dataDir);
   const absOutput = resolve(absRepo, outputPath);
   const absTmp = join(absRepo, "tmp");
+  const absRepoSnap = resolve(repoSnapshotDir);
+  const excludedRealPaths = [
+    safeRealPath(join(absRepo, ".git")),
+    safeRealPath(absDataDir),
+    safeRealPath(absOutput),
+    safeRealPath(absTmp),
+  ];
 
   function walkCopy(srcDir, destDir) {
     mkdirSync(destDir, { recursive: true });
@@ -260,7 +283,11 @@ function copyWorkspaceTree(repoRoot, repoSnapshotDir, { dataDir, outputPath }) {
         continue;
       }
       if (name === "node_modules") {
-        copyNodeModulesIsolated(src, join(destDir, name));
+        copyNodeModulesIsolated(src, join(destDir, name), {
+          realBoundaryRoot: realRepo,
+          absDestBoundaryRoot: absRepoSnap,
+          excludedRealPaths,
+        });
         continue;
       }
       let lst;

@@ -614,9 +614,18 @@ await test("markStage isolates dataDir gate state and node_modules per snapshot"
   const outputPath = join(dataDir, "workflow-artifacts");
   mkdirSync(join(repoRoot, "node_modules", "pkg"), { recursive: true });
   mkdirSync(join(repoRoot, "node_modules", ".bin"), { recursive: true });
+  mkdirSync(join(repoRoot, "node_modules", ".pnpm", "dep@1.0.0", "node_modules", "dep"), { recursive: true });
+  mkdirSync(join(repoRoot, "packages", "app", "node_modules"), { recursive: true });
+  mkdirSync(join(repoRoot, ".git"), { recursive: true });
   mkdirSync(outputPath, { recursive: true });
   writeFileSync(join(repoRoot, "node_modules", "pkg", "index.js"), "export const v = 1;\n");
+  writeFileSync(join(repoRoot, "node_modules", ".pnpm", "dep@1.0.0", "node_modules", "dep", "index.js"), "export const pnpmDep = 42;\n");
+  writeFileSync(join(repoRoot, ".git", "config"), "[core]\n");
+  writeFileSync(join(root, "outside-secret.js"), "export const secret = 1;\n");
   symlinkSync("../pkg/index.js", join(repoRoot, "node_modules", ".bin", "pkg-cli"));
+  symlinkSync("../../../node_modules/.pnpm/dep@1.0.0/node_modules/dep", join(repoRoot, "packages", "app", "node_modules", "dep"));
+  symlinkSync("../../../../outside-secret.js", join(repoRoot, "packages", "app", "node_modules", "escape"));
+  symlinkSync("../../../.git/config", join(repoRoot, "packages", "app", "node_modules", "gitleak"));
 
   try {
     // 1. Mark intake BEFORE uwf-issues.json exists in dataDir (attempt 1 must fail data-backed gate)
@@ -625,6 +634,10 @@ await test("markStage isolates dataDir gate state and node_modules per snapshot"
     assert.ok(ev1.dataSnapshotDir && existsSync(ev1.dataSnapshotDir), "dataSnapshotDir captured");
     assert.equal(lstatSync(join(ev1.repoSnapshotDir, "node_modules")).isSymbolicLink(), false, "node_modules must not symlink live repo");
     assert.equal(lstatSync(join(ev1.repoSnapshotDir, "node_modules", ".bin", "pkg-cli")).isSymbolicLink(), true, "internal relative .bin symlink preserved");
+    assert.equal(lstatSync(join(ev1.repoSnapshotDir, "packages", "app", "node_modules", "dep")).isSymbolicLink(), true, "pnpm cross-node_modules repo-internal symlink preserved");
+    assert.equal(readFileSync(join(ev1.repoSnapshotDir, "packages", "app", "node_modules", "dep", "index.js"), "utf8"), "export const pnpmDep = 42;\n");
+    assert.equal(existsSync(join(ev1.repoSnapshotDir, "packages", "app", "node_modules", "escape")), false, "escaping symlink outside repo must be dropped");
+    assert.equal(existsSync(join(ev1.repoSnapshotDir, "packages", "app", "node_modules", "gitleak")), false, "symlink into .git must be dropped");
 
     // Mutate live dataDir & live node_modules after attempt 1
     writeFileSync(join(dataDir, "uwf-issues.json"), JSON.stringify({ issues: [{ id: 1, status: "open" }] }));

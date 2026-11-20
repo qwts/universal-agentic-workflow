@@ -32,12 +32,25 @@
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { buildSystemPrompt, writeTranscript } from "./index.mjs";
 
 export const name = "codex";
 
 const SANDBOX = { "read-only": "read-only", edit: "workspace-write", "edit+exec": "workspace-write", "read-only+review": "workspace-write" };
+
+function resolveExtraWritableRoots(cwd, dataDir, writableRoots) {
+  const absCwd = resolve(cwd);
+  const isUnderCwd = (p) => {
+    const rel = relative(absCwd, p);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+  const candidates = [
+    ...(dataDir ? [resolve(dataDir)] : []),
+    ...(Array.isArray(writableRoots) ? writableRoots.filter(Boolean).map((p) => resolve(p)) : []),
+  ];
+  return [...new Set(candidates)].filter((p) => !isUnderCwd(p));
+}
 
 /** @param {import("./index.mjs").InvokeStageOptions} opts @returns {Promise<import("./index.mjs").InvokeStageResult>} */
 export async function invokeStage(opts) {
@@ -68,6 +81,12 @@ export async function invokeStage(opts) {
   else args.push("--cd", cwd);
   if (model) args.push("--model", model);
   args.push("--json", "-c", `sandbox_mode="${SANDBOX[permissions]}"`, "-c", 'approval_policy="never"');
+  if (SANDBOX[permissions] === "workspace-write") {
+    const extraRoots = resolveExtraWritableRoots(cwd, dataDir, opts.writableRoots);
+    if (extraRoots.length > 0) {
+      args.push("-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(extraRoots)}`);
+    }
+  }
   args.push("--skip-git-repo-check");
   if (lastMsgFile) args.push("--output-last-message", lastMsgFile);
   args.push("-");

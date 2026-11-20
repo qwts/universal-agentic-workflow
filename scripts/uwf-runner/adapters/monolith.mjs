@@ -859,7 +859,11 @@ export async function runMonolith(ctx) {
       permissions: assembled.permissions,
       allowedCommands: assembled.allowedCommands,
       skillsRoot,
-      dataDir,
+      dataDir: resolvedDataDir,
+      writableRoots: [
+        resolvedDataDir,
+        isAbsolute(outputPath) ? resolve(outputPath) : resolve(repoRoot, outputPath),
+      ],
       maxTurns: assembled.totalMaxTurns,
     });
 
