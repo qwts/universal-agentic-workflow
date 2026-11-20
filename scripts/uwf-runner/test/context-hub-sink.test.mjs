@@ -93,28 +93,122 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
         res.end("internal error");
         return;
       }
-      if (req.url === "/mcp-rpc-error") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", error: { code: -32603, message: "hub down" } }));
+      const respondRpcToolCall = (buildResponse) => {
+        const rpcReq = JSON.parse(body);
+        if (!Object.hasOwn(rpcReq, "id")) {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (rpcReq.method === "initialize") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id: rpcReq.id,
+            result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "mock-hub", version: "1.0.0" } },
+          }));
+          return;
+        }
+        buildResponse(rpcReq);
+      };
+      const mcpToolFaultRoutes = {
+        "/mcp-rpc-error": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, error: { code: -32603, message: "hub down" } }));
+        },
+        "/mcp-is-error": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            jsonrpc: "2.0",
+            id: rpcReq.id,
+            result: { isError: true, content: [{ type: "text", text: "rejected manifest" }] },
+          }));
+        },
+        "/mcp-bad-json": () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end("not-json");
+        },
+        "/mcp-no-result": () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ unrelated: 1 }));
+        },
+        "/mcp-bare-result": () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ result: { ok: true } }));
+        },
+        "/mcp-missing-jsonrpc": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ id: rpcReq.id, result: { ok: true } }));
+        },
+        "/mcp-wrong-jsonrpc": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "1.0", id: rpcReq.id, result: { ok: true } }));
+        },
+        "/mcp-missing-id": () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", result: { ok: true } }));
+        },
+        "/mcp-null-id": () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: null, result: { ok: true } }));
+        },
+        "/mcp-wrong-id": () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: "wrong-id", result: { ok: true } }));
+        },
+        "/mcp-dual-error-null": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, error: null, result: { ok: true } }));
+        },
+        "/mcp-missing-result-obj": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id }));
+        },
+        "/mcp-sse-uncorrelated": () => {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.end(
+            'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n' +
+            'data: {"jsonrpc":"2.0","result":{"ok":true}}\n\n',
+          );
+        },
+        "/mcp-sse-wrong-jsonrpc": (rpcReq) => {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.end(
+            'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n' +
+            `data: ${JSON.stringify({ jsonrpc: "1.0", id: rpcReq.id, result: { ok: true } })}\n\n`,
+          );
+        },
+      };
+      if (Object.hasOwn(mcpToolFaultRoutes, req.url)) {
+        respondRpcToolCall(mcpToolFaultRoutes[req.url]);
         return;
       }
-      if (req.url === "/mcp-is-error") {
+      if (req.url === "/mcp-init-bare-result") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          jsonrpc: "2.0",
-          id: "1",
-          result: { isError: true, content: [{ type: "text", text: "rejected manifest" }] },
-        }));
+        res.end(JSON.stringify({ result: { protocolVersion: "2025-03-26" } }));
         return;
       }
-      if (req.url === "/mcp-bad-json") {
+      if (req.url === "/mcp-init-missing-jsonrpc") {
+        const rpcReq = JSON.parse(body);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end("not-json");
+        res.end(JSON.stringify({ id: rpcReq.id, result: { protocolVersion: "2025-03-26" } }));
         return;
       }
-      if (req.url === "/mcp-no-result") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ unrelated: 1 }));
+      if (req.url === "/mcp-sse-correlated") {
+        const rpcReq = JSON.parse(body);
+        if (!Object.hasOwn(rpcReq, "id")) {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        const result = rpcReq.method === "initialize"
+          ? { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "sse-hub", version: "1.0.0" } }
+          : { ok: true, transport: "sse" };
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(
+          'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n' +
+          `data: ${JSON.stringify({ jsonrpc: "2.0", id: rpcReq.id, result })}\n\n`,
+        );
         return;
       }
       if (req.url === "/redirect-http") {
@@ -374,8 +468,26 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
     assert.equal(badMode.exitCode, 1);
     assert.match(badMode.error, /Unknown UAW_CONTEXT_HUB_MODE/);
 
-    // 6. MCP HTTP 200 JSON-RPC error, result.isError=true, missing result, invalid JSON, redirect, and mcpClient isError=true must fail closed
-    for (const ep of ["/mcp-rpc-error", "/mcp-is-error", "/mcp-no-result", "/mcp-bad-json", "/redirect-http"]) {
+    // 6. MCP HTTP 200 JSON-RPC error, result.isError=true, malformed/incomplete envelopes (initialize & tools/call), redirect, and mcpClient isError=true must fail closed
+    for (const [ep, expectedErr] of [
+      ["/mcp-rpc-error", /MCP JSON-RPC error \(-32603\): hub down/],
+      ["/mcp-is-error", /isError=true/],
+      ["/mcp-no-result", /missing or invalid jsonrpc version/],
+      ["/mcp-bad-json", /Invalid JSON response/],
+      ["/mcp-bare-result", /missing or invalid jsonrpc version/],
+      ["/mcp-missing-jsonrpc", /missing or invalid jsonrpc version/],
+      ["/mcp-wrong-jsonrpc", /missing or invalid jsonrpc version/],
+      ["/mcp-missing-id", /missing valid id/],
+      ["/mcp-null-id", /missing valid id/],
+      ["/mcp-wrong-id", /id mismatch/],
+      ["/mcp-dual-error-null", /must not include an error member alongside result/],
+      ["/mcp-missing-result-obj", /missing result object/],
+      ["/mcp-sse-uncorrelated", /missing valid id/],
+      ["/mcp-sse-wrong-jsonrpc", /missing or invalid jsonrpc version/],
+      ["/mcp-init-bare-result", /missing or invalid jsonrpc version/],
+      ["/mcp-init-missing-jsonrpc", /missing or invalid jsonrpc version/],
+      ["/redirect-http", /redirect|fetch failed/i],
+    ]) {
       const rFail = await dispatchToContextHub(baseEnvelope, {
         env: {
           UAW_CONTEXT_HUB_SINK: ep === "/redirect-http" ? "webhook" : "mcp",
@@ -390,7 +502,21 @@ const forbidFetch = async () => { throw new Error("Network I/O must not happen w
       assert.equal(rFail.ok, false, `expected failure for ${ep}`);
       assert.equal(rFail.status, "failed");
       assert.equal(rFail.exitCode, 1);
+      assert.match(rFail.error ?? "", expectedErr, `unexpected error message for ${ep}: ${rFail.error}`);
     }
+
+    const mcpSseRes = await dispatchToContextHub(baseEnvelope, {
+      env: {
+        UAW_CONTEXT_HUB_SINK: "mcp",
+        UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/mcp-sse-correlated`,
+        UAW_CONTEXT_HUB_TOKEN: HUB_SECRET,
+        UAW_CONTEXT_HUB_MODE: "strict",
+      },
+      baseDelayMs: 5,
+    });
+    assert.equal(mcpSseRes.ok, true, mcpSseRes.error ?? "");
+    assert.equal(mcpSseRes.status, "delivered");
+    assert.equal(mcpSseRes.response?.transport, "sse");
 
     const mcpClientIsError = await dispatchToContextHub(baseEnvelope, {
       env: { UAW_CONTEXT_HUB_SINK: "mcp", UAW_CONTEXT_HUB_MODE: "strict" },

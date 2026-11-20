@@ -203,22 +203,55 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function validateMcpPayload(parsed, token, { requireJsonRpcResult = false } = {}) {
-  if (!parsed || typeof parsed !== "object") {
+function validateMcpPayload(parsed, token, { requireJsonRpcResult = false, expectedId = null } = {}) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("MCP sink returned non-object JSON payload");
   }
   if (parsed.error) {
-    const code = parsed.error.code ?? "unknown";
-    const msg = parsed.error.message ?? JSON.stringify(parsed.error);
+    const errObj =
+      parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error) ? parsed.error : null;
+    const code = errObj?.code ?? "unknown";
+    const msg = errObj?.message ?? JSON.stringify(parsed.error);
     const err = new Error(sanitizeError(`MCP JSON-RPC error (${code}): ${msg}`, token));
     if (typeof code === "number" && code >= -32602 && code <= -32600) err.noRetry = true;
     throw err;
   }
-  if (requireJsonRpcResult && (!Object.hasOwn(parsed, "result") || parsed.result === null || typeof parsed.result !== "object")) {
-    throw new Error("MCP JSON-RPC response missing result object");
+  if (requireJsonRpcResult) {
+    if (Object.hasOwn(parsed, "error")) {
+      throw new Error("MCP JSON-RPC response must not include an error member alongside result");
+    }
+    if (parsed.jsonrpc !== "2.0") {
+      throw new Error(
+        sanitizeError(
+          `MCP JSON-RPC response missing or invalid jsonrpc version (expected "2.0", got ${JSON.stringify(parsed.jsonrpc)})`,
+          token,
+        ),
+      );
+    }
+    if (
+      !Object.hasOwn(parsed, "id") ||
+      (typeof parsed.id !== "string" && (typeof parsed.id !== "number" || !Number.isFinite(parsed.id)))
+    ) {
+      throw new Error("MCP JSON-RPC response missing valid id");
+    }
+    if (expectedId !== null && parsed.id !== expectedId) {
+      throw new Error(
+        sanitizeError(`MCP JSON-RPC response id mismatch (expected ${expectedId}, got ${parsed.id})`, token),
+      );
+    }
+    if (
+      !Object.hasOwn(parsed, "result") ||
+      parsed.result === null ||
+      typeof parsed.result !== "object" ||
+      Array.isArray(parsed.result)
+    ) {
+      throw new Error("MCP JSON-RPC response missing result object");
+    }
   }
-  const toolResult = parsed.result !== undefined ? parsed.result : parsed;
-  if (toolResult && typeof toolResult === "object") {
+  const toolResult = requireJsonRpcResult
+    ? parsed.result
+    : (parsed.result !== undefined ? parsed.result : parsed);
+  if (toolResult && typeof toolResult === "object" && !Array.isArray(toolResult)) {
     if (toolResult.error) {
       const msg = toolResult.error.message ?? JSON.stringify(toolResult.error);
       throw new Error(sanitizeError(`MCP tool error: ${msg}`, token));
@@ -265,8 +298,18 @@ async function parseMcpHttpResponse(res, token, { expectedId = null } = {}) {
       }
       parsed =
         (expectedId !== null
-          ? parsedMessages.findLast((m) => m && typeof m === "object" && m.id === expectedId)
-          : null) ?? parsedMessages[parsedMessages.length - 1];
+          ? parsedMessages.findLast(
+              (m) =>
+                m &&
+                typeof m === "object" &&
+                !Array.isArray(m) &&
+                m.jsonrpc === "2.0" &&
+                Object.hasOwn(m, "id") &&
+                m.id === expectedId
+            )
+          : null) ??
+        parsedMessages.findLast((m) => m && typeof m === "object" && !Array.isArray(m) && Boolean(m.error)) ??
+        parsedMessages[parsedMessages.length - 1];
     } else {
       try {
         parsed = JSON.parse(rawText);
@@ -279,11 +322,7 @@ async function parseMcpHttpResponse(res, token, { expectedId = null } = {}) {
   } else {
     throw new Error("Unreadable response object from MCP sink");
   }
-  const validated = validateMcpPayload(parsed, token, { requireJsonRpcResult: true });
-  if (expectedId !== null && Object.hasOwn(parsed, "id") && parsed.id !== expectedId) {
-    throw new Error(`MCP JSON-RPC response id mismatch (expected ${expectedId}, got ${parsed.id})`);
-  }
-  return validated;
+  return validateMcpPayload(parsed, token, { requireJsonRpcResult: true, expectedId });
 }
 
 function isRetryableClientStatus(status) {
