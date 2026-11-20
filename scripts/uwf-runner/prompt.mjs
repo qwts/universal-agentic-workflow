@@ -18,10 +18,10 @@
 import * as fs from "node:fs";
 // Named-importing globSync is a SyntaxError on Node 20 (no such export), so
 // go through the namespace and feature-detect at call time.
-const { existsSync, readFileSync, readdirSync, statSync } = fs;
+const { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync } = fs;
 const fsGlobSync = fs.globSync;
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +30,8 @@ const DEFAULT_REPO = resolve(__dirname, "..", "..");
 // character is re-sent on every turn of the stage, so keep it small.
 const EXCERPT_LINES = 12;
 const EXCERPT_LINE_CHARS = 200;
+const MAX_INPUT_BYTES = 16 * 1024 * 1024;
+const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 const clip = (l) => (l.length > EXCERPT_LINE_CHARS ? l.slice(0, EXCERPT_LINE_CHARS) + "..." : l);
 
 // js-yaml lives in the engine skill's node_modules (npm ci there).
@@ -99,15 +101,24 @@ function matchSegment(pat, str, pi = 0, si = 0) {
   return si === str.length;
 }
 
-function matchPath(patSegs, strSegs, pi = 0, si = 0) {
+function matchPath(patSegs, strSegs, pi = 0, si = 0, seen = new Set()) {
+  const key = `${pi}:${si}`;
+  if (seen.has(key)) return false;
   while (pi < patSegs.length) {
     if (patSegs[pi] === "**") {
-      for (let k = si; k <= strSegs.length; k++) if (matchPath(patSegs, strSegs, pi + 1, k)) return true;
+      for (let k = si; k <= strSegs.length; k++) {
+        if (matchPath(patSegs, strSegs, pi + 1, k, seen)) return true;
+      }
+      seen.add(key);
       return false;
     }
-    if (si >= strSegs.length || !matchSegment(patSegs[pi], strSegs[si])) return false;
+    if (si >= strSegs.length || !matchSegment(patSegs[pi], strSegs[si])) {
+      seen.add(key);
+      return false;
+    }
     pi++; si++;
   }
+  if (si !== strSegs.length) seen.add(key);
   return si === strSegs.length;
 }
 
@@ -228,6 +239,424 @@ function skippedInputNotes(inputsSkipped) {
   return lines.length ? [...lines, ""] : [];
 }
 
+function expandBraces(pattern, max = 64) {
+  const results = [];
+  const walkBrace = (str) => {
+    if (results.length >= max) {
+      throw new PromptError(`Stage input brace glob exceeds ${max} expansions: ${pattern}`);
+    }
+    let open = -1;
+    let depth = 0;
+    let inClass = false;
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+      if (ch === "[" && !inClass) { inClass = true; continue; }
+      if (ch === "]" && inClass) { inClass = false; continue; }
+      if (inClass) continue;
+      if (ch === "{") {
+        if (depth === 0) open = i;
+        depth++;
+      } else if (ch === "}" && depth > 0) {
+        depth--;
+        if (depth === 0) {
+          const prefix = str.slice(0, open);
+          const suffix = str.slice(i + 1);
+          const inner = str.slice(open + 1, i);
+          const parts = [];
+          let last = 0;
+          let subDepth = 0;
+          let subClass = false;
+          for (let j = 0; j < inner.length; j++) {
+            const c = inner[j];
+            if (c === "[" && !subClass) { subClass = true; continue; }
+            if (c === "]" && subClass) { subClass = false; continue; }
+            if (subClass) continue;
+            if (c === "{") subDepth++;
+            else if (c === "}" && subDepth > 0) subDepth--;
+            else if (c === "," && subDepth === 0) {
+              parts.push(inner.slice(last, j));
+              last = j + 1;
+            }
+          }
+          parts.push(inner.slice(last));
+          for (const part of parts) {
+            if (results.length >= max) {
+              throw new PromptError(`Stage input brace glob exceeds ${max} expansions: ${pattern}`);
+            }
+            walkBrace(prefix + part + suffix);
+          }
+          return;
+        }
+      }
+    }
+    if (results.length >= max) {
+      throw new PromptError(`Stage input brace glob exceeds ${max} expansions: ${pattern}`);
+    }
+    results.push(str);
+  };
+  walkBrace(pattern);
+  return results;
+}
+
+function canMatchDescendants(patSegs, dirSegs, pi = 0, si = 0, seen = new Set()) {
+  const key = `${pi}:${si}`;
+  if (seen.has(key)) return false;
+  if (patSegs[pi] === "**") {
+    const ok =
+      canMatchDescendants(patSegs, dirSegs, pi + 1, si, seen) ||
+      (si < dirSegs.length ? canMatchDescendants(patSegs, dirSegs, pi, si + 1, seen) : true);
+    if (!ok) seen.add(key);
+    return ok;
+  }
+  if (si === dirSegs.length) return pi < patSegs.length;
+  if (pi >= patSegs.length || !matchSegment(patSegs[pi], dirSegs[si])) {
+    seen.add(key);
+    return false;
+  }
+  const ok = canMatchDescendants(patSegs, dirSegs, pi + 1, si + 1, seen);
+  if (!ok) seen.add(key);
+  return ok;
+}
+
+function buildStageInputContext(repoRoot, outputPath, extraRoots = []) {
+  const absRepo = resolve(repoRoot);
+  const absOut = outputPath ? resolve(absRepo, outputPath) : null;
+  const containerRoots = [
+    ...new Set([
+      absRepo,
+      ...(absOut ? [absOut] : []),
+      ...extraRoots.filter(Boolean).map((r) => resolve(absRepo, r)),
+    ]),
+  ];
+  const allowedRealRoots = [];
+  for (const c of containerRoots) {
+    let st;
+    try {
+      st = statSync(c);
+    } catch (e) {
+      if (e.code === "ENOENT") continue;
+      throw e;
+    }
+    if (!st.isDirectory()) {
+      throw new PromptError(`Stage root must be a directory: ${c}`);
+    }
+    allowedRealRoots.push(realpathSync(c));
+  }
+  const insideRealRoot = (realP) =>
+    allowedRealRoots.some((r) => realP === r || realP.startsWith(r.endsWith(sep) ? r : r + sep));
+  const isOutsideRel = (rel) => rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
+  const findContainerOrNull = (absTarget) => {
+    let best = null;
+    for (const c of containerRoots) {
+      const rel = relative(c, absTarget);
+      if (absTarget === c || (rel !== "" && !isOutsideRel(rel))) {
+        if (!best || c.length > best.length) best = c;
+      }
+    }
+    return best;
+  };
+  const hasContainer = (absTarget) => findContainerOrNull(absTarget) !== null;
+  const findContainer = (absTarget) => {
+    const best = findContainerOrNull(absTarget);
+    if (!best) {
+      throw new PromptError(`Stage input escapes repo_root and output_path: ${absTarget}`);
+    }
+    return best;
+  };
+  const assertNoSymlinkAncestors = (container, absTarget) => {
+    let curLst;
+    try {
+      curLst = statSync(container);
+    } catch (e) {
+      if (e.code === "ENOENT") return { exists: false, leafLst: null };
+      throw e;
+    }
+    if (!curLst.isDirectory()) {
+      throw new PromptError(`Stage input root must be a directory: ${container}`);
+    }
+    const parts = relative(container, absTarget).split(sep).filter(Boolean);
+    let cur = container;
+    let leafLst = curLst;
+    for (let i = 0; i < parts.length; i++) {
+      cur = join(cur, parts[i]);
+      try {
+        leafLst = lstatSync(cur);
+      } catch (e) {
+        if (e.code === "ENOENT") return { exists: false, leafLst: null };
+        throw e;
+      }
+      if (leafLst.isSymbolicLink()) {
+        throw new PromptError(`Stage input must not traverse symlinks: ${cur}`);
+      }
+      if (i < parts.length - 1 && !leafLst.isDirectory()) {
+        return { exists: false, leafLst: null };
+      }
+    }
+    return { exists: true, leafLst };
+  };
+  const assertRegularContainedInput = (absTarget) => {
+    const container = findContainer(absTarget);
+    const walkRes = assertNoSymlinkAncestors(container, absTarget);
+    if (!walkRes.exists) return false;
+    if (!walkRes.leafLst.isFile()) {
+      throw new PromptError(`Stage input must be a regular file: ${absTarget}`);
+    }
+    if (walkRes.leafLst.size > MAX_INPUT_BYTES) {
+      throw new PromptError(`Stage input exceeds ${MAX_INPUT_BYTES} byte limit: ${absTarget}`);
+    }
+    const realTarget = realpathSync(absTarget);
+    if (!insideRealRoot(realTarget)) {
+      throw new PromptError(`Stage input escapes allowed root: ${absTarget}`);
+    }
+    let fd;
+    try {
+      fd = openSync(absTarget, OPEN_NOFOLLOW_FLAGS);
+      const fst = fstatSync(fd);
+      if (!fst.isFile()) {
+        throw new PromptError(`Stage input must be a regular file: ${absTarget}`);
+      }
+      if (fst.size > MAX_INPUT_BYTES) {
+        throw new PromptError(`Stage input exceeds ${MAX_INPUT_BYTES} byte limit: ${absTarget}`);
+      }
+    } catch (err) {
+      if (err instanceof PromptError) throw err;
+      throw new PromptError(`Cannot validate stage input ${absTarget}: ${err.message}`);
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+    return true;
+  };
+  const assertSafeGateDir = (dirSpec) => {
+    const absDir = resolve(absRepo, dirSpec);
+    const container = findContainer(absDir);
+    const walkRes = assertNoSymlinkAncestors(container, absDir);
+    if (!walkRes.exists) return;
+    if (!walkRes.leafLst.isDirectory()) {
+      throw new PromptError(`Gate directory must be a regular directory: ${absDir}`);
+    }
+    if (!insideRealRoot(realpathSync(absDir))) {
+      throw new PromptError(`Gate directory escapes allowed root: ${absDir}`);
+    }
+  };
+  const assertSafeGateArgPath = (absTarget, { enforceSizeLimit = false } = {}) => {
+    const container = findContainer(absTarget);
+    const walkRes = assertNoSymlinkAncestors(container, absTarget);
+    if (!walkRes.exists) return;
+    if (walkRes.leafLst.isDirectory()) {
+      if (!insideRealRoot(realpathSync(absTarget))) {
+        throw new PromptError(`Gate directory escapes allowed root: ${absTarget}`);
+      }
+      return;
+    }
+    if (!walkRes.leafLst.isFile()) {
+      throw new PromptError(`Gate path must be a regular file or directory: ${absTarget}`);
+    }
+    if (!insideRealRoot(realpathSync(absTarget))) {
+      throw new PromptError(`Gate path escapes allowed root: ${absTarget}`);
+    }
+    if (enforceSizeLimit) {
+      assertRegularContainedInput(absTarget);
+    }
+  };
+  const expandOne = (subPat, outSet) => {
+    const absP = resolve(absRepo, subPat);
+    const container = findContainer(absP);
+    const relPat = relative(container, absP);
+    const patSegs = relPat.split(sep).filter(Boolean);
+    const firstGlob = patSegs.findIndex((s) => /[*?[]/.test(s));
+    if (firstGlob === -1) {
+      if (assertRegularContainedInput(absP)) outSet.add(absP);
+      return;
+    }
+    const baseDir = firstGlob === 0 ? container : join(container, ...patSegs.slice(0, firstGlob));
+    const baseWalk = assertNoSymlinkAncestors(container, baseDir);
+    if (!baseWalk.exists) return;
+    if (!baseWalk.leafLst.isDirectory()) {
+      throw new PromptError(`Stage input directory must be a regular directory: ${baseDir}`);
+    }
+    if (!insideRealRoot(realpathSync(baseDir))) {
+      throw new PromptError(`Stage input directory escapes allowed root: ${baseDir}`);
+    }
+    const scanDir = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if ((entry.name === ".git" || entry.name === "node_modules") && !patSegs.includes(entry.name)) {
+          continue;
+        }
+        const cand = join(dir, entry.name);
+        let candLst;
+        try {
+          candLst = lstatSync(cand);
+        } catch (e) {
+          if (e.code === "ENOENT") continue;
+          throw e;
+        }
+        const candRelSegs = relative(container, cand).split(sep).filter(Boolean);
+        const hitsPattern = matchPath(patSegs, candRelSegs);
+        const traversesSubdir = canMatchDescendants(patSegs, candRelSegs);
+        if (candLst.isSymbolicLink()) {
+          let isDirTarget = false;
+          if (traversesSubdir) {
+            try { isDirTarget = statSync(cand).isDirectory(); } catch { /* broken/file */ }
+          }
+          if (hitsPattern || (traversesSubdir && isDirTarget)) {
+            throw new PromptError(`Stage input must not be or traverse a symlink: ${cand}`);
+          }
+          continue;
+        }
+        if (candLst.isDirectory()) {
+          if (traversesSubdir) {
+            if (!insideRealRoot(realpathSync(cand))) {
+              throw new PromptError(`Stage input directory escapes allowed root: ${cand}`);
+            }
+            scanDir(cand);
+          }
+          continue;
+        }
+        if (hitsPattern && assertRegularContainedInput(cand)) {
+          outSet.add(cand);
+        }
+      }
+    };
+    scanDir(baseDir);
+  };
+  const expand = (p) => {
+    const matched = new Set();
+    for (const subPat of expandBraces(p)) {
+      expandOne(subPat, matched);
+    }
+    return [...matched].sort();
+  };
+  const readSafeInputUtf8 = (absFile) => {
+    assertRegularContainedInput(absFile);
+    let fd;
+    try {
+      fd = openSync(absFile, OPEN_NOFOLLOW_FLAGS);
+      const st = fstatSync(fd);
+      if (!st.isFile()) {
+        throw new PromptError(`Stage input must be a regular file: ${absFile}`);
+      }
+      if (st.size > MAX_INPUT_BYTES) {
+        throw new PromptError(`Stage input exceeds ${MAX_INPUT_BYTES} byte limit: ${absFile}`);
+      }
+      if (!insideRealRoot(realpathSync(absFile))) {
+        throw new PromptError(`Stage input escapes allowed root: ${absFile}`);
+      }
+      const chunks = [];
+      let total = 0;
+      const chunkBuf = Buffer.allocUnsafe(65536);
+      while (true) {
+        const n = readSync(fd, chunkBuf, 0, chunkBuf.length, null);
+        if (n === 0) break;
+        total += n;
+        if (total > MAX_INPUT_BYTES) {
+          throw new PromptError(`Stage input exceeds ${MAX_INPUT_BYTES} byte limit: ${absFile}`);
+        }
+        chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
+      }
+      return Buffer.concat(chunks, total).toString("utf8");
+    } catch (err) {
+      if (err instanceof PromptError) throw err;
+      throw new PromptError(`Cannot read stage input ${absFile}: ${err.message}`);
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+  };
+  return {
+    abs: (p) => resolve(absRepo, p),
+    expand,
+    readSafeInputUtf8,
+    assertRegularContainedInput,
+    assertSafeGateDir,
+    assertSafeGateArgPath,
+    hasContainer,
+  };
+}
+
+/**
+ * Validate declared stage `inputs` (literal and glob) and, when `validateGates` is true,
+ * gate/condition file & directory paths against symlinks, non-regular files (e.g., FIFOs),
+ * size bounds, and root containment.
+ */
+export function validateWorkflowStageInputs({ workflow, stage = null, validateGates = Boolean(stage), repoRoot, skillsRoot, outputPath, dataDir } = {}) {
+  const absRepo = resolve(repoRoot ?? DEFAULT_REPO);
+  const effectiveSkillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot: absRepo, workflow }).root;
+  const stagesPath = join(effectiveSkillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml");
+  if (!existsSync(stagesPath)) return;
+  const yaml = loadYaml(effectiveSkillsRoot);
+  const stagesDoc = yaml.load(readFileSync(stagesPath, "utf8"));
+  const chosenDataDir = dataDir ?? process.env.UWF_DATA_DIR;
+  const effectiveDataDir = resolve(absRepo, chosenDataDir ?? "./tmp/uwf");
+  const rawOut = outputPath ?? (chosenDataDir ? join(chosenDataDir, "workflow-artifacts") : "./tmp/workflow-artifacts");
+  const resolvedOut = resolve(absRepo, rawOut);
+  const { expand, assertSafeGateDir, assertSafeGateArgPath, hasContainer } = buildStageInputContext(
+    absRepo,
+    resolvedOut,
+    [effectiveSkillsRoot, effectiveDataDir, DEFAULT_REPO],
+  );
+  const subst = (s) =>
+    String(s)
+      .replace(/\{\{output_path\}\}/g, () => resolvedOut)
+      .replace(/\{\{cwd\}\}/g, () => absRepo)
+      .replace(/\{\{skills_root\}\}/g, () => effectiveSkillsRoot);
+  const stages = Array.isArray(stagesDoc?.stages) ? stagesDoc.stages : [];
+  const targetStages = stage ? stages.filter((st) => st?.name === stage) : stages;
+  if (stage && stages.length > 0 && targetStages.length === 0) {
+    throw new PromptError(`Unknown stage "${stage}" in workflow "${workflow}"`);
+  }
+  for (const st of targetStages) {
+    for (const raw of st?.inputs ?? []) {
+      expand(subst(raw));
+    }
+    if (!validateGates) continue;
+    if (typeof st?.condition?.path === "string") {
+      assertSafeGateArgPath(resolve(absRepo, subst(st.condition.path)), { enforceSizeLimit: true });
+    }
+    for (const check of st?.gate?.checks ?? []) {
+      if (typeof check?.path === "string") {
+        const readsFile = check?.type === "require_contains" || check?.type === "require_json_field";
+        assertSafeGateArgPath(resolve(absRepo, subst(check.path)), { enforceSizeLimit: readsFile });
+      }
+      if ((check?.type === "require_files_with_prefix" || check?.type === "require_file_matching_pattern") && typeof check?.dir === "string") {
+        assertSafeGateDir(subst(check.dir));
+      }
+      if (check?.type === "run_script" && Array.isArray(check?.args)) {
+        for (let i = 0; i < check.args.length; i++) {
+          const rawArg = check.args[i];
+          if (typeof rawArg !== "string" || /[\n;]/.test(rawArg)) continue;
+          if (i > 0 && /^(-e|-p|--eval|--print)$/.test(String(check.args[i - 1]))) continue;
+          const candidates = [];
+          if (rawArg.startsWith("-")) {
+            const eq = rawArg.indexOf("=");
+            if (eq > 0) candidates.push(rawArg.slice(eq + 1));
+          } else {
+            candidates.push(rawArg);
+            const eq = rawArg.indexOf("=");
+            if (eq > 0) candidates.push(rawArg.slice(eq + 1));
+          }
+          for (const candidate of candidates) {
+            if (!candidate) continue;
+            const resolvedArg = resolve(absRepo, subst(candidate));
+            let existsOnDisk = false;
+            try {
+              lstatSync(resolvedArg);
+              existsOnDisk = true;
+            } catch (e) {
+              if (e.code !== "ENOENT" && e.code !== "ENOTDIR" && e.code !== "ENAMETOOLONG") throw e;
+            }
+            if (hasContainer(resolvedArg) || existsOnDisk || /\{\{(?:output_path|cwd|skills_root)\}\}/.test(candidate)) {
+              assertSafeGateArgPath(resolvedArg, { enforceSizeLimit: false });
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 /**
  * Two roots: `skillsRoot` holds workflow definitions, stage contracts, traits, profiles, agent files
  * and SKILL docs (default: this checkout, or UWF_SKILLS_ROOT); `repoRoot` is the target repo the
@@ -290,13 +719,11 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
     "",
   ] : [];
 
-  const subst = (s) => String(s).replace(/\{\{output_path\}\}/g, outputPath).replace(/\{\{cwd\}\}/g, repoRoot);
+  const subst = (s) => String(s).replace(/\{\{output_path\}\}/g, () => outputPath).replace(/\{\{cwd\}\}/g, () => repoRoot);
   const inputs = [...(stageDef.inputs ?? []), ...(extraInputs ?? [])].map(subst);
   const outputs = (stageDef.outputs ?? []).map(subst);
 
-  const abs = (p) => resolve(repoRoot, p);
-  const expand = (p) =>
-    /[*?[{]/.test(p) ? globFiles(p, repoRoot).map(abs).sort() : existsSync(abs(p)) ? [abs(p)] : [];
+  const { abs, expand, readSafeInputUtf8 } = buildStageInputContext(repoRoot, outputPath, [skillsRoot, resolve(repoRoot, dataDir)]);
   // Outputs of skipped stages: a missing input that one of them would have produced is expected, not an error.
   const skippedOutputs = new Map();
   for (const sk of skippedStages ?? []) {
@@ -318,7 +745,7 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
       continue;
     }
     for (const f of files) {
-      const lines = readFileSync(f, "utf8").split(/\r?\n/);
+      const lines = readSafeInputUtf8(f).split(/\r?\n/);
       const shown = lines.slice(0, EXCERPT_LINES).map(clip).join("\n");
       const more = lines.length > EXCERPT_LINES ? `\n... (${lines.length - EXCERPT_LINES} more lines)` : "";
       inputBlocks.push(`### ${f === abs(p) ? p : f}\n\`\`\`\n${shown}${more}\n\`\`\``);

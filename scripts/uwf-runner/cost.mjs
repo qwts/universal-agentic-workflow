@@ -14,13 +14,18 @@
  * Also used by the runner: attemptUsage() (one transcript) and listTranscripts() (all transcripts in a data dir).
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { materializePrompt } from "./prompt.mjs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
+
+const DEFAULT_REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 export const AVG_LIMIT = 50_000;
 export const TURN_LIMIT = 100_000;
 const CHARS_PER_TOKEN = 4;
+const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
+const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
 const k = (n) => (n / 1000).toFixed(1) + "K";
 const num = (v) => (Number.isFinite(v) ? v : 0);
@@ -45,25 +50,122 @@ export function transcriptRow(file, t) {
   };
 }
 
+function readRegularUtf8Bounded(fullPath, expectedRealDirs = null, maxBytes = MAX_TRANSCRIPT_BYTES) {
+  let lst;
+  try {
+    lst = lstatSync(fullPath);
+  } catch {
+    return null;
+  }
+  if (lst.isSymbolicLink() || !lst.isFile() || lst.size > maxBytes) return null;
+  if (expectedRealDirs !== null) {
+    let realFull;
+    try {
+      realFull = realpathSync(fullPath);
+    } catch {
+      return null;
+    }
+    const dirs = Array.isArray(expectedRealDirs) ? expectedRealDirs : [expectedRealDirs];
+    const allowed = dirs.some((d) => {
+      const prefix = d.endsWith(sep) ? d : d + sep;
+      return realFull === d || realFull.startsWith(prefix);
+    });
+    if (!allowed) return null;
+  }
+  let fd;
+  try {
+    fd = openSync(fullPath, OPEN_NOFOLLOW_FLAGS);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    const chunks = [];
+    let total = 0;
+    const chunkBuf = Buffer.allocUnsafe(65536);
+    while (true) {
+      const n = readSync(fd, chunkBuf, 0, chunkBuf.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > maxBytes) return null;
+      chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+function readTranscriptJsonSafe(fullPath, expectedRealDir = null) {
+  const raw = readRegularUtf8Bounded(fullPath, expectedRealDir, MAX_TRANSCRIPT_BYTES);
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 /** { ctx, cost } for one transcript file: context of the last turn (falls back to the per-turn average) and reported cost (0 when unknown). */
 export function attemptUsage(path) {
   try {
-    const row = transcriptRow(path, JSON.parse(readFileSync(path, "utf8")));
+    const parsed = readTranscriptJsonSafe(path);
+    if (!parsed) return { ctx: 0, cost: 0 };
+    const row = transcriptRow(path, parsed);
     return row ? { ctx: row.lastCtx || row.perTurn, cost: row.cost ?? 0 } : { ctx: 0, cost: 0 };
   } catch { return { ctx: 0, cost: 0 }; }
 }
 
-/** Absolute paths of every transcript file in <dataDir>/transcripts. */
+/** Absolute paths of every regular, non-symlink transcript file in <dataDir>/transcripts. */
 export function listTranscripts(dataDir) {
   const dir = join(dataDir, "transcripts");
-  return existsSync(dir) ? readdirSync(dir).filter((x) => x.endsWith(".json")).map((f) => join(dir, f)) : [];
+  let dirStat;
+  try {
+    dirStat = lstatSync(dir);
+  } catch {
+    return [];
+  }
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return [];
+  let realDir;
+  try {
+    realDir = realpathSync(dir);
+  } catch {
+    return [];
+  }
+  const prefix = realDir.endsWith(sep) ? realDir : realDir + sep;
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    const full = join(dir, name);
+    try {
+      const lst = lstatSync(full);
+      if (lst.isSymbolicLink() || !lst.isFile() || lst.size > MAX_TRANSCRIPT_BYTES) continue;
+      if (!realpathSync(full).startsWith(prefix)) continue;
+      out.push(full);
+    } catch { /* unreadable transcript */ }
+  }
+  return out;
 }
 
 /** Context size of the last turn of the newest transcript whose prompt names this stage (0 when none). */
 export function lastStageContext(dataDir, stage) {
+  let realDir = null;
+  try {
+    const dir = join(dataDir, "transcripts");
+    const dirStat = lstatSync(dir);
+    if (!dirStat.isSymbolicLink() && dirStat.isDirectory()) {
+      realDir = realpathSync(dir);
+    }
+  } catch {
+    return 0;
+  }
+  if (!realDir) return 0;
   for (const f of listTranscripts(dataDir).sort().reverse()) {
     try {
-      const row = transcriptRow(f, JSON.parse(readFileSync(f, "utf8")));
+      const parsed = readTranscriptJsonSafe(f, realDir);
+      if (!parsed) continue;
+      const row = transcriptRow(f, parsed);
       if (row?.stage === stage) return row.lastCtx || row.perTurn;
     } catch { /* unreadable transcript */ }
   }
@@ -71,23 +173,55 @@ export function lastStageContext(dataDir, stage) {
 }
 
 /** Files the agent body tells the stage to read (`.github/...` paths in backticks), with their sizes. */
-function referencedChars(skillsRoot, systemPrompt) {
+function referencedChars({ workflow, repoRoot, skillsRoot }, systemPrompt) {
+  const effectiveSkillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot, workflow }).root;
+  const orderedRoots = skillsRoot
+    ? [effectiveSkillsRoot, repoRoot, DEFAULT_REPO]
+    : [repoRoot, effectiveSkillsRoot, DEFAULT_REPO];
+  const candidateRoots = [
+    ...new Set(orderedRoots.filter(Boolean).map((r) => resolve(r))),
+  ];
+  const trustedRealRoots = [];
+  for (const r of candidateRoots) {
+    try {
+      if (statSync(r).isDirectory()) trustedRealRoots.push(realpathSync(r));
+    } catch { /* ignore absent root */ }
+  }
+  if (trustedRealRoots.length === 0) return 0;
   let total = 0;
-  // Relative refs resolve against skillsRoot; refs the prompt already made absolute resolve to themselves.
+  // Relative refs check repo/skills/fallback roots; refs the prompt already made absolute resolve to themselves.
   for (const ref of new Set([...String(systemPrompt).matchAll(/`([^`\s]*\.github\/[^`\s]+)`/g)].map((x) => x[1]))) {
-    const p = resolve(skillsRoot, ref);
-    if (existsSync(p) && !p.endsWith("/")) { try { total += readFileSync(p, "utf8").length; } catch { /* directory */ } }
+    if (ref.endsWith("/")) continue;
+    const candidates = isAbsolute(ref)
+      ? [resolve(ref)]
+      : candidateRoots.map((r) => resolve(r, ref));
+    for (const cand of candidates) {
+      const text = readRegularUtf8Bounded(cand, trustedRealRoots, MAX_TRANSCRIPT_BYTES);
+      if (text !== null) {
+        total += text.length;
+        break;
+      }
+    }
   }
   return total;
 }
 
 export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outputPath }) {
   const dir = join(dataDir, "transcripts");
-  if (!existsSync(dir)) throw new Error(`No transcripts directory at ${dir}`);
+  let dirStat;
+  try {
+    dirStat = lstatSync(dir);
+  } catch {
+    throw new Error(`No transcripts directory at ${dir}`);
+  }
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+    throw new Error(`Invalid transcripts directory at ${dir}`);
+  }
+  const realDir = realpathSync(dir);
   const rows = [];
   for (const f of readdirSync(dir).filter((x) => x.endsWith(".json")).sort()) {
-    let t;
-    try { t = JSON.parse(readFileSync(join(dir, f), "utf8")); } catch { continue; }
+    const t = readTranscriptJsonSafe(join(dir, f), realDir);
+    if (!t) continue;
     const row = transcriptRow(f, t);
     if (row) rows.push(row);
   }
@@ -98,7 +232,13 @@ export async function costReport({ dataDir, workflow, repoRoot, skillsRoot, outp
     for (const st of new Set(rows.map((r) => r.stage))) {
       try {
         const mp = await materializePrompt({ workflow, stage: st, repoRoot, skillsRoot, outputPath, dataDir });
-        statics[st] = { prompt: mp.prompt.length, system: mp.systemPrompt.length, refs: referencedChars(skillsRoot ?? repoRoot, mp.systemPrompt) };
+        let refs = 0;
+        try {
+          refs = referencedChars({ workflow, repoRoot, skillsRoot }, mp.systemPrompt);
+        } catch {
+          refs = 0;
+        }
+        statics[st] = { prompt: mp.prompt.length, system: mp.systemPrompt.length, refs };
       } catch { /* stage not in this workflow */ }
     }
   }
