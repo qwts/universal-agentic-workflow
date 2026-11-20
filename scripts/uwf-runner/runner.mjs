@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
 import { attemptUsage, costReport, lastStageContext, listTranscripts } from "./cost.mjs";
-import { computeWorktreeTreeSha, ensureRunMeta, getCommitTreeSha, isGitRepo, materializeManifest, readRoutingState, sealManifest, writeFileAtomic } from "./provenance.mjs";
+import { ensureRunMeta, materializeManifest, readContainedDataFile, readManifestRaw, readRoutingState, sealManifest, writeFileAtomic } from "./provenance.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OWN_ROOT = resolve(HERE, "..", "..");
@@ -53,21 +53,39 @@ const ROUTING_FILE = "runner-routing.json"; // on_verdict round trips + findings
 const FINALIZE_PENDING_FILE = "runner-finalize-pending.json";
 
 function readFinalizePending(dataDir) {
-  const p = join(dataDir, FINALIZE_PENDING_FILE);
-  if (!existsSync(p)) return null;
+  let raw;
   try {
-    return JSON.parse(readFileSync(p, "utf8")) ?? {};
-  } catch {
-    return {};
+    raw = readContainedDataFile(dataDir, FINALIZE_PENDING_FILE, "Finalize pending marker").toString("utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Corrupt finalize pending marker at ${join(resolve(dataDir), FINALIZE_PENDING_FILE)}: ${err.message}`);
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed.defer_seal !== undefined && typeof parsed.defer_seal !== "boolean")
+  ) {
+    throw new Error(`Corrupt finalize pending marker at ${join(resolve(dataDir), FINALIZE_PENDING_FILE)}: invalid JSON shape`);
+  }
+  return parsed;
 }
 
 function needsFinalization(dataDir) {
-  if (existsSync(join(dataDir, FINALIZE_PENDING_FILE))) return true;
-  const manifestPath = join(dataDir, "uaw-manifest.json");
-  if (!existsSync(manifestPath)) return true;
   try {
-    const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+    lstatSync(join(dataDir, FINALIZE_PENDING_FILE));
+    return true;
+  } catch (err) {
+    if (err.code !== "ENOENT") return true;
+  }
+  try {
+    const parsed = JSON.parse(readManifestRaw(dataDir));
     return parsed?.phase !== "closed" && parsed?.phase !== "sealed";
   } catch {
     return true;
@@ -76,20 +94,15 @@ function needsFinalization(dataDir) {
 
 async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, outputPath, deferSeal, rows, note, log }) {
   mkdirSync(dataDir, { recursive: true });
-  const pending = readFinalizePending(dataDir);
-  let hasDirtyGitWorktree = false;
-  if (!deferSeal && !pending?.defer_seal && isGitRepo(repoRoot)) {
-    const headTree = getCommitTreeSha(repoRoot, "HEAD");
-    const wtTree = computeWorktreeTreeSha(repoRoot, { dataDir });
-    hasDirtyGitWorktree = !headTree || headTree !== wtTree;
-  }
-  const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal || hasDirtyGitWorktree);
-  const finalPhase = effectiveDeferSeal ? "closed" : "sealed";
-  writeFileAtomic(
-    join(dataDir, FINALIZE_PENDING_FILE),
-    JSON.stringify({ phase: finalPhase, defer_seal: effectiveDeferSeal, ts: new Date().toISOString() }) + "\n",
-  );
+  let pending;
   try {
+    pending = readFinalizePending(dataDir);
+    const effectiveDeferSeal = Boolean(deferSeal || pending?.defer_seal);
+    const finalPhase = effectiveDeferSeal ? "closed" : "sealed";
+    writeFileAtomic(
+      join(dataDir, FINALIZE_PENDING_FILE),
+      JSON.stringify({ phase: finalPhase, defer_seal: effectiveDeferSeal, ts: new Date().toISOString() }) + "\n",
+    );
     const m = effectiveDeferSeal
       ? await materializeManifest({
           dataDir,
@@ -107,6 +120,7 @@ async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, ou
           repoRoot,
           skillsRoot,
           outputPath,
+          allowDirtyWorktree: true,
         });
     if (!m.ok) {
       if (m.sink && !m.sink.ok) {
@@ -114,8 +128,8 @@ async function finalizeWorkflowRun({ dataDir, workflow, repoRoot, skillsRoot, ou
       }
       return finish(EXIT.GATE, rows, `provenance manifest seal failed (${m.error ?? "unknown"})`, note);
     }
-    if (hasDirtyGitWorktree) {
-      log("[runner] working tree has uncommitted tracked changes; manifest materialized at phase=closed (run provenance.mjs seal after commit)");
+    if (!effectiveDeferSeal && m.manifest?.deliverable?.git_tree_sha && !m.manifest?.deliverable?.head_commit_sha) {
+      log("[runner] working tree has uncommitted tracked changes; sealed working-tree deliverable (run provenance.mjs seal after commit to bind head_commit_sha)");
     }
   } catch (err) {
     log(`[runner] provenance manifest failed: ${err.message}`);

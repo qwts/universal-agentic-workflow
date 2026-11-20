@@ -1111,9 +1111,11 @@ try {
     assert.match(nonGitSealRes.error, /non-git repoRoot/);
 
     // Local runner.mjs run without --defer-seal in a git repo with uncommitted tracked changes
-    // must materialize phase=closed (head_commit_sha=null, tree:<sha>) until committed and sealed
+    // must seal the working-tree deliverable immediately (phase=sealed, head_commit_sha=null, tree:<sha>)
+    // and dispatch run.finalized; explicit --defer-seal defers until commit + provenance.mjs seal
     const dirtyRepo = join(runRoot, "dirty-seal-repo");
     const dirtyData = join(runRoot, "dirty-seal-data");
+    const dirtyDeferData = join(runRoot, "dirty-defer-data");
     const fxDirty = join(runRoot, "fx-dirty");
     cpSync(fxDir, fxDirty, { recursive: true });
     mkdirSync(dirtyRepo, { recursive: true });
@@ -1125,41 +1127,194 @@ try {
     writeFileSync(join(dirtyRepo, "app.txt"), "v1\n");
     execFileSync("git", ["-C", dirtyRepo, "add", ".uwf.json", ".gitignore", "app.txt"]);
     execFileSync("git", ["-C", dirtyRepo, "commit", "-q", "-m", "initial"]);
+    const v1Head = execFileSync("git", ["-C", dirtyRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const implFx = JSON.parse(readFileSync(join(fxDirty, "implementation.json"), "utf8"));
     implFx.files = { ...(implFx.files ?? {}), "app.txt": "v2-uncommitted\n" };
     writeFileSync(join(fxDirty, "implementation.json"), JSON.stringify(implFx, null, 2));
 
-    execFileSync(
-      process.execPath,
-      [
-        RUNNER_CLI,
-        "run",
-        "--workflow", "sw_dev",
-        "--goal", "Dirty worktree defers seal",
-        "--adapter", "fake",
-        "--repo-root", dirtyRepo,
-        "--data-dir", dirtyData,
-      ],
-      { encoding: "utf8", env: { ...process.env, UWF_FAKE_FIXTURE_DIR: fxDirty, UWF_DATA_DIR: "" }, stdio: "pipe" },
-    );
-    const dirtyManifest = JSON.parse(readFileSync(join(dirtyData, "uaw-manifest.json"), "utf8"));
-    const expectedWtTree = computeWorktreeTreeSha(dirtyRepo, { dataDir: dirtyData });
-    assert.equal(dirtyManifest.phase, "closed", "uncommitted tracked changes must materialize closed, not sealed");
-    assert.equal(dirtyManifest.deliverable.head_commit_sha, null);
-    assert.equal(dirtyManifest.deliverable.git_tree_sha, expectedWtTree);
-    assert.equal(dirtyManifest.deliverable_key, `tree:${expectedWtTree}`);
+    const dirtyEvents = [];
+    const dirtyServer = createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        dirtyEvents.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise((resolveListen) => dirtyServer.listen(0, "127.0.0.1", resolveListen));
+    const runRunnerWebhook = async (args, { fxPath, port }) => {
+      let stdout = "";
+      let stderr = "";
+      const code = await new Promise((resolveSpawn, rejectSpawn) => {
+        const child = spawn(process.execPath, [RUNNER_CLI, ...args], {
+          env: {
+            ...process.env,
+            UWF_FAKE_FIXTURE_DIR: fxPath,
+            UWF_DATA_DIR: "",
+            UAW_CONTEXT_HUB_SINK: "webhook",
+            UAW_CONTEXT_HUB_URL: `http://127.0.0.1:${port}/webhook`,
+            UAW_CONTEXT_HUB_TOKEN: "tok",
+            UAW_CONTEXT_HUB_MODE: "strict",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+        child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+        child.on("error", rejectSpawn);
+        child.on("close", resolveSpawn);
+      });
+      return { code, stdout, stderr };
+    };
+    try {
+      const { port } = dirtyServer.address();
+      const dirtyRunRes = await runRunnerWebhook(
+        [
+          "run",
+          "--workflow", "sw_dev",
+          "--goal", "Dirty worktree seals directly",
+          "--adapter", "fake",
+          "--repo-root", dirtyRepo,
+          "--data-dir", dirtyData,
+        ],
+        { fxPath: fxDirty, port },
+      );
+      assert.equal(dirtyRunRes.code, 0, dirtyRunRes.stderr || dirtyRunRes.stdout);
+      assert.equal(existsSync(join(dirtyData, "runner-finalize-pending.json")), false);
 
-    execFileSync("git", ["-C", dirtyRepo, "add", "app.txt"]);
-    execFileSync("git", ["-C", dirtyRepo, "commit", "-q", "-m", "commit v2"]);
-    const v2Head = execFileSync("git", ["-C", dirtyRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-    const afterCommitSeal = execFileSync(
-      process.execPath,
-      [PROVENANCE_CLI, "seal", "--data-dir", dirtyData, "--workflow", "sw_dev", "--repo-root", dirtyRepo],
-      { encoding: "utf8", env, stdio: "pipe" },
-    );
-    assert.equal(JSON.parse(afterCommitSeal).phase, "sealed");
-    const dirtySealed = JSON.parse(readFileSync(join(dirtyData, "uaw-manifest.json"), "utf8"));
-    assert.equal(dirtySealed.deliverable.head_commit_sha, v2Head);
+      const dirtyManifest = JSON.parse(readFileSync(join(dirtyData, "uaw-manifest.json"), "utf8"));
+      const expectedWtTree = computeWorktreeTreeSha(dirtyRepo, { dataDir: dirtyData });
+      assert.equal(dirtyManifest.phase, "sealed", "dirty local run without --defer-seal must seal directly");
+      assert.equal(dirtyManifest.deliverable.base_commit_sha, v1Head);
+      assert.equal(dirtyManifest.deliverable.head_commit_sha, null);
+      assert.equal(dirtyManifest.deliverable.git_tree_sha, expectedWtTree);
+      assert.equal(dirtyManifest.deliverable_key, `tree:${expectedWtTree}`);
+      assert.deepEqual(dirtyEvents.map((e) => e.event), ["stage.completed", "run.finalized"]);
+      assert.equal(dirtyEvents[1].dedup_tuple.stage, "seal");
+      assert.equal(dirtyEvents[1].deliverable_key, `tree:${expectedWtTree}`);
+
+      // Explicit post-commit CLI seal must still fail closed before commit
+      const preCommitCliSeal = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", dirtyData, "--workflow", "sw_dev", "--repo-root", dirtyRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(preCommitCliSeal.status, 1, "CLI provenance.mjs seal must reject uncommitted tracked changes");
+      assert.match(preCommitCliSeal.stdout, /does not match post-retro tracked worktree state/);
+
+      // Explicit --defer-seal defers final seal & run.finalized until commit + provenance.mjs seal
+      dirtyEvents.length = 0;
+      writeFileSync(join(dirtyRepo, "app.txt"), "v1\n");
+      const dirtyDeferRes = await runRunnerWebhook(
+        [
+          "run",
+          "--workflow", "sw_dev",
+          "--goal", "Dirty worktree explicit defer-seal",
+          "--adapter", "fake",
+          "--repo-root", dirtyRepo,
+          "--data-dir", dirtyDeferData,
+          "--defer-seal",
+        ],
+        { fxPath: fxDirty, port },
+      );
+      assert.equal(dirtyDeferRes.code, 0, dirtyDeferRes.stderr || dirtyDeferRes.stdout);
+      const deferredDirtyManifest = JSON.parse(readFileSync(join(dirtyDeferData, "uaw-manifest.json"), "utf8"));
+      assert.equal(deferredDirtyManifest.phase, "closed");
+      assert.equal(deferredDirtyManifest.deliverable.head_commit_sha, null);
+      assert.equal(deferredDirtyManifest.deliverable.git_tree_sha, expectedWtTree);
+      assert.deepEqual(dirtyEvents.map((e) => e.event), ["stage.completed"]);
+
+      // Once committed, provenance.mjs seal binds head_commit_sha on both locally sealed & deferred runs
+      execFileSync("git", ["-C", dirtyRepo, "add", "app.txt"]);
+      execFileSync("git", ["-C", dirtyRepo, "commit", "-q", "-m", "commit v2"]);
+      const v2Head = execFileSync("git", ["-C", dirtyRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      for (const targetData of [dirtyData, dirtyDeferData]) {
+        const afterCommitSeal = execFileSync(
+          process.execPath,
+          [PROVENANCE_CLI, "seal", "--data-dir", targetData, "--workflow", "sw_dev", "--repo-root", dirtyRepo],
+          { encoding: "utf8", env, stdio: "pipe" },
+        );
+        assert.equal(JSON.parse(afterCommitSeal).phase, "sealed");
+        const dirtySealed = JSON.parse(readFileSync(join(targetData, "uaw-manifest.json"), "utf8"));
+        assert.equal(dirtySealed.deliverable.base_commit_sha, v1Head);
+        assert.equal(dirtySealed.deliverable.head_commit_sha, v2Head);
+      }
+
+      // Unborn-HEAD git repo without --defer-seal must also seal working-tree deliverable directly
+      const unbornRepo = join(runRoot, "unborn-seal-repo");
+      const unbornData = join(runRoot, "unborn-seal-data");
+      mkdirSync(unbornRepo, { recursive: true });
+      execFileSync("git", ["-C", unbornRepo, "init", "-q"]);
+      writeFileSync(join(unbornRepo, ".uwf.json"), JSON.stringify({ verify: [] }));
+      writeFileSync(join(unbornRepo, ".gitignore"), "tmp/\n");
+      dirtyEvents.length = 0;
+      const unbornRunRes = await runRunnerWebhook(
+        [
+          "run",
+          "--workflow", "sw_dev",
+          "--goal", "Unborn HEAD seals directly",
+          "--adapter", "fake",
+          "--repo-root", unbornRepo,
+          "--data-dir", unbornData,
+        ],
+        { fxPath: fxDirty, port },
+      );
+      assert.equal(unbornRunRes.code, 0, unbornRunRes.stderr || unbornRunRes.stdout);
+      const unbornManifest = JSON.parse(readFileSync(join(unbornData, "uaw-manifest.json"), "utf8"));
+      const expectedUnbornTree = computeWorktreeTreeSha(unbornRepo, { dataDir: unbornData });
+      assert.equal(unbornManifest.phase, "sealed");
+      assert.equal(unbornManifest.deliverable.base_commit_sha, null);
+      assert.equal(unbornManifest.deliverable.head_commit_sha, null);
+      assert.equal(unbornManifest.deliverable.git_tree_sha, expectedUnbornTree);
+      assert.equal(unbornManifest.deliverable_key, `tree:${expectedUnbornTree}`);
+      assert.deepEqual(dirtyEvents.map((e) => e.event), ["stage.completed", "run.finalized"]);
+      const unbornCliSeal = spawnSync(
+        process.execPath,
+        [PROVENANCE_CLI, "seal", "--data-dir", unbornData, "--workflow", "sw_dev", "--repo-root", unbornRepo],
+        { encoding: "utf8", env },
+      );
+      assert.equal(unbornCliSeal.status, 1, "CLI provenance.mjs seal must fail closed on unborn HEAD");
+      assert.match(unbornCliSeal.stdout, /Cannot resolve git commit/);
+
+      // Corrupt or symlinked runner-finalize-pending.json during resume must fail closed
+      // without silently dropping deferral, sealing, or dispatching run.finalized
+      dirtyEvents.length = 0;
+      writeFileSync(join(dirtyDeferData, "runner-finalize-pending.json"), "{corrupt-json");
+      const corruptPendingResume = await runRunnerWebhook(
+        [
+          "resume",
+          "--workflow", "sw_dev",
+          "--adapter", "fake",
+          "--repo-root", dirtyRepo,
+          "--data-dir", dirtyDeferData,
+        ],
+        { fxPath: fxDirty, port },
+      );
+      assert.equal(corruptPendingResume.code, 1, "corrupt runner-finalize-pending.json must fail closed");
+      assert.match(corruptPendingResume.stderr, /Corrupt finalize pending marker/i);
+      assert.equal(dirtyEvents.length, 0, "corrupt pending marker must not dispatch run.finalized");
+      assert.equal(existsSync(join(dirtyDeferData, "runner-finalize-pending.json")), true);
+
+      const outsidePending = join(runRoot, "outside-pending.json");
+      writeFileSync(outsidePending, JSON.stringify({ phase: "sealed", defer_seal: false }));
+      rmSync(join(dirtyDeferData, "runner-finalize-pending.json"));
+      symlinkSync(outsidePending, join(dirtyDeferData, "runner-finalize-pending.json"));
+      const symlinkPendingResume = await runRunnerWebhook(
+        [
+          "resume",
+          "--workflow", "sw_dev",
+          "--adapter", "fake",
+          "--repo-root", dirtyRepo,
+          "--data-dir", dirtyDeferData,
+        ],
+        { fxPath: fxDirty, port },
+      );
+      assert.equal(symlinkPendingResume.code, 1, "symlinked runner-finalize-pending.json must fail closed");
+      assert.match(symlinkPendingResume.stderr, /must not be a symlink|Refusing unsafe/i);
+      assert.equal(dirtyEvents.length, 0, "symlinked pending marker must not dispatch run.finalized");
+    } finally {
+      await new Promise((resolveClose) => dirtyServer.close(resolveClose));
+    }
 
     // stage-tracker.mjs --repo-root works from a different cwd and when repo dir name contains [bracket]
     const bracketRepo = join(runRoot, "repo-[v1]");

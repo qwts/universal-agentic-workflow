@@ -941,7 +941,7 @@ function readRegularFileNoFollow(filePath, label = "Declared output", { maxBytes
   }
 }
 
-function readContainedDataFile(dataDir, relName, label = "Data file", { maxBytes = MAX_DATA_FILE_BYTES } = {}) {
+export function readContainedDataFile(dataDir, relName, label = "Data file", { maxBytes = MAX_DATA_FILE_BYTES } = {}) {
   const absDataDir = resolve(dataDir);
   const filePath = join(absDataDir, relName);
   const rel = relative(absDataDir, filePath);
@@ -2607,10 +2607,12 @@ export function verifyManifest({ dataDir, repoRoot = OWN_ROOT }) {
 }
 
 /**
- * Post-commit seal (`provenance.mjs seal` / `uaw_manifest_seal`):
- * - Verifies committed `git_tree_sha` matches post-retro tracked worktree state
+ * Post-commit / working-tree seal (`provenance.mjs seal` / `uaw_manifest_seal`):
+ * - By default (`allowDirtyWorktree: false`), verifies committed `git_tree_sha` matches post-retro tracked worktree state
  *   (excluding `<data-dir>`, `tmp/`, and `.gitignore`-excluded paths; allows
  *   `head_commit_sha == base_commit_sha` when no tracked files changed).
+ * - When `allowDirtyWorktree: true` (used by local `runner.mjs` runs without `--defer-seal` or explicit commit/PR/release bindings),
+ *   seals uncommitted tracked working-tree changes directly against `git_tree_sha` (`head_commit_sha: null`).
  * - Verifies no un-superseded stage artifact was unexpectedly mutated on disk.
  * - Binds `head_commit_sha` / `pr_url` / `release_tag` / `artifact_uris[]`,
  *   seals `run_manifests` (`phase: "sealed"`), and dispatches terminal `run.finalized` sink event.
@@ -2627,6 +2629,7 @@ export async function sealManifest({
   releaseTag = null,
   artifactUris = [],
   commitGitDir = null,
+  allowDirtyWorktree = false,
   sinkOptions = {},
   now = new Date().toISOString(),
 }) {
@@ -2723,8 +2726,16 @@ export async function sealManifest({
     commitRepo = absCommitDir;
   }
 
+  const canSealDirty = Boolean(
+    allowDirtyWorktree &&
+    !headCommitSha &&
+    !commitGitDir &&
+    !prUrl &&
+    !releaseTag
+  );
   let resolvedHead = headCommitSha;
   let committedTreeSha = null;
+  let hasExplicitHeadOverride = false;
   if (resolvedHead && (String(resolvedHead).startsWith("-") || /[\s\0]/.test(String(resolvedHead)))) {
     return {
       ok: false,
@@ -2742,28 +2753,42 @@ export async function sealManifest({
     }
   } else {
     const ref = resolvedHead || "HEAD";
+    let headResolveErr = null;
     try {
       resolvedHead = gitExec(commitRepo, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
     } catch (err) {
-      return {
-        ok: false,
-        exitCode: 1,
-        error: `Cannot resolve git commit "${ref}": ${err.message}`,
-      };
+      headResolveErr = err;
+      resolvedHead = null;
     }
-    committedTreeSha = getCommitTreeSha(commitRepo, resolvedHead);
     const worktreeTreeSha = computeWorktreeTreeSha(absRepoRoot, { dataDir: absDataDir });
-    const rawWorktreeTreeSha =
-      committedTreeSha !== worktreeTreeSha
-        ? computeWorktreeTreeSha(absRepoRoot, { dataDir: absDataDir, rawBlobs: true })
-        : worktreeTreeSha;
-    if (committedTreeSha !== worktreeTreeSha && committedTreeSha !== rawWorktreeTreeSha) {
-      return {
-        ok: false,
-        exitCode: 1,
-        error: `Committed git_tree_sha (${committedTreeSha}) does not match post-retro tracked worktree state (${worktreeTreeSha})`,
-      };
+    if (headResolveErr) {
+      if (!canSealDirty) {
+        return {
+          ok: false,
+          exitCode: 1,
+          error: `Cannot resolve git commit "${ref}": ${headResolveErr.message}`,
+        };
+      }
+      committedTreeSha = worktreeTreeSha;
+    } else {
+      committedTreeSha = getCommitTreeSha(commitRepo, resolvedHead);
+      const rawWorktreeTreeSha =
+        committedTreeSha !== worktreeTreeSha
+          ? computeWorktreeTreeSha(absRepoRoot, { dataDir: absDataDir, rawBlobs: true })
+          : worktreeTreeSha;
+      if (!committedTreeSha || (committedTreeSha !== worktreeTreeSha && committedTreeSha !== rawWorktreeTreeSha)) {
+        if (!canSealDirty) {
+          return {
+            ok: false,
+            exitCode: 1,
+            error: `Committed git_tree_sha (${committedTreeSha}) does not match post-retro tracked worktree state (${worktreeTreeSha})`,
+          };
+        }
+        resolvedHead = null;
+        committedTreeSha = worktreeTreeSha;
+      }
     }
+    hasExplicitHeadOverride = true;
   }
 
   return await materializeManifest({
@@ -2777,7 +2802,8 @@ export async function sealManifest({
     _sealToken: SEAL_CALLER_TOKEN,
     deliverableOverrides: {
       ...(baseCommitSha ? { base_commit_sha: baseCommitSha } : {}),
-      ...(resolvedHead ? { head_commit_sha: resolvedHead } : {}),
+      // Preserve explicit null override when local working-tree/unborn seal intentionally unbinds HEAD.
+      ...(hasExplicitHeadOverride || resolvedHead ? { head_commit_sha: resolvedHead } : {}),
       ...(committedTreeSha ? { git_tree_sha: committedTreeSha } : {}),
       ...(prUrl ? { pr_url: prUrl } : {}),
       ...(releaseTag ? { release_tag: releaseTag } : {}),
