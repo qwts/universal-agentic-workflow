@@ -20,6 +20,7 @@ import {
   verifyManifest,
 } from "../provenance.mjs";
 import { scrubDeep } from "../context-hub-sink.mjs";
+import { listChanges, readEntry } from "../../uwf-on-pr/push-as-bot.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..", "..");
@@ -1269,6 +1270,99 @@ try {
       customManifest.stages.find((s) => s.stage === "discovery")?.outputs.some((o) => o.path === "custom-out/issues-discovery.md"),
       "resumed custom output-path manifest must record custom-out discovery output",
     );
+
+    // Step P: sealManifest accepts bot-created raw-byte commits (createBlob without .gitattributes clean conversion)
+    const botRawRepo = join(runRoot, "bot-raw-repo");
+    const botRawStore = join(runRoot, "bot-raw-store.git");
+    const botRawData = join(runRoot, "bot-raw-data");
+    mkdirSync(botRawRepo, { recursive: true });
+    mkdirSync(botRawStore, { recursive: true });
+    mkdirSync(botRawData, { recursive: true });
+    execFileSync("git", ["-C", botRawRepo, "init", "-q"]);
+    execFileSync("git", ["-C", botRawRepo, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", botRawRepo, "config", "user.name", "Test"]);
+    writeFileSync(join(botRawRepo, ".gitattributes"), "* text=auto\n");
+    writeFileSync(join(botRawRepo, "crlf.txt"), Buffer.from("line1\r\nline2\r\n"));
+    execFileSync("git", ["-C", botRawRepo, "add", ".gitattributes", "crlf.txt"]);
+    execFileSync("git", ["-C", botRawRepo, "commit", "-q", "-m", "base with gitattributes"]);
+    const botBaseHead = execFileSync("git", ["-C", botRawRepo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    // Modify crlf.txt with raw CRLF bytes in the working tree without local commit
+    writeFileSync(join(botRawRepo, "crlf.txt"), Buffer.from("updated1\r\nupdated2\r\n"));
+    const botChanges = listChanges(botRawRepo);
+    assert.deepEqual(botChanges, [{ path: "crlf.txt", deleted: false }]);
+
+    // Construct the exact tree+commit that push-as-bot.mjs createBlob+createTree produces in bare store
+    execFileSync("git", ["-C", botRawStore, "init", "--bare", "-q"]);
+    execFileSync("git", ["-C", botRawStore, "fetch", "--depth=1", "--no-tags", botRawRepo, botBaseHead]);
+    const botIdx = join(runRoot, "bot-raw.idx");
+    const botEnv = { ...process.env, GIT_INDEX_FILE: botIdx };
+    execFileSync("git", ["--git-dir", botRawStore, "read-tree", botBaseHead], { env: botEnv });
+    const entry = readEntry(botRawRepo, "crlf.txt");
+    const rawBlobSha = execFileSync("git", ["--git-dir", botRawStore, "hash-object", "-w", "--no-filters", "--stdin"], {
+      input: entry.content,
+      encoding: "utf8",
+    }).trim();
+    const filteredTreeSha = computeWorktreeTreeSha(botRawRepo, { dataDir: botRawData });
+    execFileSync("git", ["--git-dir", botRawStore, "update-index", "-z", "--index-info"], {
+      env: botEnv,
+      input: `${entry.mode} ${rawBlobSha}\tcrlf.txt\0`,
+    });
+    const botTreeSha = execFileSync("git", ["--git-dir", botRawStore, "write-tree"], {
+      env: botEnv,
+      encoding: "utf8",
+    }).trim();
+    assert.notEqual(filteredTreeSha, botTreeSha, "filtered CRLF tree must differ from raw Git Data API blob tree");
+    const botCommitSha = execFileSync(
+      "git",
+      ["--git-dir", botRawStore, "commit-tree", botTreeSha, "-p", botBaseHead, "-m", "bot raw commit"],
+      { encoding: "utf8" },
+    ).trim();
+
+    const botSealRaw = execFileSync(
+      process.execPath,
+      [
+        PROVENANCE_CLI,
+        "seal",
+        "--data-dir", botRawData,
+        "--workflow", "sw_dev",
+        "--repo-root", botRawRepo,
+        "--head-commit", botCommitSha,
+        "--commit-git-dir", botRawStore,
+      ],
+      { encoding: "utf8", env: { ...process.env, UWF_DATA_DIR: "" }, stdio: "pipe" },
+    );
+    const botSealSummary = JSON.parse(botSealRaw);
+    assert.equal(botSealSummary.phase, "sealed");
+    const botSealed = JSON.parse(readFileSync(join(botRawData, "uaw-manifest.json"), "utf8"));
+    assert.equal(botSealed.phase, "sealed");
+    assert.equal(botSealed.deliverable.head_commit_sha, botCommitSha);
+    assert.equal(botSealed.deliverable.git_tree_sha, botTreeSha);
+
+    // Tampering worktree bytes after the bot commit must still fail closed
+    writeFileSync(join(botRawRepo, "crlf.txt"), Buffer.from("tampered1\r\ntampered2\r\n"));
+    let tamperStatus = 0;
+    let tamperOutput = "";
+    try {
+      execFileSync(
+        process.execPath,
+        [
+          PROVENANCE_CLI,
+          "seal",
+          "--data-dir", botRawData,
+          "--workflow", "sw_dev",
+          "--repo-root", botRawRepo,
+          "--head-commit", botCommitSha,
+          "--commit-git-dir", botRawStore,
+        ],
+        { encoding: "utf8", env: { ...process.env, UWF_DATA_DIR: "" }, stdio: "pipe" },
+      );
+    } catch (err) {
+      tamperStatus = err.status;
+      tamperOutput = String(err.stdout ?? "") + String(err.stderr ?? "");
+    }
+    assert.notEqual(tamperStatus, 0, "tampered worktree bytes must fail closed");
+    assert.match(tamperOutput, /does not match post-retro tracked worktree state/);
   } finally {
     rmSync(runRoot, { recursive: true, force: true });
   }

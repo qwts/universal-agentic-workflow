@@ -304,7 +304,7 @@ function toPosix(p) {
  * excluding `<data-dir>`, `tmp/`, `.git/`, and `.gitignore`-excluded paths.
  * Uses a temporary `GIT_INDEX_FILE` so `.git/index` is never mutated.
  */
-export function computeWorktreeTreeSha(repoRoot, { dataDir = null } = {}) {
+export function computeWorktreeTreeSha(repoRoot, { dataDir = null, rawBlobs = false } = {}) {
   if (!isGitRepo(repoRoot)) return null;
   const absRepo = resolve(repoRoot);
   assertSafeGitConfig(absRepo);
@@ -385,11 +385,15 @@ export function computeWorktreeTreeSha(repoRoot, { dataDir = null } = {}) {
         const targetBuf = Buffer.from(readlinkSync(full), "utf8");
         indexLines.push(`120000 ${gitBlobSha1(targetBuf)}\t${c.path}\0`);
       } else if (st.isFile()) {
-        const mode = (st.mode & 0o100) ? "100755" : "100644";
+        const mode = rawBlobs
+          ? ((st.mode & 0o111) ? "100755" : "100644")
+          : ((st.mode & 0o100) ? "100755" : "100644");
         const fileBuf = readFileSync(full);
-        const blobSha = gitExec(absRepo, ["hash-object", "--stdin", "--path", c.path], {
-          input: fileBuf,
-        }).trim();
+        const blobSha = rawBlobs
+          ? gitBlobSha1(fileBuf)
+          : gitExec(absRepo, ["hash-object", "--stdin", "--path", c.path], {
+              input: fileBuf,
+            }).trim();
         indexLines.push(`${mode} ${blobSha}\t${c.path}\0`);
       }
     }
@@ -439,12 +443,21 @@ export function collectGitDeliverable(repoRoot, { dataDir = null, overrides = {}
   }
 
   const baseCommitSha = overrides.base_commit_sha ?? currentHead ?? headSha ?? null;
-  const gitTreeSha =
+  let gitTreeSha =
     overrides.git_tree_sha ??
     (inGit ? computeWorktreeTreeSha(repoRoot, { dataDir }) : null);
 
   if (explicitHead === undefined) {
-    if (inGit && currentHead && gitTreeSha && getCommitTreeSha(repoRoot, currentHead) === gitTreeSha) {
+    const headTree = inGit && currentHead ? getCommitTreeSha(repoRoot, currentHead) : null;
+    if (headTree && gitTreeSha && headTree === gitTreeSha) {
+      headSha = currentHead;
+    } else if (
+      headTree &&
+      overrides.git_tree_sha === undefined &&
+      inGit &&
+      headTree === computeWorktreeTreeSha(repoRoot, { dataDir, rawBlobs: true })
+    ) {
+      gitTreeSha = headTree;
       headSha = currentHead;
     } else {
       headSha = null;
@@ -1945,7 +1958,11 @@ export async function sealManifest({
     }
     committedTreeSha = getCommitTreeSha(commitRepo, resolvedHead);
     const worktreeTreeSha = computeWorktreeTreeSha(absRepoRoot, { dataDir: absDataDir });
-    if (committedTreeSha !== worktreeTreeSha) {
+    const rawWorktreeTreeSha =
+      committedTreeSha !== worktreeTreeSha
+        ? computeWorktreeTreeSha(absRepoRoot, { dataDir: absDataDir, rawBlobs: true })
+        : worktreeTreeSha;
+    if (committedTreeSha !== worktreeTreeSha && committedTreeSha !== rawWorktreeTreeSha) {
       return {
         ok: false,
         exitCode: 1,
