@@ -518,14 +518,6 @@ export async function cmdResume(params = {}, ctx = {}) {
   );
   const fakeFixtureDir = resolveOptionalPath(params.fake_fixture_dir, allowedRoots, "fake_fixture_dir");
 
-  const claim = claimOutputPath({
-    outputPath,
-    runId,
-    dataDir,
-    stateDir,
-    unlock: params.unlock === true,
-  });
-
   const args = [
     "resume",
     "--workflow",
@@ -551,6 +543,14 @@ export async function cmdResume(params = {}, ctx = {}) {
 
   const env = { UAW_RUN_ID: runId };
   if (fakeFixtureDir) env.UWF_FAKE_FIXTURE_DIR = fakeFixtureDir;
+
+  const claim = claimOutputPath({
+    outputPath,
+    runId,
+    dataDir,
+    stateDir,
+    unlock: params.unlock === true,
+  });
 
   try {
     const res = await execNodeAsync(RUNNER_CLI, args, {
@@ -759,6 +759,22 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
   const allowedRoots = ctx.allowedRoots ?? [];
   const stateDir = resolveUawStateDir(ctx.stateDir);
 
+  const scope = params.target;
+  const action = params.action;
+  if (scope !== "state" && scope !== "stage") {
+    throw new UsageError('target must be "state" or "stage"');
+  }
+  if (scope === "state" && !STATE_ACTIONS.has(action)) {
+    throw new UsageError(
+      `Invalid state action "${action}". Expected one of: ${[...STATE_ACTIONS].join(", ")}`,
+    );
+  }
+  if (scope === "stage" && !STAGE_ACTIONS.has(action)) {
+    throw new UsageError(
+      `Invalid stage action "${action}". Expected one of: ${[...STAGE_ACTIONS].join(", ")}`,
+    );
+  }
+
   const target = resolveRunTarget({
     run_id: params.run_id,
     data_dir: params.data_dir,
@@ -769,6 +785,10 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
 
   const dataDir = target.dataDir;
   const meta = target.meta;
+  const workflow = scope === "stage"
+    ? assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow")
+    : (params.workflow ? assertSafeWorkflow(params.workflow, "workflow") : meta?.workflow ?? null);
+  const runId = target.runId ?? generateRunId(workflow ?? "uaw");
   const outputPath = assertAllowedPath(
     params.output_path ?? meta?.output_path ?? defaultOutputPath(dataDir),
     allowedRoots,
@@ -781,78 +801,86 @@ export async function cmdStageTransition(params = {}, ctx = {}) {
     "skills_root",
   );
 
-  // Enforce single-writer lock invariant (ADR-0008): refuse mutation with code 2 if run.lock is active
+  // Enforce single-writer lock & cross-run output ownership invariants (ADR-0008).
   assertNoActiveRunLock(dataDir);
-
-  const scope = params.target;
-  const action = params.action;
-  if (scope !== "state" && scope !== "stage") {
-    throw new UsageError('target must be "state" or "stage"');
-  }
+  const claim = claimOutputPath({
+    outputPath,
+    runId,
+    dataDir,
+    stateDir,
+    unlock: params.unlock === true,
+  });
 
   const common = ["--data-dir", dataDir, "--output-path", outputPath];
   const env = { UWF_DATA_DIR: dataDir, ...(skillsRoot ? { UWF_SKILLS_ROOT: skillsRoot } : {}) };
 
-  if (scope === "state") {
-    if (!STATE_ACTIONS.has(action)) {
-      throw new UsageError(
-        `Invalid state action "${action}". Expected one of: ${[...STATE_ACTIONS].join(", ")}`,
-      );
+  try {
+    if (!meta) {
+      const createdMeta = {
+        run_id: runId,
+        workflow,
+        data_dir: dataDir,
+        output_path: outputPath,
+        repo_root: repoRoot,
+        skills_root: skillsRoot ?? null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      writeRunMeta(dataDir, createdMeta);
+      registerRunIndex(stateDir, createdMeta);
     }
-    const args = [action];
-    if (params.mode) args.push("--mode", assertNoLeadingDash(params.mode, "mode"));
-    if (params.to) args.push("--to", assertSafeIdentifier(params.to, "to"));
-    if (params.agent) args.push("--agent", assertNoLeadingDash(params.agent, "agent"));
+
+    if (scope === "state") {
+      const args = [action];
+      if (params.mode) args.push("--mode", assertNoLeadingDash(params.mode, "mode"));
+      if (params.to) args.push("--to", assertSafeIdentifier(params.to, "to"));
+      if (params.agent) args.push("--agent", assertNoLeadingDash(params.agent, "agent"));
+      if (params.note) args.push("--note", assertNoLeadingDash(params.note, "note"));
+      if (params.phases) {
+        const phasesVal = Array.isArray(params.phases) ? params.phases.join(",") : String(params.phases);
+        args.push("--phases", assertNoLeadingDash(phasesVal, "phases"));
+      }
+      if (params.status) args.push("--status", assertSafeIdentifier(params.status, "status"));
+      if (params.profile) args.push("--profile", assertSafeIdentifier(params.profile, "profile"));
+      if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
+      if (params.force === true) args.push("--force");
+      args.push(...common);
+
+      const res = await execNodeAsync(STATE_CLI, args, { cwd: repoRoot, env });
+      return redactDeep({
+        ok: res.code === 0 && res.json?.ok !== false,
+        exit_code: res.code,
+        run_id: runId,
+        data_dir: dataDir,
+        target: "state",
+        action,
+        result: res.json,
+        error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || `exit ${res.code}`,
+      }).value;
+    }
+
+    // scope === "stage"
+    const args = [action, "--workflow", workflow];
+    if (params.stage) args.push("--stage", assertSafeIdentifier(params.stage, "stage"));
     if (params.note) args.push("--note", assertNoLeadingDash(params.note, "note"));
-    if (params.phases) {
-      const phasesVal = Array.isArray(params.phases) ? params.phases.join(",") : String(params.phases);
-      args.push("--phases", assertNoLeadingDash(phasesVal, "phases"));
-    }
-    if (params.status) args.push("--status", assertSafeIdentifier(params.status, "status"));
-    if (params.profile) args.push("--profile", assertSafeIdentifier(params.profile, "profile"));
-    if (params.model) args.push("--model", assertNoLeadingDash(params.model, "model"));
-    if (params.force === true) args.push("--force");
+    if (params.session_id) args.push("--session-id", assertNoLeadingDash(params.session_id, "session_id"));
+    if (skillsRoot) args.push("--skills-root", skillsRoot);
     args.push(...common);
 
-    const res = await execNodeAsync(STATE_CLI, args, { cwd: repoRoot, env });
+    const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot, env });
     return redactDeep({
       ok: res.code === 0 && res.json?.ok !== false,
       exit_code: res.code,
-      run_id: target.runId,
+      run_id: runId,
       data_dir: dataDir,
-      target: "state",
+      target: "stage",
       action,
       result: res.json,
       error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || `exit ${res.code}`,
     }).value;
+  } finally {
+    claim.release();
   }
-
-  // scope === "stage"
-  if (!STAGE_ACTIONS.has(action)) {
-    throw new UsageError(
-      `Invalid stage action "${action}". Expected one of: ${[...STAGE_ACTIONS].join(", ")}`,
-    );
-  }
-  const workflow = assertSafeWorkflow(params.workflow ?? meta?.workflow, "workflow");
-
-  const args = [action, "--workflow", workflow];
-  if (params.stage) args.push("--stage", assertSafeIdentifier(params.stage, "stage"));
-  if (params.note) args.push("--note", assertNoLeadingDash(params.note, "note"));
-  if (params.session_id) args.push("--session-id", assertNoLeadingDash(params.session_id, "session_id"));
-  if (skillsRoot) args.push("--skills-root", skillsRoot);
-  args.push(...common);
-
-  const res = await execNodeAsync(TRACKER_CLI, args, { cwd: repoRoot, env });
-  return redactDeep({
-    ok: res.code === 0 && res.json?.ok !== false,
-    exit_code: res.code,
-    run_id: target.runId,
-    data_dir: dataDir,
-    target: "stage",
-    action,
-    result: res.json,
-    error: res.code === 0 ? null : res.json?.error || res.stderr.trim() || `exit ${res.code}`,
-  }).value;
 }
 
 /**

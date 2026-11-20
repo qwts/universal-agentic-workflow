@@ -12,11 +12,14 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SECRET_PATTERNS } from "../../hooks/secret-patterns.mjs";
-import { assertAllowedPath, registerRunIndex, writeRunMeta } from "../paths.mjs";
+import { assertAllowedPath, lookupRunById, registerRunIndex, writeRunMeta } from "../paths.mjs";
 import { createMcpHandler, MCP_PROTOCOL_VERSION } from "../protocol.mjs";
 import { isOriginAllowed, startHttpServer } from "../server.mjs";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "uaw-mcp-sec-")));
 const stateDir = join(root, "uaw-state");
@@ -250,6 +253,177 @@ try {
     params: { protocolVersion: "1999-01-01" },
   });
   assert.equal(initMismatch.result.protocolVersion, MCP_PROTOCOL_VERSION);
+
+  // 6. Symlinked run-meta / SQLite / runner-routing.json must be rejected with exit_code 2
+  const symDirMeta = join(safeRepo, "sym-meta-run");
+  mkdirSync(symDirMeta, { recursive: true });
+  symlinkSync("/etc/hosts", join(symDirMeta, "run-meta.json"));
+  const symMetaRes = await handler.callTool("uaw_read_state", { data_dir: symDirMeta });
+  assert.equal(symMetaRes.isError, true);
+  assert.equal(symMetaRes.structuredContent.exit_code, 2);
+
+  const symDirDb = join(safeRepo, "sym-db-run");
+  mkdirSync(symDirDb, { recursive: true });
+  symlinkSync("/etc/hosts", join(symDirDb, "uwf-state.db"));
+  const symDbRes = await handler.callTool("uaw_read_state", { data_dir: symDirDb });
+  assert.equal(symDbRes.isError, true);
+  assert.equal(symDbRes.structuredContent.exit_code, 2);
+
+  const symDirRouting = join(safeRepo, "sym-routing-run");
+  mkdirSync(symDirRouting, { recursive: true });
+  symlinkSync("/etc/hosts", join(symDirRouting, "runner-routing.json"));
+  const symRoutingRes = await handler.callTool("uaw_read_stages", { data_dir: symDirRouting });
+  assert.equal(symRoutingRes.isError, true);
+  assert.equal(symRoutingRes.structuredContent.exit_code, 2);
+
+  // 7. uaw_run supplying existing run_id with a different data_dir must preserve existing index mapping
+  const hijackDir = join(safeRepo, "hijack-dir");
+  mkdirSync(hijackDir, { recursive: true });
+  const hijackRes = await handler.callTool("uaw_run", {
+    run_id: runId,
+    workflow: "sw_dev",
+    goal: "Try to hijack run_id mapping",
+    adapter: "fake",
+    data_dir: hijackDir,
+    repo_root: safeRepo,
+  });
+  assert.equal(hijackRes.isError, true);
+  assert.equal(hijackRes.structuredContent.exit_code, 2);
+  assert.equal(lookupRunById(stateDir, runId)?.data_dir, dataDir);
+
+  // Planted run-meta.json carrying existing runId in another data_dir (even when caller omits run_id) must be rejected
+  const plantedDir = join(safeRepo, "planted-hijack-dir");
+  writeRunMeta(plantedDir, { run_id: runId, workflow: "sw_dev", data_dir: plantedDir });
+  const plantedRes = await handler.callTool("uaw_run", {
+    workflow: "sw_dev",
+    goal: "Planted run-meta hijack",
+    adapter: "fake",
+    data_dir: plantedDir,
+    repo_root: safeRepo,
+  });
+  assert.equal(plantedRes.isError, true);
+  assert.equal(plantedRes.structuredContent.exit_code, 2);
+  assert.equal(lookupRunById(stateDir, runId)?.data_dir, dataDir);
+
+  // 8. uaw_stage_transition enforces cross-run output_path ownership & preserves run_id across calls
+  const trackerAbs = join(REPO_ROOT, ".github", "skills", "uwf-orchestration-engine", "stage-tracker.mjs");
+  const wfDir = join(safeRepo, ".github", "skills", "uwf-sw_dev");
+  mkdirSync(wfDir, { recursive: true });
+  mkdirSync(join(safeRepo, ".github", "agents"), { recursive: true });
+  writeFileSync(join(safeRepo, ".github", "agents", "sec-agent.agent.md"), "---\nname: sec-agent\ntools: [read]\n---\nRun stage.\n");
+  writeFileSync(
+    join(wfDir, "stages.yaml"),
+    [
+      "workflow: sw_dev",
+      "stages:",
+      "  - name: intake",
+      "    agent: sec-agent",
+      "    advances_phase_to: intake",
+      "    outputs:",
+      "      - '{{output_path}}/out.md'",
+      "    gate:",
+      "      checks:",
+      "        - type: require_non_empty",
+      "          path: '{{output_path}}/out.md'",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  writeFileSync(
+    join(wfDir, "run.mjs"),
+    [
+      'import { spawnSync } from "node:child_process";',
+      `const tracker = ${JSON.stringify(trackerAbs)};`,
+      "const raw = process.argv.slice(2);",
+      "const out = [];",
+      "for (let i = 0; i < raw.length; i++) {",
+      '  if (raw[i] === "--list-stages") { out.push("list-stages"); continue; }',
+      '  if (raw[i] === "--check-gate") { out.push("check-gate", "--stage", raw[++i]); continue; }',
+      "  out.push(raw[i]);",
+      "}",
+      'if (!out.includes("--workflow")) out.push("--workflow", "sw_dev");',
+      'const r = spawnSync(process.execPath, [tracker, ...out], { stdio: "inherit", env: process.env });',
+      "process.exit(r.status ?? 1);",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const transDataA = join(safeRepo, "trans-a");
+  const transOutA = join(safeRepo, "trans-out-a");
+  const t1 = await handler.callTool("uaw_stage_transition", {
+    target: "stage",
+    action: "init",
+    workflow: "sw_dev",
+    data_dir: transDataA,
+    output_path: transOutA,
+    repo_root: safeRepo,
+  });
+  assert.equal(t1.isError, false, t1.structuredContent?.error ?? "");
+  assert.equal(t1.structuredContent.ok, true);
+  const t2 = await handler.callTool("uaw_stage_transition", {
+    target: "stage",
+    action: "stage-start",
+    workflow: "sw_dev",
+    stage: "intake",
+    data_dir: transDataA,
+    repo_root: safeRepo,
+  });
+  assert.equal(t2.isError, false, t2.structuredContent?.error ?? "");
+  assert.equal(t2.structuredContent.run_id, t1.structuredContent.run_id);
+
+  const transConflict = await handler.callTool("uaw_stage_transition", {
+    target: "stage",
+    action: "init",
+    workflow: "sw_dev",
+    data_dir: join(safeRepo, "trans-b"),
+    output_path: transOutA,
+    repo_root: safeRepo,
+  });
+  assert.equal(transConflict.isError, true);
+  assert.equal(transConflict.structuredContent.exit_code, 2);
+
+  // 9. uaw_run schema omits unsupported monolith adapter, avoids top-level anyOf, and allows goal_file without goal
+  const toolsList = await handler.handleJsonRpc({ jsonrpc: "2.0", id: 100, method: "tools/list" });
+  const uawRunTool = toolsList.result.tools.find((t) => t.name === "uaw_run");
+  assert.equal(uawRunTool.inputSchema.properties.adapter.enum.includes("monolith"), false);
+  assert.deepEqual(uawRunTool.inputSchema.required, ["workflow"]);
+  assert.equal("anyOf" in uawRunTool.inputSchema, false);
+  assert.equal("oneOf" in uawRunTool.inputSchema, false);
+
+  // uaw_resume validation error must NOT leave an output-path lock behind
+  const badResume = await handler.callTool("uaw_resume", {
+    data_dir: transDataA,
+    model: "--evil-flag",
+    repo_root: safeRepo,
+  });
+  assert.equal(badResume.isError, true);
+  assert.equal(badResume.structuredContent.exit_code, 2);
+  const afterBadResume = await handler.callTool("uaw_stage_transition", {
+    target: "stage",
+    action: "stage-session",
+    workflow: "sw_dev",
+    stage: "intake",
+    session_id: "sess-after-bad-resume",
+    data_dir: transDataA,
+    repo_root: safeRepo,
+  });
+  assert.equal(afterBadResume.isError, false, afterBadResume.structuredContent?.error ?? "");
+
+  const validGoalFile = join(safeRepo, "goal-input.md");
+  writeFileSync(validGoalFile, "Build verified feature via goal_file\n", "utf8");
+  const fxDir = join(safeRepo, "fx-dry");
+  mkdirSync(fxDir, { recursive: true });
+  const goalFileDryRun = await handler.callTool("uaw_run", {
+    workflow: "sw_dev",
+    goal_file: validGoalFile,
+    adapter: "fake",
+    fake_fixture_dir: fxDir,
+    dry_run: true,
+    data_dir: join(safeRepo, "run-goalfile"),
+    repo_root: safeRepo,
+  });
+  assert.equal(goalFileDryRun.structuredContent.exit_code, 0, goalFileDryRun.structuredContent?.stderr ?? "");
 
   const srv = await startHttpServer({
     host: "127.0.0.1",

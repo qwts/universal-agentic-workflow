@@ -56,15 +56,15 @@ export const TOOL_DEFINITIONS = [
       "Execute a UAW workflow via runner.mjs, persisting durable run_id and output_path (<data-dir>/workflow-artifacts by default) with out-of-tree ownership enforcement.",
     inputSchema: {
       type: "object",
-      required: ["workflow", "goal"],
+      required: ["workflow"],
       properties: {
         ...RUN_SCOPE_PROPS,
         workflow: { type: "string", description: "Workflow name (e.g., sw_dev)" },
-        goal: { type: "string", description: "Goal text or path to goal file" },
-        goal_file: { type: "string", description: "Optional path to goal file (must lie within allowedRoots)" },
+        goal: { type: "string", description: "Goal text or path to goal file (required unless goal_file is set)" },
+        goal_file: { type: "string", description: "Optional path to goal file within allowedRoots (alternative to goal)" },
         adapter: {
           type: "string",
-          enum: ["claude-code", "codex", "fake", "grokbot", "monolith"],
+          enum: ["claude-code", "codex", "fake", "grokbot"],
           description: "Execution harness adapter",
         },
         model: { type: "string" },

@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
-import { canonicalizePath, resolveUawStateDir, UsageError } from "./paths.mjs";
+import { assertRegularFileInDir, canonicalizePath, resolveUawStateDir, UsageError } from "./paths.mjs";
 
 const LOCK_WAIT_MS = 3_000;
 const LOCK_UNREADABLE_STALE_MS = 10_000;
@@ -188,8 +188,8 @@ export function claimOutputPath({ outputPath, runId, dataDir, stateDir, unlock =
  * if an active lock is held by another process.
  */
 export function assertNoActiveRunLock(dataDir) {
-  const lockPath = join(resolve(dataDir), "run.lock");
-  if (!existsSync(lockPath)) return;
+  const lockPath = assertRegularFileInDir(dataDir, "run.lock", "run.lock");
+  if (!lockPath) return;
   let st;
   try {
     st = statSync(lockPath);

@@ -12,10 +12,10 @@
 
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
-import { readRunMeta, UsageError } from "./paths.mjs";
+import { assertRegularFileInDir, readRunMeta, UsageError } from "./paths.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
@@ -81,9 +81,15 @@ export function redactDeep(value) {
  * Returns `null` if the database file does not exist (zero side effects).
  */
 function withReadOnlyDb(dbPath, fn) {
-  if (!existsSync(dbPath)) return null;
+  const absDb = resolve(dbPath);
+  const absDir = dirname(absDb);
+  const base = basename(absDb);
+  const realDb = assertRegularFileInDir(absDir, base, base);
+  if (!realDb) return null;
+  assertRegularFileInDir(absDir, `${base}-wal`, `${base}-wal`);
+  assertRegularFileInDir(absDir, `${base}-shm`, `${base}-shm`);
   const Database = loadDatabaseCtor();
-  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  const db = new Database(realDb, { readonly: true, fileMustExist: true });
   try {
     db.pragma("query_only = ON");
     return fn(db);
@@ -184,10 +190,10 @@ export function readStages(dataDir, { workflow } = {}) {
   });
 
   let routing = { trips: {}, findings: {} };
-  const routingPath = join(absDir, "runner-routing.json");
-  if (existsSync(routingPath)) {
+  const realRouting = assertRegularFileInDir(absDir, "runner-routing.json", "runner-routing.json");
+  if (realRouting) {
     try {
-      const parsed = JSON.parse(readFileSync(routingPath, "utf8"));
+      const parsed = JSON.parse(readFileSync(realRouting, "utf8"));
       routing = {
         trips: parsed?.trips ?? {},
         findings: parsed?.findings ?? {},

@@ -125,11 +125,38 @@ export function generateRunId(workflow = "uaw") {
   return `uaw-${safeWf}-${randomUUID()}`;
 }
 
-export function readRunMeta(dataDir) {
-  const metaPath = join(resolve(dataDir), RUN_META_FILE);
-  if (!existsSync(metaPath)) return null;
+export function assertRegularFileInDir(dirPath, fileName, label = fileName) {
+  const absDir = resolve(dirPath);
+  if (!existsSync(absDir)) return null;
+  const dirLst = lstatSync(absDir);
+  if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
+    throw new UsageError(`Invalid directory for ${label}: "${absDir}"`);
+  }
+  const full = join(absDir, fileName);
+  let lst;
   try {
-    const parsed = JSON.parse(readFileSync(metaPath, "utf8"));
+    lst = lstatSync(full);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
+  if (lst.isSymbolicLink() || !lst.isFile()) {
+    throw new UsageError(`${label} must be a regular file (symlinks disallowed): "${full}"`);
+  }
+  const realDir = realpathSync(absDir);
+  const realFull = realpathSync(full);
+  const inside = realDir === "/" ? realFull.startsWith("/") : realFull.startsWith(realDir + sep);
+  if (!inside) {
+    throw new UsageError(`${label} escapes directory "${absDir}"`);
+  }
+  return realFull;
+}
+
+export function readRunMeta(dataDir) {
+  const realMeta = assertRegularFileInDir(dataDir, RUN_META_FILE, "run-meta.json");
+  if (!realMeta) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(realMeta, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : null;
   } catch {
     return null;
@@ -139,7 +166,17 @@ export function readRunMeta(dataDir) {
 export function writeRunMeta(dataDir, meta) {
   const absDir = resolve(dataDir);
   mkdirSync(absDir, { recursive: true });
+  if (lstatSync(absDir).isSymbolicLink()) {
+    throw new UsageError(`data_dir must not be a symlink: "${absDir}"`);
+  }
   const metaPath = join(absDir, RUN_META_FILE);
+  try {
+    if (lstatSync(metaPath).isSymbolicLink()) {
+      throw new UsageError(`run-meta.json must not be a symlink: "${metaPath}"`);
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
   const tmpPath = `${metaPath}.${process.pid}.${Date.now()}.tmp`;
   try {
     writeFileSync(tmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
@@ -157,6 +194,12 @@ function runIndexPath(stateDir, runId) {
 
 export function registerRunIndex(stateDir, meta) {
   if (!meta?.run_id || !meta?.data_dir) return null;
+  const existing = lookupRunById(stateDir, meta.run_id);
+  if (existing?.data_dir && canonicalizePath(existing.data_dir) !== canonicalizePath(meta.data_dir)) {
+    throw new UsageError(
+      `run_id "${meta.run_id}" is already registered to data_dir "${existing.data_dir}" (refusing to reassign to "${meta.data_dir}")`,
+    );
+  }
   const idxPath = runIndexPath(stateDir, meta.run_id);
   mkdirSync(dirname(idxPath), { recursive: true });
   const tmpPath = `${idxPath}.${process.pid}.${Date.now()}.tmp`;
@@ -207,6 +250,14 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
 
   if (data_dir) {
     resolvedDataDir = assertAllowedPath(data_dir, allowedRoots, "data_dir");
+    if (run_id) {
+      const indexed = lookupRunById(resolvedStateDir, run_id);
+      if (indexed?.data_dir && canonicalizePath(indexed.data_dir) !== canonicalizePath(resolvedDataDir)) {
+        throw new UsageError(
+          `run_id "${run_id}" is already registered to data_dir "${indexed.data_dir}" (refusing to reassign to "${resolvedDataDir}")`,
+        );
+      }
+    }
     meta = readRunMeta(resolvedDataDir);
   } else if (run_id) {
     const indexed = lookupRunById(resolvedStateDir, run_id);
@@ -235,6 +286,16 @@ export function resolveRunTarget({ run_id, data_dir, stateDir, allowedRoots, req
     throw new UsageError(
       `run_id mismatch for data_dir ${resolvedDataDir}: persisted "${meta.run_id}", requested "${run_id}"`,
     );
+  }
+
+  const effectiveRunId = run_id ?? meta?.run_id ?? null;
+  if (effectiveRunId) {
+    const indexed = lookupRunById(resolvedStateDir, effectiveRunId);
+    if (indexed?.data_dir && canonicalizePath(indexed.data_dir) !== canonicalizePath(resolvedDataDir)) {
+      throw new UsageError(
+        `run_id "${effectiveRunId}" is already registered to data_dir "${indexed.data_dir}" (refusing to reassign to "${resolvedDataDir}")`,
+      );
+    }
   }
 
   return {
