@@ -1,5 +1,5 @@
 /**
- * results.db schema and inserts for uwf-bench (better-sqlite3 via the engine skill, see sqlite.mjs).
+ * results.db schema and inserts for uwf-bench (built-in node:sqlite via sqlite.mjs).
  * Fields follow docs/research/cli-offload-design.md section 11. Anything a run cannot fill is NULL.
  */
 

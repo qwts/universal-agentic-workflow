@@ -12,40 +12,11 @@
  */
 
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { createRequire } from "node:module";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { openDatabase } from "../../.github/skills/uwf-state-manager/sqlite.mjs";
 import { redactSecrets } from "../hooks/secret-patterns.mjs";
 import { assertRegularFileInDir, readRegularFileBounded, readRunMeta, UsageError } from "./paths.mjs";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(HERE, "..", "..");
-const SKILLS_DIR = join(REPO_ROOT, ".github", "skills");
-
-let cachedDatabaseCtor = null;
-
-function loadDatabaseCtor() {
-  if (cachedDatabaseCtor) return cachedDatabaseCtor;
-  const candidates = [
-    join(SKILLS_DIR, "uwf-state-manager", "package.json"),
-    join(SKILLS_DIR, "uwf-orchestration-engine", "package.json"),
-    join(SKILLS_DIR, "uwf-question-protocol", "package.json"),
-  ];
-  for (const pkgPath of candidates) {
-    if (!existsSync(pkgPath)) continue;
-    try {
-      const req = createRequire(pkgPath);
-      const mod = req("better-sqlite3");
-      cachedDatabaseCtor = mod?.default ?? mod;
-      return cachedDatabaseCtor;
-    } catch {
-      /* try next skill install */
-    }
-  }
-  throw new Error(
-    "better-sqlite3 not found; run npm ci in .github/skills/uwf-state-manager",
-  );
-}
 
 /**
  * Recursively redact all secret-shaped substrings in any JSON-serializable value.
@@ -99,8 +70,7 @@ function withReadOnlyDb(dbPath, fn) {
   assertRegularFileInDir(absDir, `${base}-shm`, `${base}-shm`);
   assertRegularFileInDir(absDir, `${base}-journal`, `${base}-journal`);
   const inoBefore = statSync(realDb).ino;
-  const Database = loadDatabaseCtor();
-  const db = new Database(realDb, { readonly: true, fileMustExist: true });
+  const db = openDatabase(realDb, { readOnly: true });
   try {
     const realAfter = assertRegularFileInDir(absDir, base, base);
     if (!realAfter || statSync(realAfter).ino !== inoBefore) {
@@ -109,7 +79,6 @@ function withReadOnlyDb(dbPath, fn) {
     assertRegularFileInDir(absDir, `${base}-wal`, `${base}-wal`);
     assertRegularFileInDir(absDir, `${base}-shm`, `${base}-shm`);
     assertRegularFileInDir(absDir, `${base}-journal`, `${base}-journal`);
-    db.pragma("query_only = ON");
     return fn(db);
   } finally {
     db.close();
