@@ -1,0 +1,48 @@
+{
+  "name": "@qwts/uaw",
+  "version": "0.1.0",
+  "description": "Universal Agentic Workflow (UAW) — deterministic stage runner, gates, MCP runtime, and cross-client agent plugin tools",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qwts/universal-agentic-workflow.git"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "uaw": "./bin/uaw.mjs",
+    "uaw-mcp": "./bin/uaw-mcp.mjs"
+  },
+  "files": [
+    "bin/",
+    "scripts/uwf-runner/",
+    "!scripts/uwf-runner/test/**",
+    "scripts/uaw-mcp/",
+    "!scripts/uaw-mcp/test/**",
+    "scripts/hooks/",
+    "schemas/",
+    ".github/skills/",
+    "!.github/skills/**/*.db*",
+    "!.github/skills/**/package-lock.json",
+    ".github/agents/",
+    ".github/instructions/",
+    ".github/prompts/",
+    ".github/hooks/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node scripts/run-tests.mjs all",
+    "test:smoke": "node scripts/run-tests.mjs smoke",
+    "test:runner": "node scripts/run-tests.mjs runner",
+    "test:mcp": "node scripts/run-tests.mjs mcp",
+    "test:bench": "node scripts/run-tests.mjs bench",
+    "test:pack": "node scripts/run-tests.mjs pack",
+    "pack:plugin": "node scripts/pack-plugin.mjs"
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.1"
+  }
+}
