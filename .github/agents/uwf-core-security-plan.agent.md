@@ -2,7 +2,7 @@
 name: uwf-core-security-plan
 description: "Threat model + security controls plan."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Security Plan Stage

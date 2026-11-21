@@ -2,7 +2,7 @@
 name: uwf-core-test-planner
 description: "Issue Mode: define what tests must be written before implementation begins. Produces {outputPath}/{role}-test-plan.md. No coding — stubs/signatures only."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Test Planning Stage

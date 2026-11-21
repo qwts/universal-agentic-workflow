@@ -2,7 +2,7 @@
 name: uwf-core-snapshot
 description: "Produce uwf-drs as a point-in-time reconstruction record after acceptance. Closes uwf-br layer 5 and appends a closure entry to uwf-changelog."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Snapshot Stage

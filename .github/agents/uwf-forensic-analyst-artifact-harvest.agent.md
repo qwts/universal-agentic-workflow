@@ -2,7 +2,7 @@
 name: uwf-forensic-analyst-artifact-harvest
 description: "Collect all available evidence artifacts from the repositories in scope: commits, tickets, docs, configs, CI/CD definitions, test suites, ADRs. Brownfield pre-phase stage 2."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Artifact Harvest Stage
