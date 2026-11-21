@@ -1,3 +1,7 @@
+---
+name: uwf-solutions_architect
+description: "Persona skill for architecture-first engagements: designing platforms, evaluating migration strategies, defining service boundaries, producing ADRs, and delivering an SDD."
+---
 # Skill: uwf-solutions_architect
 
 Persona skill for architecture-first engagements: designing platforms, evaluating migration strategies, defining service boundaries, producing ADR sets, and delivering a System Design Document (SDD) as the primary deliverable.

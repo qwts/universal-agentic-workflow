@@ -1,3 +1,7 @@
+---
+name: uwf-sw_dev
+description: "Persona skill for driving individual software development work items (issues) from intake through implementation, review, and acceptance."
+---
 # Skill: uwf-sw_dev
 
 Persona skill for driving individual work items (issues) from intake through implementation, review, and acceptance.
