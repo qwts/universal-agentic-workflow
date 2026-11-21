@@ -20,9 +20,9 @@ import * as fs from "node:fs";
 // go through the namespace and feature-detect at call time.
 const { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync } = fs;
 const fsGlobSync = fs.globSync;
-import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO = resolve(__dirname, "..", "..");
@@ -33,18 +33,6 @@ const EXCERPT_LINE_CHARS = 200;
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const OPEN_NOFOLLOW_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 const clip = (l) => (l.length > EXCERPT_LINE_CHARS ? l.slice(0, EXCERPT_LINE_CHARS) + "..." : l);
-
-// js-yaml lives in the engine skill's node_modules (npm ci there).
-// Prefer the skills root's install; fall back to this checkout's so the runner
-// works against a skills tree or target repository that has no skill installs.
-function loadYaml(skillsRoot) {
-  for (const root of [skillsRoot, DEFAULT_REPO]) {
-    const pkg = join(root, ".github", "skills", "uwf-orchestration-engine", "package.json");
-    if (!existsSync(pkg)) continue;
-    try { return createRequire(pkg)("js-yaml"); } catch { /* try next root */ }
-  }
-  throw new PromptError("js-yaml not found: run npm ci in .github/skills/uwf-orchestration-engine");
-}
 
 export class PromptError extends Error {}
 
@@ -586,7 +574,6 @@ export function validateWorkflowStageInputs({ workflow, stage = null, validateGa
   const effectiveSkillsRoot = resolveSkillsRoot({ explicit: skillsRoot, repoRoot: absRepo, workflow }).root;
   const stagesPath = join(effectiveSkillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml");
   if (!existsSync(stagesPath)) return;
-  const yaml = loadYaml(effectiveSkillsRoot);
   const stagesDoc = yaml.load(readFileSync(stagesPath, "utf8"));
   const chosenDataDir = dataDir ?? process.env.UWF_DATA_DIR;
   const effectiveDataDir = resolve(absRepo, chosenDataDir ?? "./tmp/uwf");
@@ -672,7 +659,6 @@ export async function materializePrompt({ workflow, stage, repoRoot, skillsRoot,
   outputPath = outputPath ?? (chosenDataDir ? join(chosenDataDir, "workflow-artifacts") : "./tmp/workflow-artifacts");
   if (!workflow || !stage) throw new PromptError("workflow and stage are required");
 
-  const yaml = loadYaml(skillsRoot);
   const skills = join(skillsRoot, ".github", "skills");
   const stagesPath = join(skills, `uwf-${workflow}`, "stages.yaml");
   if (!existsSync(stagesPath)) throw new PromptError(`stages.yaml not found for workflow "${workflow}": ${stagesPath}`);

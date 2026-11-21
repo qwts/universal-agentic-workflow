@@ -1192,15 +1192,18 @@ export async function cmdGates(params = {}, ctx = {}) {
 
   assertSafeSkillDbs(repoRoot, "repo_root");
   if (skillsRoot) assertSafeSkillDbs(skillsRoot, "skills_root");
-  const env = {};
-  if (skillsRoot) env.UWF_SKILLS_ROOT = skillsRoot;
+  const effectiveSkillsRoot =
+    skillsRoot ??
+    (existsSync(join(repoRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml"))
+      ? repoRoot
+      : OWN_REPO_ROOT);
+  const env = { UWF_SKILLS_ROOT: effectiveSkillsRoot };
 
   if (mode === "list") {
     const scratch = mkdtempSync(join(tmpdir(), "uaw-mcp-gates-"));
     try {
-      const args = ["list-stages", "--workflow", workflow, "--data-dir", scratch];
+      const args = ["list-stages", "--workflow", workflow, "--data-dir", scratch, "--skills-root", effectiveSkillsRoot];
       if (outputPath) args.push("--output-path", outputPath);
-      if (skillsRoot) args.push("--skills-root", skillsRoot);
       const res = await execNodeAsync(TRACKER_CLI, args, {
         cwd: repoRoot,
         env: { ...env, UWF_DATA_DIR: scratch },
@@ -1246,10 +1249,11 @@ export async function cmdGates(params = {}, ctx = {}) {
         dbPath,
         "--data-dir",
         dataDir,
+        "--skills-root",
+        effectiveSkillsRoot,
       ];
       if (outputPath) args.push("--output-path", outputPath);
-      if (skillsRoot) args.push("--skills-root", skillsRoot);
-      assertSafeStageInputsForRun({ workflow, stage: safeStage, validateGates: true, repoRoot, skillsRoot, outputPath, dataDir });
+      assertSafeStageInputsForRun({ workflow, stage: safeStage, validateGates: true, repoRoot, skillsRoot: effectiveSkillsRoot, outputPath, dataDir });
       const res = await execNodeAsync(TRACKER_CLI, args, {
         cwd: repoRoot,
         env: { ...env, UWF_DATA_DIR: dataDir },
@@ -1281,8 +1285,9 @@ export async function cmdGates(params = {}, ctx = {}) {
       outputPath ?? "<output_path>",
       "--data-dir",
       scratch,
+      "--skills-root",
+      effectiveSkillsRoot,
     ];
-    if (skillsRoot) args.push("--skills-root", skillsRoot);
     const res = await execNodeAsync(TRACKER_CLI, args, {
       cwd: repoRoot,
       env: { ...env, UWF_DATA_DIR: scratch },
