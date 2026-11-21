@@ -100,6 +100,8 @@ const STAGE_ACTIONS = new Set([
 ]);
 
 const QUESTION_ACTIONS = new Set(["list", "check", "answer", "skip"]);
+const VALID_QUESTION_STATUSES = new Set(["pending", "answered", "skipped"]);
+const QUESTION_SHA256_RE = /^[0-9a-f]{64}$/;
 
 const MAX_CHILD_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
@@ -1674,6 +1676,33 @@ export async function cmdQuestionResolve(params = {}, ctx = {}) {
     args.push("--ids", idsVal);
   }
   if (params.answer !== undefined) args.push("--answer", assertNoLeadingDash(params.answer, "answer"));
+  if (params.expected_status !== undefined) {
+    if (!VALID_QUESTION_STATUSES.has(params.expected_status)) {
+      throw new UsageError(
+        `Invalid expected_status "${params.expected_status}". Expected one of: ${[...VALID_QUESTION_STATUSES].join(", ")}`,
+      );
+    }
+    args.push("--expected-status", params.expected_status);
+  }
+  if (params.expected_question_sha256 !== undefined) {
+    if (
+      typeof params.expected_question_sha256 !== "string" ||
+      !QUESTION_SHA256_RE.test(params.expected_question_sha256)
+    ) {
+      throw new UsageError(
+        "expected_question_sha256 must be a 64-character lowercase hex SHA-256 digest",
+      );
+    }
+    args.push("--expected-question-sha256", params.expected_question_sha256);
+  }
+  if (params.reject_required !== undefined) {
+    if (typeof params.reject_required !== "boolean") {
+      throw new UsageError("reject_required must be a boolean");
+    }
+    if (params.reject_required) {
+      args.push("--reject-required");
+    }
+  }
 
   if (action !== "answer" && action !== "skip") {
     assertSafeDataDir(dataDir, { strictTranscripts: false });

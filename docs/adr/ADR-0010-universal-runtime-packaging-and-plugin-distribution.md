@@ -80,11 +80,7 @@ Extends: [ADR-0008](./ADR-0008-multi-surface-mcp-plugin-runtime-contract.md)
   standalone MCP clients.
 - **Negative:** Minimum supported Node.js runtime increases from `20` to `22.13+`
   (matching `uwf-companion/`).
-- **Follow-up:** Rewire [`uwf-companion/`](../../uwf-companion/README.md) from
-  direct `.github/skills/**/*.db` file readers (`BaseReader.ts`, `DbWatcher.ts`)
-  onto the `uaw-mcp/v1` runtime contract and formal VS Code AI contribution
-  points (`mcpServerDefinitionProviders`, `chatAgents`, `chatSkills`,
-  `chatPromptFiles`) in a separate dedicated PR.
+- **Follow-up (Phase 2 implemented in `uwf-companion/`):** Rewired `uwf-companion/` from direct `.github/skills/**/*.db` file readers onto the `uaw-mcp/v1` runtime contract (`McpServerConfig`, `UawMcpClient`, `UawDataService`), replaced the stale vendored `.github/` copy with build-time staging via `uwf-companion/scripts/stage-bundle.mjs`, and registered formal VS Code AI/MCP contribution points (`mcpServerDefinitionProviders`, `chatAgents`, `chatSkills`, `chatPromptFiles`, `chatInstructions`).
 
 ## Security / Privacy / Compliance notes
 - [`scripts/pack-plugin.mjs`](../../scripts/pack-plugin.mjs) rejects symlinks,

@@ -29,6 +29,7 @@
 import { openDatabase } from "../uwf-state-manager/sqlite.mjs";
 import yaml from "js-yaml";
 import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
+import { createHash } from "node:crypto";
 import { readFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -134,6 +135,67 @@ function cmdLog(db) {
   succeed({ procedure: "log", question_id: row.id, question: row });
 }
 
+const VALID_EXPECTED_STATUSES = new Set(["pending", "answered", "skipped"]);
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+/** Fail-closed check: only explicit false/0/"0"/"false"/"no" are optional. */
+function isOptionalRequiredValue(val) {
+  if (val === 0 || val === false) return true;
+  if (typeof val === "string") {
+    const norm = val.trim().toLowerCase();
+    return norm === "0" || norm === "false" || norm === "no";
+  }
+  return false;
+}
+
+function parseCasFlags() {
+  const expectedStatus = flags["expected-status"];
+  if (expectedStatus !== undefined) {
+    if (typeof expectedStatus !== "string" || !VALID_EXPECTED_STATUSES.has(expectedStatus)) {
+      usageError(
+        `--expected-status must be one of: ${[...VALID_EXPECTED_STATUSES].join(", ")}`,
+      );
+    }
+  }
+  const expectedQuestionSha256 = flags["expected-question-sha256"];
+  if (expectedQuestionSha256 !== undefined) {
+    if (typeof expectedQuestionSha256 !== "string" || !SHA256_HEX_RE.test(expectedQuestionSha256)) {
+      usageError("--expected-question-sha256 must be a 64-character lowercase hex SHA-256 digest");
+    }
+  }
+  return { expectedStatus, expectedQuestionSha256 };
+}
+
+function runImmediateQuestionCas(db, id, { expectedStatus, expectedQuestionSha256 }, mutateFn) {
+  const failRolledBack = (msg) => {
+    try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+    fail(msg);
+  };
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.prepare("SELECT * FROM questions WHERE id = ?").get(id);
+    if (!row) failRolledBack(`Question ${id} not found.`);
+    if (expectedStatus !== undefined && row.status !== expectedStatus) {
+      failRolledBack(`Question ${id} status is "${row.status}", expected "${expectedStatus}".`);
+    }
+    if (expectedQuestionSha256 !== undefined) {
+      const actualHash = createHash("sha256")
+        .update(String(row.question ?? ""), "utf8")
+        .digest("hex");
+      if (actualHash !== expectedQuestionSha256) {
+        failRolledBack(`Question ${id} text changed (expected SHA-256 mismatch).`);
+      }
+    }
+    const updated = mutateFn(row, failRolledBack);
+    db.exec("COMMIT");
+    return updated;
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+    throw err;
+  }
+}
+
 /**
  * Record a user's answer. Sets status → "answered".
  */
@@ -142,16 +204,26 @@ function cmdAnswer(db) {
   requireFlag("answer", "answer");
 
   const id = Number(flags["id"]);
-  const row = db.prepare("SELECT * FROM questions WHERE id = ?").get(id);
-  if (!row) fail(`Question ${id} not found.`);
-  if (row.status === "answered") fail(`Question ${id} is already answered.`);
+  const cas = parseCasFlags();
+  const question = runImmediateQuestionCas(db, id, cas, (row, failRolledBack) => {
+    if (row.status === "answered") {
+      failRolledBack(`Question ${id} is already answered.`);
+    }
+    const now = new Date().toISOString();
+    const info = cas.expectedStatus !== undefined
+      ? db.prepare(
+          `UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ? AND status = ?`
+        ).run(flags["answer"], now, id, cas.expectedStatus)
+      : db.prepare(
+          `UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ?`
+        ).run(flags["answer"], now, id);
+    if (info.changes !== 1) {
+      failRolledBack(`Question ${id} could not be updated atomically (status changed concurrently).`);
+    }
+    return db.prepare("SELECT * FROM questions WHERE id = ?").get(id);
+  });
 
-  const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE questions SET status = 'answered', answer = ?, answered_at = ? WHERE id = ?`
-  ).run(flags["answer"], now, id);
-
-  succeed({ procedure: "answer", question: db.prepare("SELECT * FROM questions WHERE id = ?").get(id) });
+  succeed({ procedure: "answer", question });
 }
 
 /**
@@ -162,11 +234,26 @@ function cmdSkip(db) {
   requireFlag("id", "skip");
 
   const id = Number(flags["id"]);
-  const row = db.prepare("SELECT * FROM questions WHERE id = ?").get(id);
-  if (!row) fail(`Question ${id} not found.`);
+  const cas = parseCasFlags();
+  const rejectRequired = flags["reject-required"] === true;
+  const question = runImmediateQuestionCas(db, id, cas, (row, failRolledBack) => {
+    if (rejectRequired && !isOptionalRequiredValue(row.required)) {
+      failRolledBack(`Question ${id} is required and cannot be skipped.`);
+    }
+    const info = cas.expectedStatus !== undefined
+      ? db.prepare(
+          `UPDATE questions SET status = 'skipped' WHERE id = ? AND status = ?`
+        ).run(id, cas.expectedStatus)
+      : db.prepare(
+          `UPDATE questions SET status = 'skipped' WHERE id = ?`
+        ).run(id);
+    if (info.changes !== 1) {
+      failRolledBack(`Question ${id} could not be skipped atomically (status changed concurrently).`);
+    }
+    return db.prepare("SELECT * FROM questions WHERE id = ?").get(id);
+  });
 
-  db.prepare(`UPDATE questions SET status = 'skipped' WHERE id = ?`).run(id);
-  succeed({ procedure: "skip", question: db.prepare("SELECT * FROM questions WHERE id = ?").get(id) });
+  succeed({ procedure: "skip", question });
 }
 
 /**
