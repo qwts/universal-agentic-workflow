@@ -7,7 +7,6 @@
  *   node scripts/uwf-smoke/test-skill-reference-integrity.mjs --repo-root <path>
  */
 
-import { createRequire } from "node:module";
 import {
   existsSync,
   mkdirSync,
@@ -28,16 +27,10 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCE_REPO_ROOT = resolve(__dirname, "../..");
-const require = createRequire(
-  join(
-    SOURCE_REPO_ROOT,
-    ".github/skills/uwf-orchestration-engine/package.json",
-  ),
-);
-const yaml = require("js-yaml");
 
 const REFERENCE_SCOPES = [
   ".github/agents",

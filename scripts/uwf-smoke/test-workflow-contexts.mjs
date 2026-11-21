@@ -17,12 +17,11 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import yaml from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../..");
 const WORKFLOWS_DIR = join(REPO_ROOT, ".github/workflows");
-const yaml = createRequire(import.meta.url)(join(REPO_ROOT, ".github/skills/uwf-orchestration-engine/node_modules/js-yaml"));
 
 // Contexts allowed per job-level key (workflow-level keys are not checked here).
 const ALLOWED = {

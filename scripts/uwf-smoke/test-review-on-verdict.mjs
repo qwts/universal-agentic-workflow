@@ -2,22 +2,20 @@
  * Every review stage with a verdict gate must route changes_requested back to an
  * earlier stage of the same workflow via on_verdict (see #135, #154).
  *
- * Needs js-yaml from .github/skills/uwf-orchestration-engine (npm ci).
+ * Needs js-yaml (installed via root `npm ci`).
  *
  * Usage:
  *   node scripts/uwf-smoke/test-review-on-verdict.mjs
  */
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../..");
 const SKILLS_DIR = join(REPO_ROOT, ".github/skills");
-const require = createRequire(join(SKILLS_DIR, "uwf-orchestration-engine/package.json"));
-const yaml = require("js-yaml");
 
 let passed = 0;
 let failed = 0;
