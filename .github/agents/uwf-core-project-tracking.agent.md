@@ -2,7 +2,7 @@
 name: uwf-core-project-tracking
 description: "Read issues-backlog.md and seed the SQLite issues DB via issues.mjs."
 tools: ["execute", "read"]
-user-invokable: false
+user-invocable: false
 ---
 # Issue State Population Stage
 

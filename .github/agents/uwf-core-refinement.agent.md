@@ -2,7 +2,7 @@
 name: uwf-core-refinement
 description: "Groom unrefined user stories to production-ready standard. Field completeness gate, nine quality controls, and brownfield confidence-promotion logic."
 tools: ["read", "edit", "search", "todo"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Refinement Stage
