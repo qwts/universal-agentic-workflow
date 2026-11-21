@@ -37,7 +37,7 @@
  * All output is JSON to stdout.
  */
 
-import Database from "better-sqlite3";
+import { openDatabase } from "../uwf-state-manager/sqlite.mjs";
 import yaml from "js-yaml";
 import { resolveDbPath } from "../uwf-state-manager/data-dir.mjs";
 import { readFileSync, unlinkSync } from "node:fs";
@@ -291,9 +291,7 @@ if (!command)
     "No command given. Expected: start | finding | verdict | get | list | list-findings | close-finding | reopen"
   );
 
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+const db = openDatabase(DB_PATH, { wal: true, foreignKeys: true });
 
 initTables(db);
 
