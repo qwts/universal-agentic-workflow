@@ -2,7 +2,7 @@
 name: uwf-sw_dev-work-planner
 description: "Produce the implementation plan (`issues-plan.md`) for the active issue. No coding."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 # Work Planning Stage
 

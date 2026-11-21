@@ -9,7 +9,7 @@ tools:
   - web
   - agent
   - todo
-user-invokable: false
+user-invocable: false
 ---
 
 # Intake Stage

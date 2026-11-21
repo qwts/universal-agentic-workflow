@@ -3,7 +3,7 @@ name: uwf-solutions_architect-reviewer
 description: "Architecture review gate. Validates design completeness, NFR coverage, requirement traceability, and constraint compliance. Flags unresolved interface contracts and ungrounded design decisions as blockers. Requests fixes or hands off to acceptance."
 tools: ["agent", "todo", "search", "read"]
 allowed-commands: ["node .github/skills/uwf-review/reviews.mjs"]
-user-invokable: false
+user-invocable: false
 ---
 # Architecture Review Stage
 

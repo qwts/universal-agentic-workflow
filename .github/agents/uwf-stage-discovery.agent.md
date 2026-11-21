@@ -2,7 +2,7 @@
 name: uwf-stage-discovery
 description: "Canonical discovery stage agent. Inspects the workspace, clarifies unknowns, and produces a structured discovery artifact. No implementation."
 tools: ["agent", "todo", "search", "edit", "read", "execute", "web"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Discovery Stage

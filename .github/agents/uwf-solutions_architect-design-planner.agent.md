@@ -2,7 +2,7 @@
 name: uwf-solutions_architect-design-planner
 description: "Produce the System Design Document (SDD): elaborated ADRs, interface contracts, measurable NFRs, component dependency graph, cross-domain risk mapping, and requirement traceability. Also handles intake for the solutions-architect persona."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 # Design Planning Stage
 

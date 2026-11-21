@@ -1,7 +1,7 @@
 ---
 name: uwf-discovery
 description: "Inspect the workspace, log findings to SQLite, clarify unknowns, and update intake. No implementation."
-user-invokable: true
+user-invocable: true
 ---
 
 # UWF Discovery Skill
