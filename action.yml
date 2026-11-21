@@ -1,0 +1,258 @@
+name: Universal Agentic Workflow (UAW)
+description: Run, resume, audit gates, or inspect cost for a UWF/UAW workflow in CI
+author: qwts
+
+inputs:
+  command:
+    description: Runner command (run, resume, gates, cost)
+    required: false
+    default: run
+  workflow:
+    description: Workflow persona name (matches .github/skills/uwf-<workflow>/stages.yaml)
+    required: false
+    default: sw_dev
+  goal:
+    description: Goal file path or inline goal text (required for command=run)
+    required: false
+    default: ""
+  adapter:
+    description: Harness adapter (claude-code, codex, fake, grokbot, monolith)
+    required: false
+    default: claude-code
+  model:
+    description: Model identifier passed to the adapter
+    required: false
+    default: ""
+  repo_root:
+    description: Target repository root path
+    required: false
+    default: "."
+  data_dir:
+    description: Isolated state/transcript directory for this run (defaults to $RUNNER_TEMP/uaw-run)
+    required: false
+    default: ""
+  output_path:
+    description: Artifact output directory override
+    required: false
+    default: ""
+  from_stage:
+    description: Stage name to restart from (command=run)
+    required: false
+    default: ""
+  max_cost_usd:
+    description: Cumulative run cost cap in USD
+    required: false
+    default: ""
+  timeout_ms:
+    description: Per-stage timeout in milliseconds
+    required: false
+    default: ""
+  non_interactive:
+    description: Skip pending required questions instead of pausing with exit 3 (true/false)
+    required: false
+    default: "false"
+  dry_run:
+    description: Print stage plan without invoking models (true/false)
+    required: false
+    default: "false"
+  force:
+    description: Re-initialize a completed data directory (true/false)
+    required: false
+    default: "false"
+  unlock:
+    description: Clear a stale run.lock whose owner PID is dead (true/false)
+    required: false
+    default: "false"
+  node_version:
+    description: Node.js version to provision (>= 22.13.0)
+    required: false
+    default: "22.13.1"
+
+outputs:
+  exit_code:
+    description: UAW runner exit code (0 complete, 1 gate/abort, 2 usage, 3 questions, 4 cost cap)
+    value: ${{ steps.run_uaw.outputs.exit_code }}
+  data_dir:
+    description: Data directory used for the invocation
+    value: ${{ steps.run_uaw.outputs.data_dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install @qwts/uaw runtime dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -d "$GITHUB_ACTION_PATH/node_modules" ]; then
+          (cd "$GITHUB_ACTION_PATH" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+        fi
+
+    - name: Run UAW
+      id: run_uaw
+      shell: bash
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_WORKFLOW: ${{ inputs.workflow }}
+        INPUT_GOAL: ${{ inputs.goal }}
+        INPUT_ADAPTER: ${{ inputs.adapter }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_REPO_ROOT: ${{ inputs.repo_root }}
+        INPUT_DATA_DIR: ${{ inputs.data_dir }}
+        INPUT_OUTPUT_PATH: ${{ inputs.output_path }}
+        INPUT_FROM_STAGE: ${{ inputs.from_stage }}
+        INPUT_MAX_COST_USD: ${{ inputs.max_cost_usd }}
+        INPUT_TIMEOUT_MS: ${{ inputs.timeout_ms }}
+        INPUT_NON_INTERACTIVE: ${{ inputs.non_interactive }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_FORCE: ${{ inputs.force }}
+        INPUT_UNLOCK: ${{ inputs.unlock }}
+      run: |
+        set -euo pipefail
+
+        resolved_data_dir=""
+
+        emit_outputs() {
+          local rc="$1"
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            {
+              echo "exit_code=${rc}"
+              echo "data_dir=${resolved_data_dir}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+        }
+
+        fail_usage() {
+          echo "::error::$1" >&2
+          emit_outputs 2
+          exit 2
+        }
+
+        reject_multiline() {
+          local name="$1" val="$2"
+          if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+            fail_usage "input '${name}' must not contain newlines"
+          fi
+        }
+
+        reject_leading_dash() {
+          local name="$1" val="$2"
+          if [[ "$val" == -* ]]; then
+            fail_usage "input '${name}' must not start with '-'"
+          fi
+        }
+
+        require_bool() {
+          local name="$1" val="$2"
+          case "$val" in
+            true|false|"") ;;
+            *)
+              fail_usage "input '${name}' must be 'true' or 'false'"
+              ;;
+          esac
+        }
+
+        if ! node -e 'const [maj,min]=process.versions.node.split(".").map(Number); process.exit((maj>22||(maj===22&&min>=13))?0:1);'; then
+          fail_usage "Node.js >= 22.13.0 is required; found $(node -v 2>/dev/null || echo unknown)"
+        fi
+
+        case "$INPUT_COMMAND" in
+          run|resume|gates|cost) ;;
+          *)
+            fail_usage "input 'command' must be one of: run, resume, gates, cost"
+            ;;
+        esac
+
+        if [ -n "$INPUT_WORKFLOW" ]; then
+          if ! [[ "$INPUT_WORKFLOW" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            fail_usage "input 'workflow' must match ^[A-Za-z0-9_-]+$"
+          fi
+        fi
+
+        resolved_data_dir="${INPUT_DATA_DIR:-${RUNNER_TEMP:-/tmp}/uaw-run}"
+        reject_multiline "data_dir" "$resolved_data_dir"
+        reject_leading_dash "data_dir" "$resolved_data_dir"
+
+        for pair in \
+          "adapter:$INPUT_ADAPTER" \
+          "model:$INPUT_MODEL" \
+          "repo_root:$INPUT_REPO_ROOT" \
+          "output_path:$INPUT_OUTPUT_PATH" \
+          "from_stage:$INPUT_FROM_STAGE" \
+          "max_cost_usd:$INPUT_MAX_COST_USD" \
+          "timeout_ms:$INPUT_TIMEOUT_MS"; do
+          name="${pair%%:*}"
+          val="${pair#*:}"
+          reject_multiline "$name" "$val"
+          if [ -n "$val" ]; then
+            reject_leading_dash "$name" "$val"
+          fi
+        done
+
+        if [[ "$INPUT_GOAL" == --* ]]; then
+          fail_usage "input 'goal' must not start with '--'"
+        fi
+
+        require_bool "non_interactive" "$INPUT_NON_INTERACTIVE"
+        require_bool "dry_run" "$INPUT_DRY_RUN"
+        require_bool "force" "$INPUT_FORCE"
+        require_bool "unlock" "$INPUT_UNLOCK"
+
+        if [ "$INPUT_COMMAND" = "resume" ]; then
+          if [ -n "$INPUT_GOAL" ]; then fail_usage "'goal' is not valid with command=resume"; fi
+          if [ -n "$INPUT_FROM_STAGE" ]; then fail_usage "'from_stage' is not valid with command=resume"; fi
+          if [ "$INPUT_DRY_RUN" = "true" ]; then fail_usage "'dry_run' is not valid with command=resume"; fi
+          if [ "$INPUT_FORCE" = "true" ]; then fail_usage "'force' is not valid with command=resume"; fi
+        elif [ "$INPUT_COMMAND" = "gates" ] || [ "$INPUT_COMMAND" = "cost" ]; then
+          if [ -n "$INPUT_GOAL" ]; then fail_usage "'goal' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ -n "$INPUT_FROM_STAGE" ]; then fail_usage "'from_stage' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ "$INPUT_COMMAND" = "gates" ] && [ -n "$INPUT_OUTPUT_PATH" ]; then fail_usage "'output_path' is not valid with command=gates"; fi
+          if [ -n "$INPUT_MAX_COST_USD" ]; then fail_usage "'max_cost_usd' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ -n "$INPUT_TIMEOUT_MS" ]; then fail_usage "'timeout_ms' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ "$INPUT_DRY_RUN" = "true" ]; then fail_usage "'dry_run' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ "$INPUT_FORCE" = "true" ]; then fail_usage "'force' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ "$INPUT_UNLOCK" = "true" ]; then fail_usage "'unlock' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ "$INPUT_NON_INTERACTIVE" = "true" ]; then fail_usage "'non_interactive' is not valid with command=${INPUT_COMMAND}"; fi
+        fi
+
+        args=("$INPUT_COMMAND")
+        if [ -n "$INPUT_WORKFLOW" ]; then
+          args+=("--workflow" "$INPUT_WORKFLOW")
+        fi
+        if [ -n "$INPUT_REPO_ROOT" ]; then
+          args+=("--repo-root" "$INPUT_REPO_ROOT")
+        fi
+        if [ "$INPUT_COMMAND" = "run" ] && [ -n "$INPUT_GOAL" ]; then
+          args+=("--goal" "$INPUT_GOAL")
+        fi
+        if [ "$INPUT_COMMAND" = "run" ] || [ "$INPUT_COMMAND" = "resume" ]; then
+          if [ -n "$INPUT_ADAPTER" ]; then args+=("--adapter" "$INPUT_ADAPTER"); fi
+          if [ -n "$INPUT_MODEL" ]; then args+=("--model" "$INPUT_MODEL"); fi
+          if [ -n "$INPUT_MAX_COST_USD" ]; then args+=("--max-cost-usd" "$INPUT_MAX_COST_USD"); fi
+          if [ -n "$INPUT_TIMEOUT_MS" ]; then args+=("--timeout-ms" "$INPUT_TIMEOUT_MS"); fi
+          if [ "$INPUT_NON_INTERACTIVE" = "true" ]; then args+=("--non-interactive"); fi
+          if [ "$INPUT_UNLOCK" = "true" ]; then args+=("--unlock"); fi
+        fi
+        if [ "$INPUT_COMMAND" = "run" ]; then
+          if [ -n "$INPUT_FROM_STAGE" ]; then args+=("--from-stage" "$INPUT_FROM_STAGE"); fi
+          if [ "$INPUT_DRY_RUN" = "true" ]; then args+=("--dry-run"); fi
+          if [ "$INPUT_FORCE" = "true" ]; then args+=("--force"); fi
+        fi
+        if [ "$INPUT_COMMAND" != "gates" ]; then
+          if [ -n "$INPUT_OUTPUT_PATH" ]; then args+=("--output-path" "$INPUT_OUTPUT_PATH"); fi
+          args+=("--data-dir" "$resolved_data_dir")
+        fi
+
+        rc=0
+        if node "$GITHUB_ACTION_PATH/bin/uaw.mjs" "${args[@]}"; then
+          rc=0
+        else
+          rc=$?
+        fi
+
+        emit_outputs "$rc"
+        exit "$rc"

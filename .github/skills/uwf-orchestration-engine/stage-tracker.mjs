@@ -34,7 +34,7 @@
  * All output is JSON to stdout.
  */
 
-import Database from "better-sqlite3";
+import { openDatabase } from "../uwf-state-manager/sqlite.mjs";
 import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
@@ -302,8 +302,7 @@ if (!command) usageError("No command provided.");
 // ---------------------------------------------------------------------------
 
 function openDb() {
-  const db = new Database(DB_PATH);
-  db.pragma("journal_mode = WAL");
+  const db = openDatabase(DB_PATH, { wal: true });
   initTables(db);
   return db;
 }

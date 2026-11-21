@@ -103,6 +103,7 @@ try {
   // resetting the databases in this checkout.
   const copyRoot = join(tempRoot, "copy");
   cpSync(join(REPO_ROOT, ".github"), join(copyRoot, ".github"), { recursive: true });
+  cpSync(join(REPO_ROOT, "node_modules"), join(copyRoot, "node_modules"), { recursive: true });
   const copySkills = join(copyRoot, ".github/skills");
   for (const [name, cli] of Object.entries(CLIS)) {
     const copyScript = join(copySkills, cli.dir, cli.script.split("/").pop());

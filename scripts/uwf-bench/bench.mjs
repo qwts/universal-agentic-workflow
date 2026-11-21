@@ -15,9 +15,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { hasRun, insertRating, insertRun, openDb, tableCsv } from "./db.mjs";
 import { openSqlite } from "./sqlite.mjs";
 import { loadMatrix, planRuns } from "./matrix.mjs";
@@ -144,7 +144,6 @@ export function readStageRuns(dataDir, workflow) {
 /** Stage names whose gate has at least one check (stages.yaml); all stages when it cannot be read. */
 function gatedStages(workflow) {
   try {
-    const yaml = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"))("js-yaml");
     const doc = yaml.load(readFileSync(join(SKILLS, `uwf-${workflow}`, "stages.yaml"), "utf8"));
     return new Set((doc.stages ?? []).filter((s) => (s.gate?.checks ?? []).length).map((s) => s.name));
   } catch { return null; }

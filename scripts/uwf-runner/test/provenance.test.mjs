@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { openDatabase } from "../../../.github/skills/uwf-state-manager/sqlite.mjs";
 import {
   buildManifest,
   canonicalizeJcs,
@@ -39,17 +40,13 @@ const RUNNER_CLI = join(REPO_ROOT, "scripts", "uwf-runner", "runner.mjs");
 const TRACKER_CLI = join(REPO_ROOT, ".github", "skills", "uwf-orchestration-engine", "stage-tracker.mjs");
 const SW_DEV_RUN_CLI = join(REPO_ROOT, ".github", "skills", "uwf-sw_dev", "run.mjs");
 
-// Resolve better-sqlite3 the same way provenance.mjs does.
-function loadDatabase() {
-  for (const base of [
-    join(REPO_ROOT, ".github", "skills", "uwf-state-manager", "state.mjs"),
-    import.meta.url,
-  ]) {
-    try { return createRequire(base)("better-sqlite3"); } catch { /* next */ }
-  }
-  throw new Error("better-sqlite3 not available");
+function Database(dbPath, opts = {}) {
+  return openDatabase(dbPath, {
+    readOnly: Boolean(opts?.readonly),
+    wal: false,
+    foreignKeys: false,
+  });
 }
-const Database = loadDatabase();
 
 // Synthetic tokens assembled at runtime so no secret literal sits in the repo.
 const FAKE_ANTHROPIC = "sk-ant-" + "api03-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";

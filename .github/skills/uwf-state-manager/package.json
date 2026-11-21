@@ -3,8 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "description": "UWF State Manager — SQLite-backed CLI for workflow state and issue management",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "dependencies": {
-    "better-sqlite3": "^12.9.0",
     "js-yaml": "^4.3.1"
   }
 }

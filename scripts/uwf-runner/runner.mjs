@@ -31,11 +31,11 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { loadAdapter, ADAPTERS } from "./adapters/index.mjs";
 import { GIT_ENV_OVERRIDES } from "./mark-stage.mjs";
 import { materializePrompt, resolveSkillsRoot } from "./prompt.mjs";
@@ -238,7 +238,7 @@ const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0
 const EXIT = { OK: 0, GATE: 1, USAGE: 2, QUESTIONS: 3, COST: 4 };
 const DEFAULT_RESUME_MAX_CONTEXT = 100_000;
 
-class UsageError extends Error {}
+export class UsageError extends Error {}
 
 // ---------------------------------------------------------------------------
 // CLI plumbing
@@ -340,7 +340,7 @@ export function parseQuestions(text) {
 // Run
 // ---------------------------------------------------------------------------
 
-async function main(argv) {
+export async function main(argv) {
   const { flags, positional } = parseArgs(argv);
   const command = positional[0];
   if (command === "gates") return gatesAudit(flags);
@@ -1021,8 +1021,7 @@ function finish(code, rows, message, note) {
 async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRoot, outputPath, dataDir, goal, flags, adapterName, maxCostUsd }) {
   let gateChecks = {};
   try {
-    const req = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"));
-    const doc = req("js-yaml").load(readFileSync(join(skillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml"), "utf8"));
+    const doc = yaml.load(readFileSync(join(skillsRoot, ".github", "skills", `uwf-${workflow}`, "stages.yaml"), "utf8"));
     gateChecks = Object.fromEntries((doc.stages ?? []).map((s) => [s.name, s.gate?.checks ?? []]));
   } catch (e) {
     log(`[dry-run] gate checks unavailable: ${e.message}`);
@@ -1052,7 +1051,16 @@ async function dryRunReport({ workflow, stages, total, start, repoRoot, skillsRo
 
 // ---------------------------------------------------------------------------
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isDirectCliEntry() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  }
+}
+
+if (isDirectCliEntry()) {
   main(process.argv.slice(2)).then(
     (code) => { process.exitCode = code; },
     (err) => {

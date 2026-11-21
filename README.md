@@ -10,14 +10,20 @@ UWF is a gate-enforced, role-based stage workflow for AI-assisted project delive
 
 **Prerequisites**
 
-- Node.js 20 or newer. CI runs Node 20; the commands below were also checked on Node 24.
-- Install dependencies in each skill that ships a `package.json` (nine today). From the repository root:
+- Node.js 22.13 or newer (uses built-in `node:sqlite`, zero native addons; CI runs Node 22.13.1).
+- Install dependencies once at the repository root:
 
   ```sh
-  for d in .github/skills/uwf-*/; do [ -f "$d/package.json" ] && (cd "$d" && npm ci); done
+  npm ci
   ```
 
 - For live runs only: a harness CLI that is logged in, `claude` (Claude Code) or `codex`. Dry runs and tests do not call a model.
+
+**CLI & distribution surfaces (`@qwts/uaw`).** After `npm ci` (or globally / via `npx @qwts/uaw`), the package exposes `uaw` ([`bin/uaw.mjs`](bin/uaw.mjs)) and `uaw-mcp` ([`bin/uaw-mcp.mjs`](bin/uaw-mcp.mjs)) alongside the underlying `scripts/uwf-runner/runner.mjs` script:
+
+- **Universal CLI / CI:** `uaw run|resume|gates|cost ...`, [`action.yml`](action.yml) (composite GitHub Action), and [`Dockerfile`](Dockerfile) (`node:22-slim`, `UWF_SKILLS_ROOT=/opt/uaw`, `ENTRYPOINT ["uaw"]`).
+- **MCP server (`uaw-mcp/v1`):** `uaw mcp --transport stdio|http` (or `uaw-mcp`) per [ADR-0008](docs/adr/ADR-0008-multi-surface-mcp-plugin-runtime-contract.md).
+- **Cross-client Agent Plugin bundle:** `npm run pack:plugin` ([`scripts/pack-plugin.mjs`](scripts/pack-plugin.mjs)) emits a self-contained pure-JS bundle into `dist/uaw-plugin/` supporting **Agent Plugins 1.0** (`plugin.json`, `mcp.json`, `com.github.copilot/`), **Claude Code** (`.claude-plugin/plugin.json`, `.mcp.json`, `agents/`, `hooks/hooks.json`), and optional `marketplace.json` catalogs (see [ADR-0010](docs/adr/ADR-0010-universal-runtime-packaging-and-plugin-distribution.md)).
 
 **Commands.** `UWF_FAKE_FIXTURE_DIR` selects the offline fake adapter. The runner's stores (stage tracker, state, questions, transcripts) live under `--data-dir` (default `./tmp/uwf`, relative to where you run), so pass the same `--data-dir` to `resume` and `cost`. Commands below run from this checkout; `../my-app` is any git repository.
 
@@ -93,20 +99,30 @@ Artifacts are written to `tmp/workflow-artifacts/` in the target repository, wit
 ├── instructions/           Copilot always-on rules
 ├── hooks/                  PreToolUse security policy
 ├── copilot-instructions.md Copilot adapter entry point
-└── workflows/              ci.yml, codeql.yml
+└── workflows/              ci.yml, codeql.yml, uwf-on-pr.yml
+bin/
+├── uaw.mjs                 Unified CLI (`run`, `resume`, `gates`, `cost`, `mcp`, `hook`)
+└── uaw-mcp.mjs             Standalone `uaw-mcp/v1` entrypoint
 scripts/
+├── uaw-mcp/                MCP runtime (`uaw-mcp/v1`): server.mjs, protocol, commands, store
 ├── uwf-runner/             runner.mjs (run | resume | gates | cost), adapters/, cost.mjs, prompt.mjs, test/
 ├── uwf-bench/              bench.mjs matrix harness, matrix.example.yaml, test/
 ├── uwf-smoke/              Repository smoke tests (run by CI)
+├── uaw-pack/               Packaging & plugin test suite
 ├── hooks/                  preToolUse.mjs, the hook behind .github/hooks
+├── pack-plugin.mjs         Cross-client Agent Plugin + marketplace emitter
+├── run-tests.mjs           Cross-platform test runner (`npm test`)
 ├── scaffold-skill.mjs      Persona skeleton generator
-└── runner-host/            planned (#93): self-hosted runner provisioning; not on main yet
+└── runner-host/            Self-hosted runner provisioning & diagnostics
 docs/
-├── adr/                    Architecture decision records (ADR-0007 is the runner decision)
+├── adr/                    Architecture decision records (ADR-0007..ADR-0010)
 ├── research/               cli-offload-design.md (pre-registered experiment)
 ├── product/                Product definition and v1 roadmap
 ├── artifacts/, workflow-output-templates/, uwf-architecture.md, brownfield-path.md
 uwf-companion/              VS Code extension: live dashboard over the skill databases
+action.yml                  Composite GitHub Action wrapping `@qwts/uaw`
+Dockerfile                  Non-root OCI image (`node:22-slim`, `ENTRYPOINT ["uaw"]`)
+package.json                Root pure-JS `@qwts/uaw` manifest (`js-yaml`, `node:sqlite`)
 AGENTS.md                   Canonical agent context for this repository
 CONTRIBUTING.md             Development guide, test commands, PR conventions
 ```

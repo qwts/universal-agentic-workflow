@@ -22,9 +22,9 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { ADAPTERS, buildSystemPrompt, loadAdapter, resolveDataDir, writeTranscript } from "./index.mjs";
 import { materializePrompt } from "../prompt.mjs";
 import { attemptUsage } from "../cost.mjs";
@@ -209,8 +209,7 @@ function loadYamlStageMeta(workflow, skillsRoot, repoRoot) {
   const yamlPath = candidates.find((p) => existsSync(p));
   if (!yamlPath) return { conditions: {}, runScriptStages: new Set(), rawPaths: [] };
   try {
-    const req = createRequire(join(OWN_REPO_ROOT, ".github", "skills", "uwf-orchestration-engine", "stage-tracker.mjs"));
-    const doc = req("js-yaml").load(readFileSync(yamlPath, "utf8"));
+    const doc = yaml.load(readFileSync(yamlPath, "utf8"));
     const conditions = {};
     const runScriptStages = new Set();
     const rawPaths = [];

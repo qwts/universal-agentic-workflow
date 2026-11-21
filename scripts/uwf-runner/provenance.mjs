@@ -43,7 +43,8 @@ import {
   rmSync,
   writeSync,
 } from "node:fs";
-import { createRequire } from "node:module";
+import yaml from "js-yaml";
+import { openDatabase } from "../../.github/skills/uwf-state-manager/sqlite.mjs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -123,37 +124,6 @@ export function writeFileAtomic(filePath, content) {
   }
 }
 
-// Load better-sqlite3 and js-yaml from the skill packages (or fallback to local node_modules).
-function loadDatabaseCtor() {
-  const candidates = [
-    join(SKILLS_DIR, "uwf-state-manager", "state.mjs"),
-    join(SKILLS_DIR, "uwf-orchestration-engine", "stage-tracker.mjs"),
-    import.meta.url,
-  ];
-  for (const base of candidates) {
-    try {
-      const req = createRequire(base);
-      return req("better-sqlite3");
-    } catch { /* try next */ }
-  }
-  throw new Error("better-sqlite3 could not be resolved from skill packages or node_modules");
-}
-
-function loadYamlLib() {
-  const candidates = [
-    join(SKILLS_DIR, "uwf-orchestration-engine", "stage-tracker.mjs"),
-    join(SKILLS_DIR, "uwf-state-manager", "state.mjs"),
-    import.meta.url,
-  ];
-  for (const base of candidates) {
-    try {
-      const req = createRequire(base);
-      return req("js-yaml");
-    } catch { /* try next */ }
-  }
-  throw new Error("js-yaml could not be resolved from skill packages or node_modules");
-}
-
 // ---------------------------------------------------------------------------
 // Durable Run Metadata (<data-dir>/run-meta.json)
 // ---------------------------------------------------------------------------
@@ -185,97 +155,86 @@ function recoverPersistedRunIdentity(absDataDir) {
     return out;
   }
 
-  let Database = null;
-  try {
-    Database = loadDatabaseCtor();
-  } catch {
-    Database = null;
-  }
-
   let stageLedgerWorkflow = null;
-  if (Database) {
-    const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
-    const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
-    if (stagesDb) {
-      try {
-        if (tableExists(stagesDb, "stage_history")) {
-          const sh = stagesDb.prepare("SELECT workflow FROM stage_history ORDER BY id DESC LIMIT 1").get();
-          if (sh && typeof sh.workflow === "string" && sh.workflow.trim()) {
-            stageLedgerWorkflow = sh.workflow.trim();
-          }
+  const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
+  const stagesDb = stagesChecked.exists ? openReadOnly(stagesChecked.path) : null;
+  if (stagesDb) {
+    try {
+      if (tableExists(stagesDb, "stage_history")) {
+        const sh = stagesDb.prepare("SELECT workflow FROM stage_history ORDER BY id DESC LIMIT 1").get();
+        if (sh && typeof sh.workflow === "string" && sh.workflow.trim()) {
+          stageLedgerWorkflow = sh.workflow.trim();
         }
-        if (!stageLedgerWorkflow && tableExists(stagesDb, "stage_runs")) {
-          const sr = stagesDb
-            .prepare(
-              "SELECT workflow FROM stage_runs ORDER BY CASE WHEN completed_at IS NOT NULL OR started_at IS NOT NULL THEN 1 ELSE 0 END DESC, COALESCE(completed_at, started_at) DESC, id DESC LIMIT 1",
-            )
-            .get();
-          if (sr && typeof sr.workflow === "string" && sr.workflow.trim()) {
-            stageLedgerWorkflow = sr.workflow.trim();
-          }
-        }
-      } finally {
-        stagesDb.close();
       }
+      if (!stageLedgerWorkflow && tableExists(stagesDb, "stage_runs")) {
+        const sr = stagesDb
+          .prepare(
+            "SELECT workflow FROM stage_runs ORDER BY CASE WHEN completed_at IS NOT NULL OR started_at IS NOT NULL THEN 1 ELSE 0 END DESC, COALESCE(completed_at, started_at) DESC, id DESC LIMIT 1",
+          )
+          .get();
+        if (sr && typeof sr.workflow === "string" && sr.workflow.trim()) {
+          stageLedgerWorkflow = sr.workflow.trim();
+        }
+      }
+    } finally {
+      stagesDb.close();
     }
   }
 
   let historyWorkflow = null;
-  if (Database) {
-    const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
-    const stateDb = stateChecked.exists ? openReadOnly(Database, stateChecked.path) : null;
-    if (stateDb) {
-      try {
-        if (tableExists(stateDb, "workflow_state")) {
-          const ws = stateDb.prepare("SELECT * FROM workflow_state WHERE id = 1").get();
-          if (ws) {
-            if (typeof ws.run_id === "string" && ws.run_id.trim()) out.runId = ws.run_id.trim();
-            if (typeof ws.mode === "string" && ws.mode.trim()) out.modeHint = ws.mode.trim();
-            if (typeof ws.artifact_path === "string" && ws.artifact_path.trim()) out.outputPath = ws.artifact_path.trim();
-          }
+  const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
+  const stateDb = stateChecked.exists ? openReadOnly(stateChecked.path) : null;
+  if (stateDb) {
+    try {
+      if (tableExists(stateDb, "workflow_state")) {
+        const ws = stateDb.prepare("SELECT * FROM workflow_state WHERE id = 1").get();
+        if (ws) {
+          if (typeof ws.run_id === "string" && ws.run_id.trim()) out.runId = ws.run_id.trim();
+          if (typeof ws.mode === "string" && ws.mode.trim()) out.modeHint = ws.mode.trim();
+          if (typeof ws.artifact_path === "string" && ws.artifact_path.trim()) out.outputPath = ws.artifact_path.trim();
         }
-        if (tableExists(stateDb, "workflow_history")) {
-          out.hasRunnerHistory = Boolean(
-            stateDb
-              .prepare("SELECT 1 FROM workflow_history WHERE note LIKE 'runner start:%' OR note LIKE 'runner resume:%' LIMIT 1")
-              .get()
-          );
-          const startHist = stateDb
-            .prepare("SELECT note FROM workflow_history WHERE note LIKE 'runner start: workflow=%' ORDER BY id DESC LIMIT 1")
-            .get();
-          const wfMatch =
-            typeof startHist?.note === "string" ? startHist.note.match(/^runner start:\s+workflow=(\S+)/) : null;
-          if (wfMatch && wfMatch[1]) {
-            historyWorkflow = wfMatch[1].trim();
-          }
-        }
-        if (tableExists(stateDb, "run_manifests")) {
-          const ledgerWf = historyWorkflow ?? stageLedgerWorkflow;
-          let rm = null;
-          if (out.runId) {
-            rm = stateDb
-              .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests WHERE run_id = ?")
-              .get(out.runId);
-          } else if (ledgerWf) {
-            rm = stateDb
-              .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests WHERE workflow = ? ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
-              .get(ledgerWf);
-          }
-          if (rm) {
-            if (!out.runId && typeof rm.run_id === "string" && rm.run_id.trim()) out.runId = rm.run_id.trim();
-            if (!out.workflow && typeof rm.workflow === "string" && rm.workflow.trim()) out.workflow = rm.workflow.trim();
-            if (!out.baseCommitSha && typeof rm.manifest_json === "string") {
-              try {
-                const parsedRm = JSON.parse(rm.manifest_json);
-                const base = parsedRm?.deliverable?.base_commit_sha;
-                if (typeof base === "string" && base.trim()) out.baseCommitSha = base.trim();
-              } catch { /* ignore */ }
-            }
-          }
-        }
-      } finally {
-        stateDb.close();
       }
+      if (tableExists(stateDb, "workflow_history")) {
+        out.hasRunnerHistory = Boolean(
+          stateDb
+            .prepare("SELECT 1 FROM workflow_history WHERE note LIKE 'runner start:%' OR note LIKE 'runner resume:%' LIMIT 1")
+            .get()
+        );
+        const startHist = stateDb
+          .prepare("SELECT note FROM workflow_history WHERE note LIKE 'runner start: workflow=%' ORDER BY id DESC LIMIT 1")
+          .get();
+        const wfMatch =
+          typeof startHist?.note === "string" ? startHist.note.match(/^runner start:\s+workflow=(\S+)/) : null;
+        if (wfMatch && wfMatch[1]) {
+          historyWorkflow = wfMatch[1].trim();
+        }
+      }
+      if (tableExists(stateDb, "run_manifests")) {
+        const ledgerWf = historyWorkflow ?? stageLedgerWorkflow;
+        let rm = null;
+        if (out.runId) {
+          rm = stateDb
+            .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests WHERE run_id = ?")
+            .get(out.runId);
+        } else if (ledgerWf) {
+          rm = stateDb
+            .prepare("SELECT run_id, workflow, manifest_json FROM run_manifests WHERE workflow = ? ORDER BY finalized_at DESC, rowid DESC LIMIT 1")
+            .get(ledgerWf);
+        }
+        if (rm) {
+          if (!out.runId && typeof rm.run_id === "string" && rm.run_id.trim()) out.runId = rm.run_id.trim();
+          if (!out.workflow && typeof rm.workflow === "string" && rm.workflow.trim()) out.workflow = rm.workflow.trim();
+          if (!out.baseCommitSha && typeof rm.manifest_json === "string") {
+            try {
+              const parsedRm = JSON.parse(rm.manifest_json);
+              const base = parsedRm?.deliverable?.base_commit_sha;
+              if (typeof base === "string" && base.trim()) out.baseCommitSha = base.trim();
+            } catch { /* ignore */ }
+          }
+        }
+      }
+    } finally {
+      stateDb.close();
     }
   }
   if (!out.workflow) {
@@ -1163,11 +1122,11 @@ export function captureStageOutputs(stageOutputs, { outputPath, repoRoot, skills
 // Domain Store Readers (Read-Only)
 // ---------------------------------------------------------------------------
 
-function openReadOnly(Database, dbPath) {
+function openReadOnly(dbPath) {
   if (!dbPath || !existsSync(dbPath)) return null;
   let db;
   try {
-    db = new Database(dbPath, { readonly: true });
+    db = openDatabase(dbPath, { readOnly: true, wal: false, foreignKeys: false });
     db.pragma("query_only = ON");
     db.prepare("SELECT count(*) FROM sqlite_master").get();
     return db;
@@ -1215,9 +1174,9 @@ function resolveDomainDb(dataDir, skillDirName, dbFileName, repoRoot) {
   return null;
 }
 
-function readRequirementsStore(Database, dataDir, repoRoot) {
+function readRequirementsStore(dataDir, repoRoot) {
   const dbPath = resolveDomainDb(dataDir, "uwf-requirements", "uwf-requirements.db", repoRoot);
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     if (!tableExists(db, "requirements")) return null;
@@ -1246,9 +1205,9 @@ function readRequirementsStore(Database, dataDir, repoRoot) {
   }
 }
 
-function readAdrsStore(Database, dataDir, repoRoot) {
+function readAdrsStore(dataDir, repoRoot) {
   const dbPath = resolveDomainDb(dataDir, "uwf-adr", "uwf-adrs.db", repoRoot);
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     if (!tableExists(db, "adrs")) return null;
@@ -1287,9 +1246,9 @@ function readAdrsStore(Database, dataDir, repoRoot) {
   }
 }
 
-function readDiscoveriesStore(Database, dataDir, repoRoot) {
+function readDiscoveriesStore(dataDir, repoRoot) {
   const dbPath = resolveDomainDb(dataDir, "uwf-discovery", "uwf-discoveries.db", repoRoot);
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     if (!tableExists(db, "discoveries")) return null;
@@ -1315,9 +1274,9 @@ function readDiscoveriesStore(Database, dataDir, repoRoot) {
   }
 }
 
-function readReviewsStore(Database, dataDir, repoRoot) {
+function readReviewsStore(dataDir, repoRoot) {
   const dbPath = resolveDomainDb(dataDir, "uwf-review", "uwf-reviews.db", repoRoot);
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     if (!tableExists(db, "reviews")) return null;
@@ -1349,9 +1308,9 @@ function readReviewsStore(Database, dataDir, repoRoot) {
   }
 }
 
-function readIssuesStore(Database, dataDir, repoRoot) {
+function readIssuesStore(dataDir, repoRoot) {
   const dbPath = resolveDomainDb(dataDir, "uwf-local-tracking", "uwf-issues.db", repoRoot);
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     if (!tableExists(db, "issues")) return null;
@@ -1371,9 +1330,9 @@ function readIssuesStore(Database, dataDir, repoRoot) {
   }
 }
 
-function readQuestionsStore(Database, dataDir, repoRoot) {
+function readQuestionsStore(dataDir, repoRoot) {
   const dbPath = resolveDomainDb(dataDir, "uwf-question-protocol", "uwf-questions.db", repoRoot);
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     if (!tableExists(db, "questions")) return null;
@@ -1468,7 +1427,7 @@ function assertSafeDbPath(candidatePath, allowedRoot) {
  * Canonical Build Spec store: `<data-dir>/uwf-cbs.db` or `.github/skills/uwf-cbs/uwf-cbs.db`.
  * Returns `null` when `blueprint` did not run or the DB does not exist.
  */
-function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
+function readCbsStore(dataDir, repoRoot, blueprintRan) {
   if (!blueprintRan) return null;
   const candidates = [
     { path: dataDir ? join(dataDir, "uwf-cbs.db") : null, root: dataDir },
@@ -1483,7 +1442,7 @@ function readCbsStore(Database, dataDir, repoRoot, blueprintRan) {
       break;
     }
   }
-  const db = openReadOnly(Database, dbPath);
+  const db = openReadOnly(dbPath);
   if (!db) return null;
   try {
     const components = tableExists(db, "components")
@@ -1595,7 +1554,7 @@ function resolveWorkflowDefinition(workflow, skillsRoot, repoRoot) {
     }
     throw err;
   }
-  const doc = loadYamlLib().load(rawBuf.toString("utf8"));
+  const doc = yaml.load(rawBuf.toString("utf8"));
   if (!isPlainObject(doc) || !Array.isArray(doc.stages) || doc.stages.length === 0) {
     throw new Error(`Invalid workflow definition at ${yamlPath}: expected non-empty stages array`);
   }
@@ -1952,10 +1911,10 @@ function ensureRunManifestsTable(db) {
   `);
 }
 
-function readPersistedManifestRow(Database, dataDir, runId) {
+function readPersistedManifestRow(dataDir, runId) {
   const checked = assertSafeDbPath(join(dataDir, "uwf-state.db"), dataDir);
   if (!checked.exists) return null;
-  const db = openReadOnly(Database, checked.path);
+  const db = openReadOnly(checked.path);
   if (!db) return null;
   try {
     if (!tableExists(db, "run_manifests")) return null;
@@ -1968,7 +1927,7 @@ function readPersistedManifestRow(Database, dataDir, runId) {
   }
 }
 
-function upsertRunManifest(Database, dataDir, { runId, workflow, phase, manifestSha256, deliverableKey, manifestJson, sinkStatus, finalizedAt }) {
+function upsertRunManifest(dataDir, { runId, workflow, phase, manifestSha256, deliverableKey, manifestJson, sinkStatus, finalizedAt }) {
   try {
     const dirLst = lstatSync(dataDir);
     if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) {
@@ -1979,9 +1938,8 @@ function upsertRunManifest(Database, dataDir, { runId, workflow, phase, manifest
   }
   mkdirSync(dataDir, { recursive: true });
   const checked = assertSafeDbPath(join(dataDir, "uwf-state.db"), dataDir);
-  const db = new Database(checked.path);
+  const db = openDatabase(checked.path, { wal: true, foreignKeys: false });
   try {
-    db.pragma("journal_mode = WAL");
     ensureRunManifestsTable(db);
     db.prepare(`
       INSERT INTO run_manifests
@@ -2232,7 +2190,6 @@ export function buildManifest({
   if (phase !== "snapshot" && phase !== "closed" && phase !== "sealed") {
     throw new Error(`Invalid manifest phase "${phase}"`);
   }
-  const Database = loadDatabaseCtor();
   const absDataDir = resolve(dataDir);
   const absRepoRoot = resolve(repoRoot);
   const existingMeta = readExistingRunMeta(absDataDir);
@@ -2244,7 +2201,7 @@ export function buildManifest({
   let stateArtifactPath = null;
   let firstHistTs = null;
   const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
-  const stateDb = stateChecked.exists ? openReadOnly(Database, stateChecked.path) : null;
+  const stateDb = stateChecked.exists ? openReadOnly(stateChecked.path) : null;
   if (stateDb) {
     try {
       if (tableExists(stateDb, "workflow_state")) {
@@ -2269,7 +2226,7 @@ export function buildManifest({
   let persistedManifestWorkflow = null;
   const targetRunId = existingMeta?.run_id ?? stateRunId ?? null;
   if (targetRunId) {
-    const persistedForRun = readPersistedManifestRow(Database, absDataDir, targetRunId);
+    const persistedForRun = readPersistedManifestRow(absDataDir, targetRunId);
     if (persistedForRun && typeof persistedForRun.workflow === "string" && persistedForRun.workflow.trim()) {
       persistedManifestWorkflow = persistedForRun.workflow.trim();
     }
@@ -2314,7 +2271,7 @@ export function buildManifest({
   let blueprintRan = false;
 
   const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
-  const stagesDb = stagesChecked.exists ? openReadOnly(Database, stagesChecked.path) : null;
+  const stagesDb = stagesChecked.exists ? openReadOnly(stagesChecked.path) : null;
   if (!stagesDb) {
     throw new Error(
       `Stage ledger not found at ${stagesChecked.path}; cannot build ${phase} manifest without stage history`,
@@ -2385,13 +2342,13 @@ export function buildManifest({
   }
 
   const stores = {
-    requirements: readRequirementsStore(Database, absDataDir, absRepoRoot),
-    adrs: readAdrsStore(Database, absDataDir, absRepoRoot),
-    discoveries: readDiscoveriesStore(Database, absDataDir, absRepoRoot),
-    reviews: readReviewsStore(Database, absDataDir, absRepoRoot),
-    issues: readIssuesStore(Database, absDataDir, absRepoRoot),
-    questions: readQuestionsStore(Database, absDataDir, absRepoRoot),
-    cbs: readCbsStore(Database, absDataDir, absRepoRoot, blueprintRan),
+    requirements: readRequirementsStore(absDataDir, absRepoRoot),
+    adrs: readAdrsStore(absDataDir, absRepoRoot),
+    discoveries: readDiscoveriesStore(absDataDir, absRepoRoot),
+    reviews: readReviewsStore(absDataDir, absRepoRoot),
+    issues: readIssuesStore(absDataDir, absRepoRoot),
+    questions: readQuestionsStore(absDataDir, absRepoRoot),
+    cbs: readCbsStore(absDataDir, absRepoRoot, blueprintRan),
   };
 
   const architecture = readArchitectureStrata({
@@ -2434,7 +2391,7 @@ export function buildManifest({
     stages: auditStages,
   });
 
-  const persisted = readPersistedManifestRow(Database, absDataDir, runId);
+  const persisted = readPersistedManifestRow(absDataDir, runId);
   if (persisted && persisted.manifest_sha256 === manifestSha256 && persisted.manifest_json) {
     try {
       const prev = JSON.parse(persisted.manifest_json);
@@ -2501,7 +2458,6 @@ export async function materializeManifest({
   if (phase === "sealed" && _sealToken !== SEAL_CALLER_TOKEN) {
     throw new Error('phase="sealed" requires sealManifest()');
   }
-  const Database = loadDatabaseCtor();
   const absDataDir = resolve(dataDir);
   const built = buildManifest({
     dataDir: absDataDir,
@@ -2554,7 +2510,7 @@ export async function materializeManifest({
     sinkResult = await dispatchToContextHub(envelope, sinkOptions);
   }
 
-  upsertRunManifest(Database, absDataDir, {
+  upsertRunManifest(absDataDir, {
     runId: built.runId,
     workflow: built.manifest.workflow,
     phase,
@@ -3059,12 +3015,11 @@ export async function scrubProvenanceOutputs({
   }
 
   const existingMeta = readExistingRunMeta(absDataDir);
-  const Database = loadDatabaseCtor();
 
   let stateArtifactPath = null;
   const stateChecked = assertSafeDbPath(join(absDataDir, "uwf-state.db"), absDataDir);
   if (stateChecked.exists) {
-    const stateDb = openReadOnly(Database, stateChecked.path);
+    const stateDb = openReadOnly(stateChecked.path);
     if (stateDb) {
       try {
         if (tableExists(stateDb, "workflow_state")) {
@@ -3128,7 +3083,7 @@ export async function scrubProvenanceOutputs({
 
   const stagesChecked = assertSafeDbPath(join(absDataDir, "uwf-stages.db"), absDataDir);
   if (stagesChecked.exists) {
-    const db = new Database(stagesChecked.path);
+    const db = openDatabase(stagesChecked.path, { wal: false, foreignKeys: false });
     try {
       if (tableExists(db, "stage_runs")) {
         const rows = db

@@ -510,8 +510,8 @@ function splitCsv(val) {
     .filter(Boolean);
 }
 
-async function main() {
-  const flags = parseCliArgs(process.argv.slice(2));
+export async function main(argv = process.argv.slice(2)) {
+  const flags = parseCliArgs(argv);
   const transport = String(flags.transport ?? process.env.UAW_MCP_TRANSPORT ?? "stdio");
   const rawAllowedRoots = flags["allowed-roots"] ?? process.env.UAW_MCP_ALLOWED_ROOTS;
   const allowedRoots = splitCsv(rawAllowedRoots ?? "");

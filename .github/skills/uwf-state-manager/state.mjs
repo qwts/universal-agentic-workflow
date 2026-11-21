@@ -36,7 +36,7 @@
  * All output is JSON to stdout.
  */
 
-import Database from "better-sqlite3";
+import { openDatabase } from "./sqlite.mjs";
 import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
@@ -81,8 +81,7 @@ if (!command) {
 // ---------------------------------------------------------------------------
 
 function openDb() {
-  const db = new Database(DB_PATH);
-  db.pragma("journal_mode = WAL");
+  const db = openDatabase(DB_PATH, { wal: true });
   initTables(db);
   return db;
 }

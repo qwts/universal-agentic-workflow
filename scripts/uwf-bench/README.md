@@ -2,7 +2,7 @@
 
 Benchmark harness around `scripts/uwf-runner/runner.mjs` (issue #101). It runs a matrix of
 cells x fixtures x run indexes unattended, records usage and gate outcomes in `results.db`
-(SQLite via `better-sqlite3`, the engine skill's own driver, so it runs on Node 20) and exports CSV for analysis. Field list:
+(SQLite via built-in `node:sqlite`, matching `stage-tracker.mjs` on Node 22.13+) and exports CSV for analysis. Field list:
 `docs/research/cli-offload-design.md` section 11.
 
 ```sh
@@ -59,4 +59,4 @@ See `matrix.example.yaml`.
 ## Tests
 
 `node scripts/uwf-bench/test/bench.test.mjs` (fake adapter only; never calls a live model).
-Needs the runner's skill dependencies installed (`npm ci` in the `.github/skills/uwf-*` dirs, as CI does).
+Needs root dependencies installed (`npm ci` at the repository root, as CI does).

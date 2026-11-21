@@ -20,15 +20,14 @@ Thank you for your interest in contributing. This guide covers everything you ne
 
 ## Prerequisites
 
-- **Node.js 20+** — required for the runner, the bench harness, the skill scripts and the
-  repository smoke suite (CI runs Node 20)
+- **Node.js 22.13+** — required for the runner, the bench harness, the skill scripts,
+  the `uaw-mcp` server, the repository smoke suite, and the UWF Companion (all use
+  the unflagged built-in `node:sqlite` API with zero native addons; CI runs Node 22.13.1)
 - **A harness CLI** — `claude` (Claude Code) or `codex`, logged in. Only live runs need it;
   the tests use the offline `fake` adapter and never call a model
 - **VS Code with GitHub Copilot** — optional. Only the Copilot chat adapter needs it; custom
-  agents / subagents must be enabled in settings (currently experimental)
-- **Node.js 22.13+** and **VS Code 1.101+** — required for the UWF Companion;
-  its database readers use the unflagged `node:sqlite` API available in the
-  VS Code extension host from this release line
+  agents / subagents must be enabled in settings (currently experimental); VS Code 1.101+
+  is required for the UWF Companion
 - Familiarity with the UWF phase model described in [`docs/uwf-architecture.md`](docs/uwf-architecture.md)
 
 ---
@@ -56,28 +55,21 @@ The **runner** (`scripts/uwf-runner/runner.mjs`) is the primary runtime (see [AD
 
 ## Development Setup
 
-Most skills are self-contained Node.js packages. Install dependencies for every skill that ships a `package.json` (the same set CI installs):
+Install the hoisted pure-JS runtime dependency once at the repository root:
 
 ```bash
-for d in .github/skills/uwf-*/; do [ -f "$d/package.json" ] && (cd "$d" && npm ci); done
+npm ci
 ```
 
 ### Running the tests
 
-These are the exact loops CI runs (`.github/workflows/ci.yml`). They run offline: the runner tests use the `fake` adapter and the bench tests never call a live model. Run them from the repository root after installing dependencies.
+These match the offline test suites CI runs (`.github/workflows/ci.yml`): the runner tests use the `fake` adapter and the bench tests never call a live model. Run them from the repository root after `npm ci`:
 
 ```bash
-set -euo pipefail
-for test_file in scripts/uwf-smoke/*.mjs; do
-  node "$test_file"
-done
-for test_file in scripts/uwf-runner/test/*.test.mjs; do
-  node "$test_file"
-done
-for test_file in scripts/uwf-bench/test/*.test.mjs; do
-  node "$test_file"
-done
+npm test
 ```
+
+You can also run individual suites (`npm run test:smoke`, `npm run test:runner`, `npm run test:mcp`, `npm run test:bench`, `npm run test:pack`) or package a cross-client Agent Plugin bundle (`npm run pack:plugin`).
 
 The adapter contract tests skip the live `claude` and `codex` checks unless `UWF_TEST_LIVE=1` is set and the CLI is on `PATH`. Leave `UWF_TEST_LIVE` unset for routine work. Do not run live tests unless you intend to spend model budget.
 
@@ -285,9 +277,9 @@ A **skill** encapsulates a discrete behavior — usually a SQLite-backed data st
 ```
 .github/skills/uwf-<name>/
 ├── SKILL.md              # Agent-readable behavior spec
-├── <name>.mjs            # CLI script (the primary interface)
+├── <name>.mjs            # CLI script (the primary interface; uses built-in node:sqlite)
 ├── <name>-schema.yaml    # SQLite schema definition
-├── package.json          # "type": "module", lists better-sqlite3 dependency
+├── package.json          # "type": "module", lists js-yaml dependency
 └── package-lock.json
 ```
 
