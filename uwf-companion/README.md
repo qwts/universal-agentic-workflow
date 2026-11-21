@@ -47,7 +47,7 @@ Live workflow visibility, question resolution, cost reporting, gate auditing, an
 
 ## Requirements
 
-- VS Code 1.101+
+- VS Code 1.109+
 - Node.js >= 22.13.0
 
 ## Building, Staging & Testing

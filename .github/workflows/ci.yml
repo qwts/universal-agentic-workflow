@@ -135,7 +135,7 @@ jobs:
           executable: npm
           arguments-json: '["ci","--no-audit","--no-fund"]'
           working-directory: uwf-companion
-          timeout-seconds: '600'
+          timeout-seconds: '420'
           attempts: '2'
           retry-delay-seconds: '5'
 
@@ -146,7 +146,7 @@ jobs:
           executable: npm
           arguments-json: '["ci","--omit=dev","--ignore-scripts","--no-audit","--no-fund"]'
           working-directory: .
-          timeout-seconds: '300'
+          timeout-seconds: '120'
           attempts: '2'
           retry-delay-seconds: '5'
 

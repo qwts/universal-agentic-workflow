@@ -22,9 +22,15 @@ export class UawMcpDefinitionProvider
     this._onDidChange.fire();
   }
 
-  provideMcpServerDefinitions(
+  private async loadAuthHeaders(url: string): Promise<Record<string, string>> {
+    const secretKey = secretKeyForRemoteUrl(url);
+    const authToken = (await this.context.secrets.get(secretKey))?.trim();
+    return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+  }
+
+  async provideMcpServerDefinitions(
     _token: vscode.CancellationToken,
-  ): vscode.ProviderResult<vscode.McpServerDefinition[]> {
+  ): Promise<vscode.McpServerDefinition[]> {
     if (!vscode.workspace.isTrusted) {
       return [];
     }
@@ -42,11 +48,14 @@ export class UawMcpDefinitionProvider
     }
 
     if (config.transport === "http") {
+      // Publish auth headers eagerly so background Copilot forwarding stays authenticated
+      // even when VS Code skips resolveMcpServerDefinition.
+      const headers = await this.loadAuthHeaders(config.url);
       return [
         new vscode.McpHttpServerDefinition(
           "UAW MCP Runtime (Remote)",
           vscode.Uri.parse(config.url),
-          {},
+          headers,
           this.version,
         ),
       ];
@@ -71,14 +80,14 @@ export class UawMcpDefinitionProvider
       return undefined;
     }
     if (server instanceof vscode.McpHttpServerDefinition) {
-      const secretKey = secretKeyForRemoteUrl(server.uri.toString(true));
-      const authToken = (await this.context.secrets.get(secretKey))?.trim();
-      if (authToken) {
-        server.headers = {
-          ...server.headers,
-          Authorization: `Bearer ${authToken}`,
-        };
+      const authHeaders = await this.loadAuthHeaders(server.uri.toString(true));
+      const nextHeaders = { ...server.headers };
+      if (authHeaders.Authorization) {
+        nextHeaders.Authorization = authHeaders.Authorization;
+      } else {
+        delete nextHeaders.Authorization;
       }
+      server.headers = nextHeaders;
     }
     return server;
   }

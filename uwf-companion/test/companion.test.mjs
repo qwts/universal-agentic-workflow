@@ -93,8 +93,26 @@ test("staged bundle and vsce ls satisfy AI contribution & VSIX hygiene checks", 
   assert.ok(checkSummary.counts.chatInstructions > 0);
 
   const pkg = JSON.parse(fs.readFileSync(path.join(COMPANION_ROOT, "package.json"), "utf8"));
+  assert.equal(pkg.engines?.vscode, "^1.109.0", "engines.vscode must require >=1.109.0 for chatSkills");
   assert.ok(Array.isArray(pkg.contributes?.mcpServerDefinitionProviders));
   assert.equal(pkg.contributes.mcpServerDefinitionProviders[0]?.id, "uwf.uaw-mcp");
+
+  for (const agentEntry of pkg.contributes.chatAgents) {
+    const absAgent = path.join(COMPANION_ROOT, agentEntry.path);
+    const agentText = fs.readFileSync(absAgent, "utf8");
+    assert.equal(
+      /^\s*user-invokable\s*:/m.test(agentText),
+      false,
+      `Misspelled user-invokable frontmatter key in ${agentEntry.path}`,
+    );
+    if (!agentEntry.path.endsWith("/uwf-core-orchestrator.agent.md")) {
+      assert.match(
+        agentText,
+        /^\s*user-invocable:\s*false\s*$/m,
+        `Internal agent must declare user-invocable: false: ${agentEntry.path}`,
+      );
+    }
+  }
 
   const vsceBin = path.join(
     COMPANION_ROOT,
@@ -1084,7 +1102,8 @@ test("UawMcpClient validates JSON-RPC 2.0 frames, bounds HTTP bodies, and reaps 
         command: process.execPath,
         args: [
           "-e",
-          `const fs=require('node:fs');process.on('SIGTERM',()=>{});fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},1000);`,
+          "const fs=require('node:fs');process.on('SIGTERM',()=>{});fs.writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000);",
+          pidFile,
         ],
         cwd: scratch,
         env: {},
