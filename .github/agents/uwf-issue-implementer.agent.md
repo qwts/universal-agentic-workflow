@@ -2,7 +2,7 @@
 name: uwf-issue-implementer
 description: "Implement changes. Must follow plan + ADRs."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 # Implementation stage
 Rules:

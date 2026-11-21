@@ -2,7 +2,7 @@
 name: uwf-forensic-analyst-confidence-score
 description: "Formal scoring pass: review every entry from intent-inference, finalize confidence tiers, and write the provisional forensic-br.json Build Record. Brownfield pre-phase stage 4."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Confidence Score Stage

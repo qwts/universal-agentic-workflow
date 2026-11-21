@@ -2,7 +2,7 @@
 name: uwf-forensic-analyst-gap-report
 description: "Surface all gap entries from the provisional Build Record, produce the structured human-review document, and block until every gap is resolved or accepted as out-of-scope. Brownfield pre-phase stage 5."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Gap Report Stage
