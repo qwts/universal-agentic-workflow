@@ -2,7 +2,7 @@
 name: uwf-project_manager-timeline-planner
 description: "Produce the timeline roadmap (`project-roadmap.md`) and the issue backlog (`issues-backlog.md`) and create the issue file-system state structure under state/. No implementation."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 # Timeline Planning Stage
 This stage produces the **roadmap** and **issue state structure**. It is NOT an implementation plan. Do not write code, create source files, or produce implementation steps.

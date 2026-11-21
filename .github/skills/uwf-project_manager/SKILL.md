@@ -1,3 +1,7 @@
+---
+name: uwf-project_manager
+description: "Persona skill for macro-level project planning: scoping a new effort, producing a requirements pack, building a roadmap, and scaffolding the backlog."
+---
 # Skill: uwf-project_manager
 
 Persona skill for macro-level project planning: scoping a new effort, producing a requirements pack, building a roadmap, and scaffolding the backlog.

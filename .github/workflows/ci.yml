@@ -135,7 +135,18 @@ jobs:
           executable: npm
           arguments-json: '["ci","--no-audit","--no-fund"]'
           working-directory: uwf-companion
-          timeout-seconds: '600'
+          timeout-seconds: '420'
+          attempts: '2'
+          retry-delay-seconds: '5'
+
+      - name: Install locked root runtime dependencies
+        uses: qwts/qwts-agent-ci/.github/actions/bounded-command@290635a3292ad49eb31cfadf8059353863d33a3b
+        with:
+          task: Install locked root runtime dependencies
+          executable: npm
+          arguments-json: '["ci","--omit=dev","--ignore-scripts","--no-audit","--no-fund"]'
+          working-directory: .
+          timeout-seconds: '120'
           attempts: '2'
           retry-delay-seconds: '5'
 

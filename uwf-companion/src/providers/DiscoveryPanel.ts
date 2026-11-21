@@ -1,53 +1,46 @@
 import * as vscode from "vscode";
-import { DiscoveryReader } from "../db/readers/DiscoveryReader";
-import { escHtml, badge, renderDynamicTable, pageShell, sectionHeader } from "./webviewUtils";
-import { PanelRegistry } from "./PanelRegistry";
+import { UawDataService } from "../services/UawDataService";
+import { ManagedWebviewPanel } from "./PanelRegistry";
+import { badge, deriveColumns, renderDynamicTable } from "./webviewUtils";
 
 const IMPACT_COLORS: Record<string, "red" | "yellow" | "grey"> = {
-  high: "red", medium: "yellow", low: "grey",
+  high: "red",
+  medium: "yellow",
+  low: "grey",
 };
 
-export class DiscoveryPanel {
-  private static panel: vscode.WebviewPanel | undefined;
+const managed = new ManagedWebviewPanel({
+  registryId: "discoveries",
+  viewType: "uwf.discoveries",
+  title: "UWF: Discoveries",
+  pageTitle: "UWF Discoveries",
+  sectionTitle: "Discovery Findings",
+  openCommand: "uwf.openDashboard",
+  renderBody: async (dataService, target) => {
+    const res = await dataService.getDiscoveries(target);
+    if (!res.exists) return `<p class="empty">No discoveries store found for active run.</p>`;
+    const rows = res.discoveries ?? [];
+    const cols = deriveColumns(rows, [
+      "id",
+      "role",
+      "stage",
+      "category",
+      "title",
+      "impact",
+      "status",
+    ]);
+    return renderDynamicTable(cols, rows, {
+      impact: (v) => badge(String(v ?? ""), IMPACT_COLORS[String(v).toLowerCase()] ?? "grey"),
+    });
+  },
+});
 
-  static show(context: vscode.ExtensionContext, workspaceRoot: string) {
-    if (DiscoveryPanel.panel) {
-      DiscoveryPanel.panel.reveal();
-      DiscoveryPanel.refresh(workspaceRoot);
-      return;
-    }
-    DiscoveryPanel.panel = vscode.window.createWebviewPanel(
-      "uwf.discoveries", "UWF: Discoveries",
-      vscode.ViewColumn.One,
-      { enableScripts: false, enableCommandUris: true, retainContextWhenHidden: true }
-    );
-    PanelRegistry.register("discoveries", (root) => DiscoveryPanel.refresh(root));
-    DiscoveryPanel.panel.onDidDispose(() => {
-      PanelRegistry.unregister("discoveries");
-      DiscoveryPanel.panel = undefined;
-    }, null, context.subscriptions);
-    DiscoveryPanel.refresh(workspaceRoot);
+export class DiscoveryPanel {
+  static show(context: vscode.ExtensionContext, dataService: UawDataService): void {
+    managed.show(context, dataService);
   }
 
-  static refresh(workspaceRoot: string) {
-    if (!DiscoveryPanel.panel) return;
-    const reader = new DiscoveryReader(workspaceRoot);
-    let body: string;
-    if (!reader.exists()) {
-      body = `<p class="empty">No discoveries database found.</p>`;
-    } else {
-      try {
-        const cols = reader.columns("discoveries");
-        const rows = reader.listAll();
-        body = renderDynamicTable(cols, rows, {
-          impact: (v) => badge(String(v ?? ""), IMPACT_COLORS[String(v).toLowerCase()] ?? "grey"),
-        });
-      } catch (e) {
-        body = `<p class="empty">Error: ${escHtml(String(e))}</p>`;
-      } finally {
-        reader.close();
-      }
-    }
-    DiscoveryPanel.panel.webview.html = pageShell("UWF Discoveries", `${sectionHeader("Discovery Findings", "uwf.openDashboard")}${body}`);
+  static refresh(dataService: UawDataService): Promise<void> {
+    return managed.refresh(dataService);
   }
 }

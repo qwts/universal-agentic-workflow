@@ -1,3 +1,7 @@
+---
+name: uwf-forensic-analyst
+description: "Brownfield pre-phase persona skill for existing projects without documented intent, producing a provisional Build Record (uwf-br) with confidence scores."
+---
 # Skill: uwf-forensic-analyst
 
 Brownfield pre-phase archetype. Runs before the standard First phase on existing projects where intent was never recorded. Produces a provisional Build Record (`uwf-br`) with confidence scores so that the normal First/Second/Third phases can proceed from a documented baseline.

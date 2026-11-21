@@ -2,7 +2,7 @@
 name: uwf-forensic-analyst-repo-audit
 description: "Enumerate all repositories in scope, map service boundaries and seams, catalog tech stack per repo. Brownfield pre-phase stage 1."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Repo Audit Stage

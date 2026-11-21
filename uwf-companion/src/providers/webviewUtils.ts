@@ -14,9 +14,47 @@ export function escHtml(val: unknown): string {
     .replace(/"/g, "&quot;");
 }
 
+/** Format scalar or structured MCP JSON field values without "[object Object]". */
+export function formatCellValue(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "object") {
+    try {
+      return JSON.stringify(val);
+    } catch {
+      return String(val);
+    }
+  }
+  return String(val);
+}
+
+/** Derive ordered column names from dynamic MCP row objects. */
+export function deriveColumns(
+  rows: Array<Record<string, unknown>>,
+  preferredOrder: string[] = [],
+): string[] {
+  const seen = new Set<string>();
+  const cols: string[] = [];
+
+  for (const col of preferredOrder) {
+    if (!seen.has(col) && rows.some((r) => Object.prototype.hasOwnProperty.call(r, col))) {
+      seen.add(col);
+      cols.push(col);
+    }
+  }
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        cols.push(key);
+      }
+    }
+  }
+  return cols;
+}
+
 export function badge(
   text: string,
-  color: "green" | "yellow" | "red" | "blue" | "grey"
+  color: "green" | "yellow" | "red" | "blue" | "grey",
 ): string {
   const colors: Record<string, string> = {
     green: "#2ea44f",
@@ -34,39 +72,51 @@ export function statusBadge(status: string): string {
     active: "yellow",
     closed: "green",
     skipped: "grey",
+    passed: "green",
     completed: "green",
+    complete: "green",
     failed: "red",
-    pending: "grey",
+    pending: "yellow",
+    answered: "green",
   };
   return badge(status, map[status] ?? "grey");
 }
 
 /**
- * Render a table from live schema columns and row data.
- * Columns come from PRAGMA table_info so the table always matches the actual DB schema.
- * A column-specific renderer can return a badge/tag string; otherwise the value is escaped.
+ * Render a dynamic HTML table from MCP record objects.
+ * Values pass through formatCellValue + escHtml unless overridden by a badge renderer.
  */
 export function renderDynamicTable(
   columns: string[],
   rows: unknown[],
-  renderers: Record<string, (val: unknown) => string> = {}
+  renderers: Record<string, (val: unknown, row: Record<string, unknown>) => string> = {},
 ): string {
   if (!rows.length) return `<p class="empty">No records found.</p>`;
   const headers = columns.map((c) => `<th>${escHtml(c)}</th>`).join("");
-  const bodyRows = (rows as Record<string, unknown>[]).map((row) => {
-    const cells = columns.map((c) => {
-      const val = row[c];
-      const rendered = renderers[c] ? renderers[c](val) : escHtml(val);
-      return `<td>${rendered}</td>`;
-    }).join("");
-    return `<tr>${cells}</tr>`;
-  }).join("");
+  const bodyRows = (rows as Record<string, unknown>[])
+    .map((row) => {
+      const cells = columns
+        .map((c) => {
+          const val = row[c];
+          const rendered = renderers[c] ? renderers[c](val, row) : escHtml(formatCellValue(val));
+          return `<td>${rendered}</td>`;
+        })
+        .join("");
+      return `<tr>${cells}</tr>`;
+    })
+    .join("");
   return `<table><thead><tr>${headers}</tr></thead><tbody>${bodyRows}</tbody></table>`;
 }
 
-export function pageShell(title: string, body: string, nonce?: string, scriptContent?: string): string {
+export function pageShell(
+  title: string,
+  body: string,
+  nonce?: string,
+  scriptContent?: string,
+): string {
   const scriptPolicy = nonce ? ` script-src 'nonce-${nonce}';` : "";
-  const scriptTag = nonce && scriptContent ? `<script nonce="${nonce}">${scriptContent}</script>` : "";
+  const scriptTag =
+    nonce && scriptContent ? `<script nonce="${nonce}">${scriptContent}</script>` : "";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -76,9 +126,10 @@ export function pageShell(title: string, body: string, nonce?: string, scriptCon
   body { font-family: var(--vscode-font-family, sans-serif); font-size: 13px; padding: 12px; color: var(--vscode-foreground); background: var(--vscode-editor-background); }
   h2 { margin: 0 0 12px; font-size: 15px; }
   table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border, #333); }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border, #333); vertical-align: top; }
   th { font-weight: 600; }
   .empty { opacity: .6; font-style: italic; }
+  .btn { display:inline-block; background:var(--vscode-button-background); color:var(--vscode-button-foreground); border:0; border-radius:4px; padding:4px 8px; cursor:pointer; text-decoration:none; font-size:12px; }
 </style>
 <title>${escHtml(title)}</title>
 </head>

@@ -7,7 +7,7 @@ tools:
   - vscode/askQuestions
   - execute
   - read
-user-invokable: true
+user-invocable: true
 argument-hint: "workflow (required): name of the persona skill to load (e.g. project_manager, sw_dev, book_writer). Optional: --profile <compact|balanced|reasoning> or --model <model_name>"
 agents:
   - uwf-stage-intake

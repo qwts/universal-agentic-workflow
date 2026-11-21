@@ -185,6 +185,12 @@ export const TOOL_DEFINITIONS = [
         id: { type: "integer" },
         ids: { oneOf: [{ type: "string" }, { type: "array", items: { type: "integer" } }] },
         answer: { type: "string" },
+        expected_status: { type: "string", enum: ["pending", "answered", "skipped"] },
+        expected_question_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        reject_required: {
+          type: "boolean",
+          description: "When true on action=skip, reject skipping required questions server-side.",
+        },
         unlock: { type: "boolean" },
       },
     },
@@ -386,7 +392,8 @@ export function createMcpHandler({ allowedRoots = [], stateDir } = {}) {
         }
         case "uaw_question_resolve": {
           const res = await cmdQuestionResolve(args, ctx);
-          return toolResponse(res, { isError: isUnexpectedExit(res) });
+          const isMutation = args?.action === "answer" || args?.action === "skip";
+          return toolResponse(res, { isError: isMutation ? !res.ok : isUnexpectedExit(res) });
         }
         case "uaw_read_state": {
           const { dataDir } = resolveRunTarget({ ...args, ...ctx, requireExisting: true });

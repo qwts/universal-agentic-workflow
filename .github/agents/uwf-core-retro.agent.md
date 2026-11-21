@@ -2,7 +2,7 @@
 name: uwf-core-retro
 description: "Retrospective: workflow + implementation improvements."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Retro Stage

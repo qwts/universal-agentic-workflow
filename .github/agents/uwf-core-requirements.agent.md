@@ -2,7 +2,7 @@
 name: uwf-core-requirements
 description: "Write the requirements pack: PRD + NFRs + acceptance criteria."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Requirements Stage

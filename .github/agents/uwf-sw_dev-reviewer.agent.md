@@ -3,7 +3,7 @@ name: uwf-sw_dev-reviewer
 description: "Dev-archetype quality review. Validates implementation correctness, dependency ordering, coverage completeness, story quality, and test alignment. Requests fixes or hands off to acceptance."
 tools: ["agent", "todo", "search", "read"]
 allowed-commands: ["node .github/skills/uwf-review/reviews.mjs"]
-user-invokable: false
+user-invocable: false
 ---
 # Issues Review Stage
 

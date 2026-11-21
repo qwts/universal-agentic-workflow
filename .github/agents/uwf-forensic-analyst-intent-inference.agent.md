@@ -2,7 +2,7 @@
 name: uwf-forensic-analyst-intent-inference
 description: "Infer requirements and architectural decisions from observed behavior and collected artifacts. Assign preliminary confidence to each entry. Brownfield pre-phase stage 3."
 tools: ["agent", "todo", "search", "edit", "read", "execute"]
-user-invokable: false
+user-invocable: false
 ---
 
 # Intent Inference Stage
