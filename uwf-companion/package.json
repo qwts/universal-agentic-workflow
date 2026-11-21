@@ -1,7 +1,7 @@
 {
   "name": "uwf-companion",
   "displayName": "UWF Companion",
-  "description": "Live data from UWF SQLite skill databases inside VS Code",
+  "description": "Universal Agentic Workflow (UAW) — VS Code companion, MCP runtime provider, and Copilot agents/skills/prompts",
   "version": "0.1.0",
   "publisher": "uwf",
   "repository": {
@@ -16,8 +16,24 @@
   "categories": [
     "Other"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Running the UAW MCP runtime or overriding runtime paths/endpoints is disabled in untrusted workspaces.",
+      "restrictedConfigurations": [
+        "uwf.nodePath",
+        "uwf.mcpServerPath",
+        "uwf.mcpServerUrl",
+        "uwf.stateDir",
+        "uwf.dataDir",
+        "uwf.allowedRoots",
+        "uwf.refreshIntervalMs"
+      ]
+    }
+  },
   "activationEvents": [
-    "workspaceContains:.github/skills"
+    "workspaceContains:.github/skills",
+    "workspaceContains:.uaw-runs"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -55,6 +71,30 @@
         "title": "UWF: Open Issues"
       },
       {
+        "command": "uwf.openQuestions",
+        "title": "UWF: Open Questions"
+      },
+      {
+        "command": "uwf.resolveQuestion",
+        "title": "UWF: Resolve Pending Question"
+      },
+      {
+        "command": "uwf.openCost",
+        "title": "UWF: Open Cost & Token Report"
+      },
+      {
+        "command": "uwf.checkGates",
+        "title": "UWF: Audit Stage Gates"
+      },
+      {
+        "command": "uwf.selectRun",
+        "title": "UWF: Select Active Run / Data Directory"
+      },
+      {
+        "command": "uwf.setRemoteToken",
+        "title": "UWF: Set Remote MCP Auth Token"
+      },
+      {
         "command": "uwf.exportReport",
         "title": "UWF: Export Report (CSV/JSON)"
       },
@@ -80,23 +120,244 @@
         }
       ]
     },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "uwf.uaw-mcp",
+        "label": "Universal Agentic Workflow (UAW)"
+      }
+    ],
+    "chatAgents": [
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-acceptance.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-adr.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-blueprint.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-orchestrator.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-project-tracking.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-refinement.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-requirements.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-retro.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-risk-planner.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-security-plan.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-snapshot.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-technical-writer.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-core-test-planner.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-forensic-analyst-artifact-harvest.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-forensic-analyst-confidence-score.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-forensic-analyst-gap-report.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-forensic-analyst-intent-inference.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-forensic-analyst-repo-audit.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-issue-implementer.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-project_manager-reviewer.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-project_manager-timeline-planner.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-solutions_architect-design-planner.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-solutions_architect-reviewer.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-stage-discovery.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-stage-intake.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-sw_dev-reviewer.agent.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/agents/uwf-sw_dev-work-planner.agent.md"
+      }
+    ],
+    "chatSkills": [
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-adr/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-cbs/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-discovery/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-forensic-analyst/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-local-tracking/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-model-adaptation/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-orchestration-engine/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-project_manager/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-question-protocol/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-refinement/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-requirements/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-review/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-reviewer/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-risk-planner/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-snapshot/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-solutions_architect/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-state-manager/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-sw_dev/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-threat-model/SKILL.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/skills/uwf-traits/SKILL.md"
+      }
+    ],
+    "chatPromptFiles": [
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/prompts/uwf-start-project-planning.prompt.md"
+      }
+    ],
+    "chatInstructions": [
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/instructions/docs-writing.instructions.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/instructions/slides.instructions.md"
+      },
+      {
+        "path": "./dist/uaw-plugin/com.github.copilot/instructions/uwf-core.instructions.md"
+      }
+    ],
     "configuration": {
       "title": "UWF Companion",
       "properties": {
         "uwf.workflowStagesPath": {
           "type": "string",
+          "scope": "window",
           "default": ".github/skills/uwf-sw_dev/stages.yaml",
-          "description": "Relative path to declarative workflow stage config used for dashboard archetype/artifact planning insights."
+          "description": "Legacy setting retained for workspace stage discovery overrides; MCP runtime resolves workflows dynamically."
+        },
+        "uwf.workflow": {
+          "type": "string",
+          "scope": "window",
+          "default": "sw_dev",
+          "description": "Default UAW workflow persona name used for gate audits and cost reporting."
+        },
+        "uwf.dataDir": {
+          "type": "string",
+          "scope": "machine",
+          "default": "",
+          "description": "Explicit UAW run data directory override (absolute or relative to the workspace root)."
+        },
+        "uwf.stateDir": {
+          "type": "string",
+          "scope": "machine",
+          "default": "",
+          "description": "Optional UAW host state registry directory override (defaults to $XDG_STATE_HOME/uaw)."
+        },
+        "uwf.mcpServerPath": {
+          "type": "string",
+          "scope": "machine",
+          "default": "",
+          "description": "Optional path to an external uaw-mcp entrypoint script (defaults to the bundled runtime/bin/uaw-mcp.mjs)."
+        },
+        "uwf.mcpServerUrl": {
+          "type": "string",
+          "scope": "machine",
+          "default": "",
+          "description": "Optional remote Streamable HTTP uaw-mcp/v1 endpoint URL (requires https:// except loopback hosts)."
+        },
+        "uwf.nodePath": {
+          "type": "string",
+          "scope": "machine",
+          "default": "",
+          "description": "Optional path to a Node.js (>= 22.13.0) executable used when spawning the stdio uaw-mcp server."
+        },
+        "uwf.allowedRoots": {
+          "type": "array",
+          "scope": "machine",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Optional allowed workspace/data root paths passed to --allowed-roots when spawning the stdio uaw-mcp server."
+        },
+        "uwf.refreshIntervalMs": {
+          "type": "number",
+          "scope": "machine",
+          "default": 0,
+          "description": "Optional polling interval in milliseconds for refreshing views (useful with remote HTTP MCP endpoints; 0 disables polling)."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "node esbuild.mjs --production",
-    "build": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "stage:bundle": "node scripts/stage-bundle.mjs",
+    "build": "node esbuild.mjs && node scripts/stage-bundle.mjs && node scripts/stage-bundle.mjs --check-manifest",
+    "vscode:prepublish": "node esbuild.mjs --production && node scripts/stage-bundle.mjs && node scripts/stage-bundle.mjs --check-manifest",
     "watch": "node esbuild.mjs --watch",
     "package": "vsce package",
-    "test": "npm run build && node --test"
+    "test": "npm run typecheck && npm run build && node --test test/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.5.0",

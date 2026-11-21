@@ -1,111 +1,63 @@
-# UWF Companion — VS Code Extension
+# UWF Companion — VS Code Extension & Copilot Plugin Host
 
-Live data from [Universal Agent Workflow](../) SQLite skill databases, surfaced directly inside VS Code.
+Live workflow visibility, question resolution, cost reporting, gate auditing, and formal VS Code AI plugin integration for [Universal Agentic Workflow (UAW)](../), backed exclusively by the `uaw-mcp/v1` Model Context Protocol runtime ([ADR-0008](../docs/adr/ADR-0008-multi-surface-mcp-plugin-runtime-contract.md), [ADR-0010](../docs/adr/ADR-0010-universal-runtime-packaging-and-plugin-distribution.md)).
 
-## Features
+## Architecture Highlights (Phase 2)
+
+- **Zero direct SQLite reads in UI code:** All panels, Activity Bar tree items, status bar updates, and CSV/JSON exports query the canonical `uaw-mcp/v1` server (`uaw_read_*`, `uaw_gates`, `uaw_cost`, `uaw_question_resolve`), inheriting strict read-only `query_only` DB opens and secret redaction via `redactSecrets()`.
+- **VS Code MCP Server Definition Provider:** Registers `uwf.uaw-mcp` via `vscode.lm.registerMcpServerDefinitionProvider`, exposing either the bundled self-contained `dist/uaw-plugin/runtime/bin/uaw-mcp.mjs` (`stdio`) or an authenticated remote HTTPS/loopback Streamable HTTP endpoint (`uwf.mcpServerUrl` + bearer token stored in VS Code `SecretStorage`).
+- **Native VS Code AI Contribution Points:** Stages the cross-client plugin bundle at build time via `scripts/stage-bundle.mjs` (powered by `../scripts/pack-plugin.mjs`) into `dist/uaw-plugin/` and declares:
+  - `contributes.mcpServerDefinitionProviders`
+  - `contributes.chatAgents`
+  - `contributes.chatSkills`
+  - `contributes.chatPromptFiles`
+  - `contributes.chatInstructions`
+
+## Commands
 
 | Command | Description |
 |---|---|
-| `UWF: Open Workflow Dashboard` | Multi-panel workflow insight view (state, stages, planned artifacts, issues, requirements, discoveries) with per-section interactive drill-down buttons |
-| `UWF: Open Workflow State` | Current workflow phase/status/agent and phase history timeline |
-| `UWF: Open Stages` | Webview table of all workflow stages and their status |
-| `UWF: Open Issues` | Webview table of all issues with milestone/sprint/status |
+| `UWF: Select Active Run / Data Directory` | Switch between registered `run_id`s, `.uaw-runs/*`, legacy `.github/skills/`, or a custom folder |
+| `UWF: Open Workflow Dashboard` | Multi-panel workflow summary (state, issues, executed stages, `uaw_gates` artifacts) |
+| `UWF: Open Workflow State` | Current workflow phase/status/agent/model profile and phase history timeline |
+| `UWF: Open Stages` | Table of stage runs, retries, and gate verdicts |
+| `UWF: Open Issues` | Backlog issues table |
 | `UWF: Open Requirements` | Requirements viewer (FR/NFR/AC) |
 | `UWF: Open ADRs` | Architecture Decision Records |
 | `UWF: Open Discoveries` | Discovery findings and open gaps |
-| `UWF: Open Review Findings` | Quality/security review results |
-| `UWF: Export Report (CSV/JSON)` | Export a snapshot of all databases to `tmp/reports/` |
-| `UWF: Refresh All` | Manually refresh the sidebar tree and panels |
+| `UWF: Open Review Findings` | Review verdicts and findings |
+| `UWF: Open Questions` | Question protocol status table with resolution shortcut |
+| `UWF: Resolve Pending Question` | Answer or skip exit-`3` pending questions via `uaw_question_resolve` |
+| `UWF: Open Cost & Token Report` | Per-stage token usage, cost, and `!50K`/`!100K`/`!MISS` flags via `uaw_cost` |
+| `UWF: Audit Stage Gates` | Declarative gate check prescriptions via `uaw_gates` |
+| `UWF: Set Remote MCP Auth Token` | Store or clear the remote HTTP MCP bearer token in VS Code `SecretStorage` |
+| `UWF: Export Report (CSV/JSON)` | Export MCP-redacted snapshot to `tmp/reports/` |
+| `UWF: Refresh All` | Manually refresh Activity Bar tree, status bar, and open webviews |
 
-The Activity Bar sidebar ("UWF Companion") shows live workflow state, archetype count, planned artifact count, open issues, and active stages. The dashboard provides a multi-panel summary with each section having an **Open interactive view ↗** action for deeper inspection. All panels auto-refresh within **300 ms** of any database write.
+## Settings
 
-### Declarative configuration
-
-The dashboard reads workflow archetype/stage/artifact expectations from declarative stage configs (`stages.yaml`) under `.github/skills/...`.
+- `uwf.workflow` (default `"sw_dev"`): Default workflow name for gate audits and cost reporting.
+- `uwf.dataDir`: Explicit UAW data directory override.
+- `uwf.stateDir`: Optional host UAW state registry directory override (`UAW_STATE_DIR`).
+- `uwf.mcpServerPath`: Optional custom `uaw-mcp` script path (defaults to bundled `dist/uaw-plugin/runtime/bin/uaw-mcp.mjs`).
+- `uwf.mcpServerUrl`: Optional remote Streamable HTTP MCP URL (`https://` required except loopback hosts).
+- `uwf.nodePath`: Optional Node.js >= 22.13.0 executable path for spawning `stdio` `uaw-mcp`.
+- `uwf.allowedRoots`: Optional `--allowed-roots` list passed to the `stdio` `uaw-mcp` server.
+- `uwf.refreshIntervalMs`: Optional polling interval (ms) for remote HTTP endpoints (`0` disables polling).
 
 ## Requirements
 
 - VS Code 1.101+
-- A workspace with `.github/skills/` containing UWF skill databases
-- Node.js 22.13+ (for building and testing from source)
+- Node.js >= 22.13.0
 
-The minimum runtime ensures that the extension and its tests can use the
-unflagged `node:sqlite` API. Standalone UWF skill scripts outside this directory
-continue to support Node.js 20+.
-
-## Building from Source
+## Building, Staging & Testing
 
 ```bash
+# Install root runtime dependencies first (required by stage-bundle / pack-plugin)
+npm ci --omit=dev
+
 cd uwf-companion
 npm ci
-npm test               # builds and runs the complete Node test suite
-npm run package        # produces uwf-companion-0.1.0.vsix
+npm test               # typecheck + esbuild + stage:bundle + manifest check + real-module MCP tests
+npm run package        # produces uwf-companion-0.1.0.vsix with bundled runtime + AI contributions
 ```
-
-## Running in Development
-
-1. Open `uwf-companion/` in VS Code (or the parent workspace).
-2. Press **F5** — a new Extension Development Host window opens.
-3. Open any UWF workspace; the extension activates automatically when `.github/skills/` is detected.
-
-## Packaging a VSIX
-
-```bash
-npm run package        # produces uwf-companion-0.1.0.vsix
-```
-
-Install the VSIX:
-
-```bash
-code --install-extension uwf-companion-0.1.0.vsix
-```
-
-## Architecture
-
-```
-src/
-  extension.ts                 — activation, command & watcher wiring, status bar state
-  config/
-    StageConfigLoader.ts       — declarative stage/archetype + expected artifact parser
-  watchers/DbWatcher.ts        — fs.watch on each skill dir, 300ms debounce
-  providers/
-    WorkflowTreeProvider.ts    — Activity Bar sidebar (live state + counts + archetypes)
-    DashboardPanel.ts          — Webview: primary multi-panel workflow dashboard
-    WorkflowInsights.ts        — live DB + declarative config aggregation
-    WorkflowStatePanel.ts      — Webview: workflow state and phase history
-    WorkflowDashboardPanel.ts  — Alternative dashboard with interactive per-section drill-down
-    WorkflowSectionPanel.ts    — Interactive drill-down webview opened per dashboard section
-    StagesPanel.ts             — Webview: stage status table
-    IssuesPanel.ts             — Webview: issues backlog table
-    RequirementsPanel.ts       — Webview: requirements
-    ReviewPanel.ts             — Webview: review findings
-    AdrPanel.ts                — Webview: ADRs
-    DiscoveryPanel.ts          — Webview: discoveries
-    PanelRegistry.ts           — Broadcasts DB-change events to all open panels
-    webviewUtils.ts            — HTML escaping, badge helpers, page shell
-  reporter/
-    ReportBuilder.ts           — CSV/JSON export of all DB snapshots
-    InterviewerBridge.ts       — Future: launch uwf-interviewer agent
-  services/
-    WorkflowInsightsService.ts  — Aggregates DB + declarative stages.yaml insights
-  db/readers/
-    BaseReader.ts              — Read-only node:sqlite wrapper base class
-    IssuesReader.ts            — uwf-issues.db
-    AdrReader.ts               — uwf-adrs.db
-    DiscoveryReader.ts         — uwf-discoveries.db
-    RequirementsReader.ts      — uwf-requirements.db
-    ReviewReader.ts            — uwf-reviews.db
-    QuestionsReader.ts         — uwf-questions.db
-    StageReader.ts             — uwf-stages.db
-    WorkflowStateReader.ts     — uwf-state.db
-```
-
-**Security note:** All webview content is HTML-escaped via `webviewUtils.escHtml`. The extension never writes to any database; all mutations must go through the skill CLI scripts (`*.mjs`).
-
-## Running Tests
-
-```bash
-npm test
-```
-
-Tests use Node's built-in `node:test` runner with `node:sqlite` directly — no VS Code host required, and include declarative stage-config integrity checks against staged workflow data.
