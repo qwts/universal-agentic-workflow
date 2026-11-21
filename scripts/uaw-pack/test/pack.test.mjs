@@ -10,6 +10,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import {
+  copyFileSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -19,6 +21,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -428,6 +431,85 @@ test("scripts/pack-plugin.mjs emits compliant standalone bundle and read-only --
     const checkTampered = runNode(PACK_SCRIPT, ["--check", "--out", bundleDir]);
     assert.equal(checkTampered.code, 1);
     assert.match(checkTampered.stderr, /disallowed top-level key/);
+
+    // Published npm tarball includes scripts/pack-plugin.mjs and runs from a hoisted install
+    assert.ok(ROOT_PKG.files.includes("scripts/pack-plugin.mjs"));
+    assert.ok(ROOT_PKG.files.includes("schemas/"));
+    const packDryJson = JSON.parse(
+      execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: REPO_ROOT, encoding: "utf8" }),
+    );
+    const packMeta = Array.isArray(packDryJson)
+      ? packDryJson[0]
+      : (packDryJson?.[ROOT_PKG.name] ?? Object.values(packDryJson ?? {})[0]);
+    const tarballPaths = (packMeta?.files ?? []).map((f) => f.path);
+    assert.ok(tarballPaths.includes("scripts/pack-plugin.mjs"), "npm pack tarball must include scripts/pack-plugin.mjs");
+    for (const relPath of tarballPaths) {
+      assert.equal(
+        /\.(?:db|db-wal|db-shm|db-journal|sqlite|sqlite3)$/.test(relPath),
+        false,
+        `DB file forbidden in npm tarball: ${relPath}`,
+      );
+      assert.equal(relPath.endsWith(".node"), false, `.node binary forbidden in npm tarball: ${relPath}`);
+      assert.equal(
+        /(?:^|\/)better-sqlite3(?:\/|$)/.test(relPath),
+        false,
+        `better-sqlite3 forbidden in npm tarball: ${relPath}`,
+      );
+      assert.equal(/\/test\//.test(relPath), false, `test/ dir forbidden in npm tarball: ${relPath}`);
+    }
+
+    const installedRoot = join(scratch, "installed");
+    const installedPkgDir = join(installedRoot, "node_modules", ...ROOT_PKG.name.split("/"));
+    for (const relPath of tarballPaths) {
+      const destFile = join(installedPkgDir, relPath);
+      mkdirSync(dirname(destFile), { recursive: true });
+      copyFileSync(join(REPO_ROOT, relPath), destFile);
+    }
+    const copiedDeps = new Set();
+    const depQueue = Object.keys(ROOT_PKG.dependencies ?? {});
+    while (depQueue.length > 0) {
+      const dep = depQueue.shift();
+      if (copiedDeps.has(dep)) continue;
+      copiedDeps.add(dep);
+      const srcDep = join(REPO_ROOT, "node_modules", ...dep.split("/"));
+      cpSync(srcDep, join(installedRoot, "node_modules", ...dep.split("/")), { recursive: true });
+      const depPkgPath = join(srcDep, "package.json");
+      if (existsSync(depPkgPath)) {
+        const depPkg = JSON.parse(readFileSync(depPkgPath, "utf8"));
+        depQueue.push(...Object.keys(depPkg.dependencies ?? {}));
+      }
+    }
+    const installedBundleDir = join(scratch, "installed-bundle");
+    const installedPack = runNode(
+      join(installedPkgDir, "scripts", "pack-plugin.mjs"),
+      ["--out", installedBundleDir],
+      { cwd: neutralCwd, env: cleanEnv },
+    );
+    assert.equal(installedPack.code, 0, installedPack.stderr || installedPack.stdout);
+    assert.equal(JSON.parse(installedPack.stdout).ok, true);
+
+    // Security: non-node_modules checkout must refuse ancestor node_modules
+    const checkoutDir = join(scratch, "checkout");
+    const checkoutRepo = join(checkoutDir, "repo");
+    cpSync(installedPkgDir, checkoutRepo, { recursive: true });
+    cpSync(join(installedRoot, "node_modules"), join(checkoutDir, "node_modules"), {
+      recursive: true,
+    });
+    const ancestorRefused = runNode(join(checkoutRepo, "scripts", "pack-plugin.mjs"), ["--check"], {
+      cwd: neutralCwd,
+      env: cleanEnv,
+    });
+    assert.equal(ancestorRefused.code, 1);
+    assert.match(ancestorRefused.stderr, /Root node_modules not found/);
+
+    // Security: symlinked node_modules fails closed
+    symlinkSync(join(installedRoot, "node_modules"), join(installedPkgDir, "node_modules"));
+    const symlinkRefused = runNode(join(installedPkgDir, "scripts", "pack-plugin.mjs"), ["--check"], {
+      cwd: neutralCwd,
+      env: cleanEnv,
+    });
+    assert.equal(symlinkRefused.code, 1);
+    assert.match(symlinkRefused.stderr, /Symlink/);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -500,38 +582,99 @@ test("Dockerfile and action.yml satisfy security and runtime invariants", () => 
   writeFileSync(ghOutput, "", "utf8");
 
   try {
-    const overrides = { command: "resume", dry_run: "true" };
-    const stepEnv = {
-      ...process.env,
-      GITHUB_ACTION_PATH: REPO_ROOT,
-      GITHUB_WORKSPACE: neutralDir,
-      GITHUB_OUTPUT: ghOutput,
-      RUNNER_TEMP: scratch,
+    const runActionStep = (overrides = {}) => {
+      writeFileSync(ghOutput, "", "utf8");
+      const stepEnv = {
+        ...process.env,
+        GITHUB_ACTION_PATH: REPO_ROOT,
+        GITHUB_WORKSPACE: neutralDir,
+        GITHUB_OUTPUT: ghOutput,
+        RUNNER_TEMP: scratch,
+      };
+      for (const [k, rawVal] of Object.entries(uawStep.env ?? {})) {
+        stepEnv[k] = String(rawVal)
+          .replace(/\$\{\{\s*inputs\.([A-Za-z0-9_]+)\s*\}\}/g, (_, name) =>
+            overrides[name] ?? String(actionYaml.inputs?.[name]?.default ?? ""),
+          )
+          .replace(/\$\{\{\s*github\.action_path\s*\}\}/g, REPO_ROOT)
+          .replace(/\$\{\{\s*github\.workspace\s*\}\}/g, neutralDir)
+          .replace(/\$\{\{\s*runner\.temp\s*\}\}/g, scratch);
+      }
+      try {
+        const stdout = execFileSync("bash", ["-euo", "pipefail", "-c", uawStep.run], {
+          cwd: neutralDir,
+          env: stepEnv,
+          encoding: "utf8",
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        return { code: 0, stdout, stderr: "", outText: readFileSync(ghOutput, "utf8") };
+      } catch (err) {
+        return {
+          code: err.status ?? 1,
+          stdout: err.stdout?.toString() ?? "",
+          stderr: err.stderr?.toString() ?? "",
+          outText: readFileSync(ghOutput, "utf8"),
+        };
+      }
     };
-    for (const [k, rawVal] of Object.entries(uawStep.env ?? {})) {
-      stepEnv[k] = String(rawVal)
-        .replace(/\$\{\{\s*inputs\.([A-Za-z0-9_]+)\s*\}\}/g, (_, name) =>
-          overrides[name] ?? String(actionYaml.inputs?.[name]?.default ?? ""),
-        )
-        .replace(/\$\{\{\s*github\.action_path\s*\}\}/g, REPO_ROOT)
-        .replace(/\$\{\{\s*github\.workspace\s*\}\}/g, neutralDir)
-        .replace(/\$\{\{\s*runner\.temp\s*\}\}/g, scratch);
-    }
 
-    let bashExit = 0;
-    try {
-      execFileSync("bash", ["-euo", "pipefail", "-c", uawStep.run], {
-        cwd: neutralDir,
-        env: stepEnv,
-        encoding: "utf8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err) {
-      bashExit = err.status ?? 1;
-    }
-    assert.equal(bashExit, 2);
-    const outText = readFileSync(ghOutput, "utf8");
-    assert.match(outText, /^exit_code=2$/m);
+    const resumeDry = runActionStep({ command: "resume", dry_run: "true" });
+    assert.equal(resumeDry.code, 2);
+    assert.match(resumeDry.outText, /^exit_code=2$/m);
+
+    const gatesWithOutputPath = runActionStep({ command: "gates", output_path: "custom-artifacts" });
+    assert.equal(gatesWithOutputPath.code, 2);
+    assert.match(gatesWithOutputPath.outText, /^exit_code=2$/m);
+
+    // command=cost accepts output_path and forwards --output-path to reconstruct stage prompt sizes
+    const costDataDir = join(scratch, "cost-data");
+    mkdirSync(join(costDataDir, "transcripts"), { recursive: true });
+    writeFileSync(
+      join(costDataDir, "transcripts", "0001-discovery.json"),
+      JSON.stringify({
+        stage: "discovery",
+        stdout: JSON.stringify({
+          num_turns: 1,
+          total_cost_usd: 0.01,
+          usage: {
+            input_tokens: 100,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            output_tokens: 50,
+          },
+        }),
+      }),
+      "utf8",
+    );
+    const customOutDir = join(neutralDir, "custom-artifacts");
+    mkdirSync(customOutDir, { recursive: true });
+    writeFileSync(
+      join(customOutDir, "issues-intake.md"),
+      Array.from({ length: 12 }, (_, i) => `Line ${i + 1}: ${"x".repeat(160)}`).join("\n") + "\n",
+      "utf8",
+    );
+
+    const costDefault = runActionStep({ command: "cost", workflow: "sw_dev", data_dir: costDataDir });
+    assert.equal(costDefault.code, 0, costDefault.stderr || costDefault.stdout);
+    assert.match(costDefault.outText, /^exit_code=0$/m);
+
+    const costWithOutputPath = runActionStep({
+      command: "cost",
+      workflow: "sw_dev",
+      data_dir: costDataDir,
+      output_path: "custom-artifacts",
+    });
+    assert.equal(costWithOutputPath.code, 0, costWithOutputPath.stderr || costWithOutputPath.stdout);
+    assert.match(costWithOutputPath.outText, /^exit_code=0$/m);
+
+    const matchDefault = costDefault.stdout.match(/^discovery\b.*?\s(\d+)\/~\d+\b/m);
+    const matchCustom = costWithOutputPath.stdout.match(/^discovery\b.*?\s(\d+)\/~\d+\b/m);
+    assert.ok(matchDefault, `Expected discovery prompt column in default cost output:\n${costDefault.stdout}`);
+    assert.ok(matchCustom, `Expected discovery prompt column in custom output_path cost output:\n${costWithOutputPath.stdout}`);
+    assert.ok(
+      Number(matchCustom[1]) > Number(matchDefault[1]) + 1000,
+      `Expected custom output_path prompt chars (${matchCustom[1]}) > default (${matchDefault[1]}) + 1000`,
+    );
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

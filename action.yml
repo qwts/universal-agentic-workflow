@@ -210,7 +210,7 @@ runs:
         elif [ "$INPUT_COMMAND" = "gates" ] || [ "$INPUT_COMMAND" = "cost" ]; then
           if [ -n "$INPUT_GOAL" ]; then fail_usage "'goal' is not valid with command=${INPUT_COMMAND}"; fi
           if [ -n "$INPUT_FROM_STAGE" ]; then fail_usage "'from_stage' is not valid with command=${INPUT_COMMAND}"; fi
-          if [ -n "$INPUT_OUTPUT_PATH" ]; then fail_usage "'output_path' is not valid with command=${INPUT_COMMAND}"; fi
+          if [ "$INPUT_COMMAND" = "gates" ] && [ -n "$INPUT_OUTPUT_PATH" ]; then fail_usage "'output_path' is not valid with command=gates"; fi
           if [ -n "$INPUT_MAX_COST_USD" ]; then fail_usage "'max_cost_usd' is not valid with command=${INPUT_COMMAND}"; fi
           if [ -n "$INPUT_TIMEOUT_MS" ]; then fail_usage "'timeout_ms' is not valid with command=${INPUT_COMMAND}"; fi
           if [ "$INPUT_DRY_RUN" = "true" ]; then fail_usage "'dry_run' is not valid with command=${INPUT_COMMAND}"; fi
@@ -232,7 +232,6 @@ runs:
         if [ "$INPUT_COMMAND" = "run" ] || [ "$INPUT_COMMAND" = "resume" ]; then
           if [ -n "$INPUT_ADAPTER" ]; then args+=("--adapter" "$INPUT_ADAPTER"); fi
           if [ -n "$INPUT_MODEL" ]; then args+=("--model" "$INPUT_MODEL"); fi
-          if [ -n "$INPUT_OUTPUT_PATH" ]; then args+=("--output-path" "$INPUT_OUTPUT_PATH"); fi
           if [ -n "$INPUT_MAX_COST_USD" ]; then args+=("--max-cost-usd" "$INPUT_MAX_COST_USD"); fi
           if [ -n "$INPUT_TIMEOUT_MS" ]; then args+=("--timeout-ms" "$INPUT_TIMEOUT_MS"); fi
           if [ "$INPUT_NON_INTERACTIVE" = "true" ]; then args+=("--non-interactive"); fi
@@ -244,6 +243,7 @@ runs:
           if [ "$INPUT_FORCE" = "true" ]; then args+=("--force"); fi
         fi
         if [ "$INPUT_COMMAND" != "gates" ]; then
+          if [ -n "$INPUT_OUTPUT_PATH" ]; then args+=("--output-path" "$INPUT_OUTPUT_PATH"); fi
           args+=("--data-dir" "$resolved_data_dir")
         fi
 

@@ -288,46 +288,107 @@ function validatePackageName(dep) {
   }
 }
 
-function collectRuntimeDeps(rootPkg) {
-  const rootNm = join(REPO_ROOT, "node_modules");
-  if (!existsSync(rootNm) || !lstatSync(rootNm).isDirectory()) {
+function getAllowedNodeModulesRoots() {
+  const ownNm = join(REPO_ROOT, "node_modules");
+  const parentDir = dirname(REPO_ROOT);
+  const parentName = basename(parentDir);
+
+  let enclosingNm = null;
+  if (parentName === "node_modules") {
+    enclosingNm = parentDir;
+  } else if (parentName.startsWith("@") && basename(dirname(parentDir)) === "node_modules") {
+    assertNotSymlink(parentDir);
+    enclosingNm = dirname(parentDir);
+  }
+
+  const roots = [];
+  const ownSt = lstatOrNull(ownNm);
+  if (ownSt) {
+    assertNotSymlink(ownNm);
+    if (!ownSt.isDirectory()) {
+      throw new ValidationError(`Expected directory at ${ownNm}`);
+    }
+    roots.push(ownNm);
+  }
+
+  if (enclosingNm) {
+    assertNotSymlink(REPO_ROOT);
+    const encSt = assertNotSymlink(enclosingNm);
+    if (!encSt.isDirectory()) {
+      throw new ValidationError(`Expected directory at ${enclosingNm}`);
+    }
+    roots.push(enclosingNm);
+  } else if (roots.length === 0) {
     throw new ValidationError(
-      `Root node_modules not found at ${rootNm}; run "npm ci" at repository root first.`,
+      `Root node_modules not found at ${ownNm}; run "npm ci" at repository root first.`,
     );
   }
-  const visited = new Set();
-  const queue = Object.keys(rootPkg.dependencies ?? {});
+
+  return roots;
+}
+
+function resolveRuntimeDepDir(dep, allowedNmRoots, minRootIdx) {
+  const segs = dep.split("/");
+  for (let i = minRootIdx; i < allowedNmRoots.length; i += 1) {
+    const nmDir = allowedNmRoots[i];
+    if (segs.length === 2) {
+      const scopeDir = join(nmDir, segs[0]);
+      if (lstatOrNull(scopeDir)) {
+        assertNotSymlink(scopeDir);
+      }
+    }
+    const depDir = join(nmDir, ...segs);
+    if (lstatOrNull(depDir)) {
+      const depSt = assertNotSymlink(depDir);
+      if (!depSt.isDirectory()) {
+        throw new ValidationError(`Expected dependency directory at ${depDir}`);
+      }
+      return { depDir, rootIdx: i };
+    }
+  }
+  const searched = allowedNmRoots.slice(minRootIdx).join(", ");
+  throw new ValidationError(`Missing dependency "${dep}" in ${searched}; run "npm ci" first.`);
+}
+
+function collectRuntimeDeps(rootPkg) {
+  const allowedNmRoots = getAllowedNodeModulesRoots();
+  const resolved = new Map();
+  const queue = Object.keys(rootPkg.dependencies ?? {}).map((dep) => ({ dep, minRootIdx: 0 }));
   while (queue.length > 0) {
-    const dep = queue.shift();
-    if (visited.has(dep)) continue;
+    const { dep, minRootIdx } = queue.shift();
     validatePackageName(dep);
     if (dep === "better-sqlite3") {
       throw new ValidationError(`Forbidden native dependency "${dep}" in root dependencies`);
     }
-    const depDir = join(rootNm, ...dep.split("/"));
-    if (!existsSync(depDir)) {
-      throw new ValidationError(`Missing dependency "${dep}" in ${rootNm}; run "npm ci" first.`);
+    const { depDir, rootIdx } = resolveRuntimeDepDir(dep, allowedNmRoots, minRootIdx);
+    const existing = resolved.get(dep);
+    if (existing !== undefined) {
+      if (existing !== depDir) {
+        throw new ValidationError(
+          `Conflicting dependency resolutions for "${dep}": ${existing} vs ${depDir}`,
+        );
+      }
+      continue;
     }
-    assertNotSymlink(depDir);
     const nestedNm = join(depDir, "node_modules");
-    if (existsSync(nestedNm)) {
+    if (lstatOrNull(nestedNm)) {
       assertNotSymlink(nestedNm);
       throw new ValidationError(
         `Nested node_modules found inside "${dep}" at ${nestedNm}; hoist dependencies at root before packing.`,
       );
     }
-    visited.add(dep);
+    resolved.set(dep, depDir);
     const depPkgPath = join(depDir, "package.json");
-    if (existsSync(depPkgPath)) {
+    if (lstatOrNull(depPkgPath)) {
       assertNotSymlink(depPkgPath);
       const depPkg = JSON.parse(readFileSync(depPkgPath, "utf8"));
       for (const childDep of Object.keys(depPkg.dependencies ?? {})) {
         validatePackageName(childDep);
-        if (!visited.has(childDep)) queue.push(childDep);
+        queue.push({ dep: childDep, minRootIdx: rootIdx });
       }
     }
   }
-  return [...visited].sort();
+  return [...resolved.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
 
 function writeJson(filePath, data) {
@@ -746,9 +807,8 @@ export function buildPluginBundle({ outDir, version, marketplaceOut } = {}) {
     );
     copyTreeSafe(join(REPO_ROOT, ".github", "agents"), join(runtimeDir, ".github", "agents"));
 
-    for (const dep of deps) {
+    for (const [dep, srcDepDir] of deps) {
       const depSegments = dep.split("/");
-      const srcDepDir = join(REPO_ROOT, "node_modules", ...depSegments);
       copyTreeSafe(srcDepDir, join(stagingDir, "node_modules", ...depSegments));
       copyTreeSafe(srcDepDir, join(runtimeDir, "node_modules", ...depSegments));
     }

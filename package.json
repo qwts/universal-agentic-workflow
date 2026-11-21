@@ -22,6 +22,7 @@
     "scripts/uaw-mcp/",
     "!scripts/uaw-mcp/test/**",
     "scripts/hooks/",
+    "scripts/pack-plugin.mjs",
     "schemas/",
     ".github/skills/",
     "!.github/skills/**/*.db*",
