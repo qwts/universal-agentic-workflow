@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { createRequire } from "node:module";
+import { DatabaseSync } from "node:sqlite";
 import { transcriptRow } from "../cost.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -578,10 +578,8 @@ const rejectedPhaseLines = (err) => err.split("\n").filter((l) => /phase .*not a
   const o = setup();
   try {
     // A DB created before session_id existed must still open, read, and accept --session-id.
-    const req = createRequire(join(SKILLS, "uwf-orchestration-engine", "stage-tracker.mjs"));
-    const Database = req("better-sqlite3");
     mkdirSync(o.data, { recursive: true });
-    const db = new Database(join(o.data, "uwf-stages.db"));
+    const db = new DatabaseSync(join(o.data, "uwf-stages.db"));
     db.exec(`CREATE TABLE stage_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL, stage TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0, run_as_subagent INTEGER NOT NULL DEFAULT 1,
       started_at TEXT, completed_at TEXT, gate_result TEXT, notes TEXT)`);

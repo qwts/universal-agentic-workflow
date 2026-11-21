@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
-import { createRequire } from "node:module";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1792,10 +1792,9 @@ setTimeout(() => {}, 30000);
       output_path: stageOut,
       repo_root: regWs.repoRoot,
     });
-    const Database = createRequire(join(REPO_ROOT, ".github", "skills", "uwf-question-protocol", "package.json"))("better-sqlite3");
     const emptyQDbPath = join(roQData, "uwf-questions.db");
     {
-      const qdb = new Database(emptyQDbPath);
+      const qdb = new DatabaseSync(emptyQDbPath);
       qdb.close();
     }
     const roQHold = claimDataDirLock({ dataDir: roQData, runId: "active-runner", stateDir: regWs.stateDir });
@@ -1827,7 +1826,7 @@ setTimeout(() => {}, 30000);
       }
 
       assert.equal(existsSync(`${emptyQDbPath}-wal`), false, "read-only question list/check must not create WAL sidecar");
-      const verifyDb = new Database(emptyQDbPath, { readonly: true });
+      const verifyDb = new DatabaseSync(emptyQDbPath, { readOnly: true });
       try {
         const tbls = verifyDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
         assert.deepEqual(tbls, [], "read-only question list/check must not create tables");
@@ -2254,7 +2253,7 @@ setTimeout(() => {}, 30000);
     mkdirSync(directRunnerData, { recursive: true });
     mkdirSync(expectedDirectOut, { recursive: true });
     {
-      const phDb = new Database(join(directRunnerData, "uwf-state.db"));
+      const phDb = new DatabaseSync(join(directRunnerData, "uwf-state.db"));
       phDb.exec("CREATE TABLE workflow_state (id INTEGER PRIMARY KEY, phase TEXT, mode TEXT, status TEXT, current_agent TEXT, artifact_path TEXT, ready_for_implementation INTEGER);");
       phDb.exec("INSERT INTO workflow_state (id, phase, status, artifact_path, ready_for_implementation) VALUES (1, 'idea', 'idle', './tmp/workflow-artifacts', 0);");
       phDb.close();

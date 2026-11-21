@@ -118,9 +118,9 @@ try {
   assert.throws(() => checkArchive(join(tmp, "evil.tar"), t2), /unsafe path/);
   assert.equal(readFileSync(join(t2, "tmp", "workflow-artifacts", "req.md"), "utf8"), "req\n");
 
-  // end to end with the real question CLI when its dependencies are installed
+  // end to end with the real question CLI
   const CLI = resolve(dirname(fileURLToPath(import.meta.url)), "../../../.github/skills/uwf-question-protocol/questions.mjs");
-  if (existsSync(join(dirname(CLI), "node_modules", "better-sqlite3"))) {
+  {
     const d = join(tmp, "qdata");
     mkdirSync(d);
     assert.ok(runQuestions(CLI, d, ["log", "--stage", "requirements", "--question", "DB?", "--proposed", "sqlite", "--required", "true"]).ok);
@@ -138,8 +138,6 @@ try {
     // the runner's own gate: check passes while only an optional question is pending
     const chk = runQuestions(CLI, d, ["check", "--stage", "requirements"]);
     assert.ok(chk.ok, "questions.mjs check ignores optional pending questions");
-  } else {
-    console.log("answer tests: question-protocol dependencies not installed; skipped the real-CLI part");
   }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
