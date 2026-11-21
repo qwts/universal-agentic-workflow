@@ -3,6 +3,7 @@ import * as readline from "node:readline";
 import { ResolvedServerConfig } from "./McpServerConfig";
 
 const MCP_PROTOCOL_VERSION = "2025-03-26";
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
 const MAX_STDERR_BYTES = 8192;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_HTTP_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -169,6 +170,7 @@ export class UawMcpClient {
   private initialized = false;
   private initPromise: Promise<void> | null = null;
   private httpSessionId: string | null = null;
+  private negotiatedProtocolVersion: string | null = null;
   private activeControllers = new Set<AbortController>();
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
@@ -432,6 +434,9 @@ export class UawMcpClient {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     };
+    if (method !== "initialize" && this.negotiatedProtocolVersion) {
+      headers["MCP-Protocol-Version"] = this.negotiatedProtocolVersion;
+    }
     if (this.config.authToken) {
       headers.Authorization = `Bearer ${this.config.authToken}`;
     }
@@ -462,6 +467,7 @@ export class UawMcpClient {
       if (resp.status === 404 && this.httpSessionId) {
         this.httpSessionId = null;
         this.initialized = false;
+        this.negotiatedProtocolVersion = null;
       }
 
       if (id === undefined) {
@@ -564,7 +570,7 @@ export class UawMcpClient {
     this.initPromise = (async () => {
       try {
         const initId = this.nextId++;
-        await this.sendRaw(
+        const initRes = (await this.sendRaw(
           "initialize",
           {
             protocolVersion: MCP_PROTOCOL_VERSION,
@@ -575,7 +581,22 @@ export class UawMcpClient {
             },
           },
           initId,
-        );
+        )) as { protocolVersion?: unknown } | null | undefined;
+
+        const serverVersion = initRes?.protocolVersion;
+        if (serverVersion !== undefined && serverVersion !== null) {
+          if (typeof serverVersion !== "string") {
+            throw new McpToolError("Invalid MCP protocolVersion from server");
+          }
+          const trimmedVer = serverVersion.trim();
+          if (!SUPPORTED_MCP_PROTOCOL_VERSIONS.has(trimmedVer) || /[\r\n]/.test(trimmedVer)) {
+            throw new McpToolError(`Unsupported MCP protocolVersion from server: "${trimmedVer}"`);
+          }
+          this.negotiatedProtocolVersion = trimmedVer;
+        } else {
+          this.negotiatedProtocolVersion = MCP_PROTOCOL_VERSION;
+        }
+
         await this.sendRaw("notifications/initialized", {});
         this.initialized = true;
       } finally {
@@ -658,6 +679,8 @@ export class UawMcpClient {
       this.disposed = true;
       this.initialized = false;
       this.initPromise = null;
+      const protoVer = this.negotiatedProtocolVersion;
+      this.negotiatedProtocolVersion = null;
       for (const ctrl of this.activeControllers) {
         try {
           ctrl.abort();
@@ -681,6 +704,9 @@ export class UawMcpClient {
         const sid = this.httpSessionId;
         this.httpSessionId = null;
         const headers: Record<string, string> = { "Mcp-Session-Id": sid };
+        if (protoVer) {
+          headers["MCP-Protocol-Version"] = protoVer;
+        }
         if (this.config.authToken) {
           headers.Authorization = `Bearer ${this.config.authToken}`;
         }

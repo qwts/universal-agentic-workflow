@@ -6,11 +6,11 @@ export function formatJsonReport(snapshot: object): string {
 }
 
 /**
- * Neutralize spreadsheet formula triggers (`=`, `+`, `-`, `@`, `\t`, `\r`, or whitespace-prefixed formulas)
+ * Neutralize spreadsheet formula triggers (`=`, `+`, `-`, `@`, `\t`, `\r`, `\n`, or whitespace-prefixed formulas)
  * and escape quotes per RFC 4180.
  */
 function neutralizeFormula(text: string): string {
-  if (/^[\t\r ]*[=+\-@]|^[\t\r]/.test(text)) {
+  if (/^[\t\r\n ]*[=+\-@]|^[\t\r\n]/.test(text)) {
     return `'${text}`;
   }
   return text;

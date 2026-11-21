@@ -869,6 +869,7 @@ test("webviewUtils, ReportFormatter, and Debouncer behave accurately", async () 
     issues: [
       { id: "I-1", note: 'He said "hello"', meta: { a: 1 } },
       { id: "=cmd|'/C calc'!A0", note: "+1\t-2\r@SUM(1,2)", meta: " ok", tailOnly: "extra" },
+      { id: "\n=HYPERLINK(\"https://evil.example\")", note: "\n\tbad", meta: "clean", tailOnly: "lf" },
     ],
     empty: [],
   });
@@ -878,6 +879,8 @@ test("webviewUtils, ReportFormatter, and Debouncer behave accurately", async () 
   assert.ok(csv.includes('He said ""hello""'));
   assert.ok(csv.includes("\"'=cmd|'/C calc'!A0\""));
   assert.ok(csv.includes("\"'+" + "1\t-2\r@SUM(1,2)\""));
+  assert.ok(csv.includes("\"'\n=HYPERLINK(\"\"https://evil.example\"\")\""));
+  assert.ok(csv.includes("\"'\n\tbad\""));
   assert.ok(!csv.includes("## empty"));
 
   const jsonText = formatJsonReport({ issues: [{ id: "I-1" }] });
@@ -1023,19 +1026,43 @@ test("UawDataService.resolveActiveTarget fails closed when registered runs belon
 
 test("UawMcpClient validates JSON-RPC 2.0 frames, bounds HTTP bodies, and reaps SIGTERM-ignoring children on dispose", async () => {
   let mode = "ok";
+  const seenProtoHeaders = [];
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
+      if (req.method === "DELETE") {
+        seenProtoHeaders.push({
+          method: "DELETE",
+          version: req.headers["mcp-protocol-version"],
+        });
+        res.writeHead(200).end();
+        return;
+      }
       let body = {};
       try {
         body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       } catch {
         /* ignore */
       }
+      if (body.method !== "initialize") {
+        seenProtoHeaders.push({
+          method: body.method,
+          version: req.headers["mcp-protocol-version"],
+        });
+      }
       if (body.method === "initialize") {
         res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": "sess-1" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { capabilities: {} } }));
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: mode === "bad-proto-version" ? "1999-01-01" : "2025-06-18",
+              capabilities: {},
+            },
+          }),
+        );
         return;
       }
       if (body.method === "notifications/initialized") {
@@ -1087,6 +1114,33 @@ test("UawMcpClient validates JSON-RPC 2.0 frames, bounds HTTP bodies, and reaps 
     await assert.rejects(() => client.listTools(), /no matching JSON-RPC 2\.0 response/);
     mode = "oversized";
     await assert.rejects(() => client.listTools(), /exceeds 128-byte limit/);
+
+    assert.ok(
+      seenProtoHeaders.some((e) => e.method === "notifications/initialized" && e.version === "2025-06-18"),
+      "notifications/initialized must carry negotiated MCP-Protocol-Version header",
+    );
+    assert.ok(
+      seenProtoHeaders.some((e) => e.method === "tools/list" && e.version === "2025-06-18"),
+      "tools/list must carry negotiated MCP-Protocol-Version header",
+    );
+
+    await client.dispose();
+    assert.ok(
+      seenProtoHeaders.some((e) => e.method === "DELETE" && e.version === "2025-06-18"),
+      "HTTP DELETE teardown must carry negotiated MCP-Protocol-Version header",
+    );
+
+    const badVerClient = new UawMcpClient({
+      transport: "http",
+      url: `http://127.0.0.1:${port}/mcp`,
+      cwd: REPO_ROOT,
+    });
+    mode = "bad-proto-version";
+    try {
+      await assert.rejects(() => badVerClient.initialize(), /Unsupported MCP protocolVersion/);
+    } finally {
+      await badVerClient.dispose();
+    }
   } finally {
     await client.dispose();
     await new Promise((res) => server.close(res));
