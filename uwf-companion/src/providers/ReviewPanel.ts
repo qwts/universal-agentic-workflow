@@ -1,68 +1,74 @@
 import * as vscode from "vscode";
-import { ReviewReader } from "../db/readers/ReviewReader";
-import { escHtml, badge, renderDynamicTable, pageShell, sectionHeader } from "./webviewUtils";
-import { PanelRegistry } from "./PanelRegistry";
+import { UawDataService } from "../services/UawDataService";
+import { ManagedWebviewPanel } from "./PanelRegistry";
+import { badge, deriveColumns, escHtml, renderDynamicTable } from "./webviewUtils";
 
 const SEVERITY_COLORS: Record<string, "red" | "yellow" | "blue" | "grey"> = {
-  critical: "red", high: "red", medium: "yellow", low: "blue", info: "grey",
+  critical: "red",
+  major: "yellow",
+  high: "red",
+  medium: "yellow",
+  minor: "blue",
+  low: "blue",
+  info: "grey",
 };
+
 const VERDICT_COLORS: Record<string, "green" | "red" | "yellow"> = {
-  pass: "green", fail: "red", conditional: "yellow",
+  pass: "green",
+  approved: "green",
+  fail: "red",
+  changes_requested: "red",
+  conditional: "yellow",
 };
+
+const managed = new ManagedWebviewPanel({
+  registryId: "review",
+  viewType: "uwf.review",
+  title: "UWF: Review Findings",
+  pageTitle: "UWF Review",
+  sectionTitle: "Review Findings",
+  openCommand: "uwf.openDashboard",
+  renderBody: async (dataService, target) => {
+    const res = await dataService.getReviews(target);
+    if (!res.exists) return `<p class="empty">No review store found for active run.</p>`;
+    const reviews = res.reviews ?? [];
+    if (!reviews.length) return `<p class="empty">No reviews recorded yet.</p>`;
+
+    const allFindings = res.findings ?? [];
+    const sections = reviews
+      .map((rv) => {
+        const verdict = String(rv.verdict ?? "");
+        const verdictBadge = badge(
+          verdict,
+          VERDICT_COLORS[verdict.toLowerCase()] ?? "grey",
+        );
+        const findings = allFindings.filter((f) => f.review_id === rv.id);
+        const cols = deriveColumns(findings, [
+          "id",
+          "severity",
+          "status",
+          "file_path",
+          "description",
+        ]);
+        const findingsTable = renderDynamicTable(cols, findings, {
+          severity: (v) =>
+            badge(String(v ?? ""), SEVERITY_COLORS[String(v).toLowerCase()] ?? "grey"),
+        });
+        return `<h3>Review #${escHtml(rv.id)} — ${escHtml(rv.role)} &nbsp;${verdictBadge}</h3>
+          ${rv.notes ? `<p style="opacity:.8;">${escHtml(rv.notes)}</p>` : ""}
+          ${findingsTable}`;
+      })
+      .join("<hr>");
+    return sections;
+  },
+});
 
 export class ReviewPanel {
-  private static panel: vscode.WebviewPanel | undefined;
-
-  static show(context: vscode.ExtensionContext, workspaceRoot: string) {
-    if (ReviewPanel.panel) {
-      ReviewPanel.panel.reveal();
-      ReviewPanel.refresh(workspaceRoot);
-      return;
-    }
-    ReviewPanel.panel = vscode.window.createWebviewPanel(
-      "uwf.review", "UWF: Review Findings",
-      vscode.ViewColumn.One,
-      { enableScripts: false, enableCommandUris: true, retainContextWhenHidden: true }
-    );
-    PanelRegistry.register("review", (root) => ReviewPanel.refresh(root));
-    ReviewPanel.panel.onDidDispose(() => {
-      PanelRegistry.unregister("review");
-      ReviewPanel.panel = undefined;
-    }, null, context.subscriptions);
-    ReviewPanel.refresh(workspaceRoot);
+  static show(context: vscode.ExtensionContext, dataService: UawDataService): void {
+    managed.show(context, dataService);
   }
 
-  static refresh(workspaceRoot: string) {
-    if (!ReviewPanel.panel) return;
-    const reader = new ReviewReader(workspaceRoot);
-    let body: string;
-    if (!reader.exists()) {
-      body = `<p class="empty">No review database found.</p>`;
-    } else {
-      try {
-        const reviews = reader.listReviews();
-        if (!reviews.length) {
-          body = `<p class="empty">No reviews recorded yet.</p>`;
-        } else {
-          const findingCols = reader.columns("findings");
-          const sections = reviews.map((rv) => {
-            const verdictBadge = badge(rv.verdict, VERDICT_COLORS[rv.verdict?.toLowerCase()] ?? "grey" as "green");
-            const findings = reader.listFindings(rv.id);
-            const findingsTable = renderDynamicTable(findingCols, findings, {
-              severity: (v) => badge(String(v ?? ""), SEVERITY_COLORS[String(v).toLowerCase()] ?? "grey"),
-            });
-            return `<h3>Review #${escHtml(rv.id)} — ${escHtml(rv.role)} &nbsp;${verdictBadge}</h3>
-              ${rv.notes ? `<p style="opacity:.8;">${escHtml(rv.notes)}</p>` : ""}
-              ${findingsTable}`;
-          }).join("<hr>");
-          body = sections;
-        }
-      } catch (e) {
-        body = `<p class="empty">Error: ${escHtml(String(e))}</p>`;
-      } finally {
-        reader.close();
-      }
-    }
-    ReviewPanel.panel.webview.html = pageShell("UWF Review", `${sectionHeader("Review Findings", "uwf.openDashboard")}${body}`);
+  static refresh(dataService: UawDataService): Promise<void> {
+    return managed.refresh(dataService);
   }
 }

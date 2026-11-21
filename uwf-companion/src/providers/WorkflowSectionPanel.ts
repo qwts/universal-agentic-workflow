@@ -1,60 +1,84 @@
 import * as vscode from "vscode";
-import { escHtml, pageShell, renderDynamicTable } from "./webviewUtils";
-import { WorkflowInsightsService } from "../services/WorkflowInsightsService";
-import { PanelRegistry } from "./PanelRegistry";
+import { ResolvedRunTarget, UawDataService } from "../services/UawDataService";
+import { ALLOWED_WEBVIEW_COMMANDS, PanelRegistry } from "./PanelRegistry";
+import { deriveColumns, escHtml, pageShell, renderDynamicTable } from "./webviewUtils";
 
-const SECTION_MAP: Record<string, { title: string; key: keyof ReturnType<typeof WorkflowInsightsService.collect> }> = {
-  "workflow-state": { title: "Workflow State", key: "sections" },
-  stages: { title: "Stages", key: "stagesRows" },
-  artifacts: { title: "Artifacts", key: "sections" },
-  issues: { title: "Issues", key: "issuesRows" },
-  requirements: { title: "Requirements", key: "requirementsRows" },
-  discoveries: { title: "Discoveries", key: "discoveriesRows" },
-  adrs: { title: "ADRs", key: "adrsRows" },
-  review: { title: "Review Findings", key: "reviewRows" },
+const SECTION_TITLES: Record<string, string> = {
+  "workflow-state": "Workflow State",
+  stages: "Stages",
+  artifacts: "Artifacts",
+  issues: "Issues",
+  requirements: "Requirements",
+  discoveries: "Discoveries",
+  adrs: "ADRs",
+  review: "Review Findings",
+  questions: "Questions",
 };
 
 export class WorkflowSectionPanel {
-  static show(workspaceRoot: string, sectionId: string) {
-    const def = SECTION_MAP[sectionId] ?? { title: sectionId, key: "sections" as const };
+  static show(dataService: UawDataService, sectionId: string): void {
+    const title = SECTION_TITLES[sectionId] ?? sectionId;
     const panel = vscode.window.createWebviewPanel(
       `uwf.section.${sectionId}`,
-      `UWF: ${def.title} (Interactive)`,
+      `UWF: ${title} (Interactive)`,
       vscode.ViewColumn.Active,
-      { enableScripts: false, retainContextWhenHidden: true }
+      {
+        enableScripts: false,
+        enableCommandUris: ALLOWED_WEBVIEW_COMMANDS,
+        retainContextWhenHidden: true,
+      },
     );
 
-    const refresh = () => {
-      const snapshot = WorkflowInsightsService.collect(workspaceRoot);
-      const rows = snapshot[def.key];
+    let renderSeq = 0;
+    let disposed = false;
 
-      let body = "";
-      if (sectionId === "artifacts") {
-        const artifactSection = snapshot.sections.find((s) => s.id === "artifacts");
-        body = `<h2>Planned Artifacts</h2><ul>${(artifactSection?.details ?? []).map((d) => `<li><code>${escHtml(d)}</code></li>`).join("")}</ul>`;
-      } else if (sectionId === "workflow-state") {
-        body = `<h2>Workflow State</h2><pre>${escHtml(JSON.stringify(snapshot.sections.find((s) => s.id === "workflow-state"), null, 2))}</pre>`;
-      } else if (Array.isArray(rows) && rows.length) {
-        const first = rows[0] as Record<string, unknown>;
-        body = `<h2>${escHtml(def.title)}</h2>${renderDynamicTable(Object.keys(first), rows as unknown[])}`;
-      } else {
-        body = `<h2>${escHtml(def.title)}</h2><p class="empty">No records available.</p>`;
+    const refresh = async (ds: UawDataService, sharedTarget?: ResolvedRunTarget) => {
+      const seq = ++renderSeq;
+      let body: string;
+      try {
+        const target = sharedTarget ?? (await ds.resolveActiveTarget());
+        if (sectionId === "artifacts") {
+          const insights = await ds.collectInsights(target);
+          const items = insights.artifactInsights
+            .map((a) => {
+              const icon = a.exists === null ? "🔷" : a.exists ? "✅" : "⬜";
+              return `<li>${icon} <b>${escHtml(a.workflow)}</b> / ${escHtml(a.stage)}: <code>${escHtml(a.path)}</code></li>`;
+            })
+            .join("");
+          body = `<h2>Planned Artifacts</h2>${items ? `<ul>${items}</ul>` : '<p class="empty">No records available.</p>'}`;
+        } else if (sectionId === "workflow-state") {
+          const st = await ds.getState(target);
+          body = `<h2>Workflow State</h2><pre>${escHtml(JSON.stringify(st, null, 2))}</pre>`;
+        } else {
+          let rows: Array<Record<string, unknown>> = [];
+          if (sectionId === "stages") rows = (await ds.getStages(undefined, target)).stage_runs;
+          else if (sectionId === "issues") rows = (await ds.getIssues(target)).issues;
+          else if (sectionId === "requirements") rows = (await ds.getRequirements(target)).requirements;
+          else if (sectionId === "discoveries") rows = (await ds.getDiscoveries(target)).discoveries;
+          else if (sectionId === "adrs") rows = (await ds.getAdrs(target)).adrs;
+          else if (sectionId === "review") rows = (await ds.getReviews(target)).findings;
+          else if (sectionId === "questions") rows = (await ds.getQuestions(target)).questions;
+
+          const cols = deriveColumns(rows);
+          body = rows.length
+            ? `<h2>${escHtml(title)}</h2>${renderDynamicTable(cols, rows)}`
+            : `<h2>${escHtml(title)}</h2><p class="empty">No records available.</p>`;
+        }
+      } catch (err) {
+        body = `<p class="empty">Error: ${escHtml(err instanceof Error ? err.message : String(err))}</p>`;
       }
 
-      panel.webview.html = pageShell(`UWF ${def.title}`, body);
+      if (disposed || seq !== renderSeq) return;
+      panel.webview.html = pageShell(`UWF ${title}`, body);
     };
 
-    // Register this panel with the PanelRegistry so DbWatcher-driven refreshes
-    // will re-render the drill-down view on DB writes.
     const registryKey = `section.${sectionId}.${Date.now()}`;
-    PanelRegistry.register(registryKey, refresh);
-
-    // Ensure we clean up the registry entry when the panel is disposed.
+    PanelRegistry.register(registryKey, (ds, sharedTarget) => refresh(ds, sharedTarget));
     panel.onDidDispose(() => {
+      disposed = true;
       PanelRegistry.unregister(registryKey);
     });
 
-    // Initial render.
-    refresh();
+    void refresh(dataService);
   }
 }
